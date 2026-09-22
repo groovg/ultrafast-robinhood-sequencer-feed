@@ -1,0 +1,22 @@
+[package]
+name = "rhfeed"
+version = "0.3.0"
+edition = "2024"
+description = "Decode an Arbitrum Orbit sequencer feed, fast enough to act on it"
+license = "Apache-2.0"
+
+[dependencies]
+base64 = "0.22"
+bytes = "1"
+hex = "0.4"
+# libsecp256k1, the same C library coincurve wraps, so the Python baseline and this
+# port recover senders with the same code and differ only in what surrounds it.
+secp256k1 = { version = "0.31", features = ["recovery", "global-context"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+tiny-keccak = { version = "2", features = ["keccak"] }
+
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

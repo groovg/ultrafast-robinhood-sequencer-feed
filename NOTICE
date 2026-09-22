@@ -1,0 +1,6 @@
+ultrafast-robinhood-sequencer-feed
+
+This product is a Rust derivative of robinhood-chain-sequencer-feed by Chainstack
+(https://github.com/chainstacklabs/robinhood-chain-sequencer-feed), licensed under the
+Apache License 2.0. The decoder, feed-signature verification and consumer logic, the
+docker-compose relay setup, and the test fixtures in tests/fixtures/ originate there.

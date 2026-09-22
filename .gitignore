@@ -1,0 +1,7 @@
+/target/
+__pycache__/
+
+# Captures are large and disposable — except the fixtures the tests decode against.
+*.jsonl
+!/tests/fixtures/frames.jsonl
+!/tests/golden.jsonl
