@@ -70,12 +70,21 @@ behind it was the rest of the time.
 
 Most of the time spent on a message goes to ECDSA. By default we use libsecp256k1, the
 same C library the Python version calls through coincurve.
-[UltrafastSecp256k1](https://github.com/shrec/UltrafastSecp256k1) is about 1.65x faster
-at recovering a public key, if you build it with clang. With MSVC it's barely faster at
-all. Turn it on with `--features ufsecp`.
+[UltrafastSecp256k1](https://github.com/shrec/UltrafastSecp256k1) is an alternative you
+can turn on with `--features ufsecp`. On Linux it's about 5% faster. On Windows it
+looked 1.65x faster at first, but that was because the `secp256k1` crate builds
+libsecp256k1 with MSVC there. Built with clang, the two are equally fast. Details in
+[BENCHMARKS.md](BENCHMARKS.md#which-ecdsa-library).
 
-It isn't on crates.io, so you build it yourself first. On Windows, from a VS x64
-developer prompt with LLVM and Ninja on `PATH`:
+It isn't on crates.io, so you build it yourself first. On Linux:
+
+```bash
+scripts/build-ufsecp.sh ufsecp native        # or x86-64-v3 for a binary you'll copy elsewhere
+export UFSECP_LIB_DIR=$PWD/ufsecp/build
+cargo build --release --features ufsecp
+```
+
+On Windows, from a VS x64 developer prompt with LLVM and Ninja on `PATH`:
 
 ```bat
 git clone https://github.com/shrec/UltrafastSecp256k1 && cd UltrafastSecp256k1

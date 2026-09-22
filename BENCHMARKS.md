@@ -36,9 +36,9 @@ Notes:
   just Rust vs Python. The rest is SIMD base64 (3.3x faster than the `base64` crate) and
   assembly keccak (1.2x faster than tiny-keccak).
 - Python already used libsecp256k1 (through coincurve), so on ECDSA alone Rust with the
-  same library is only about 12% faster. UltrafastSecp256k1 compiled with clang-cl is
-  1.65x faster than libsecp256k1. Compiled with MSVC it's only 1.08x, so which compiler
-  you use matters about as much as which library.
+  same library is only about 12% faster.
+- The ufsecp (clang-cl) column looks much faster, but that's mostly the compiler. In the
+  Rust + libsecp256k1 column, libsecp256k1 was compiled by MSVC. See the next section.
 - In absolute terms none of this is much. The feed sends about 10 messages and 70
   transactions per second, so even the Python version uses a fraction of a percent of
   one core. Network delays are measured in milliseconds, which is why racing
@@ -55,6 +55,26 @@ How the Rust feed path went from 61.0 µs to 52.4 µs (libsecp256k1, same record
 | final run for the table above | 52.4 µs |
 
 On this machine, differences smaller than about 0.3 µs are noise.
+
+## Which ECDSA library
+
+Our first numbers said UltrafastSecp256k1 was 1.65x faster than libsecp256k1. It turned
+out the comparison wasn't fair. On Windows, the `secp256k1` crate compiles libsecp256k1
+with MSVC, which has no 128-bit integers, so libsecp256k1 falls back to slower code.
+Compiled with clang, it's as fast as UltrafastSecp256k1.
+
+Recovering a public key, µs:
+
+| Machine | libsecp256k1 | UltrafastSecp256k1 |
+|---|---:|---:|
+| Ryzen 9 9950X3D, Windows, MSVC | 34.4 | 32.3 |
+| Ryzen 9 9950X3D, Windows, clang-cl | 21.4 | 21.1 |
+| EPYC 7763 (GitHub runner), Linux, gcc / clang | 45.0 | 42.5 |
+
+On Linux, the feed path on that runner was 55.2 µs with libsecp256k1 and 52.7 µs with
+UltrafastSecp256k1, about 5% apart. So on Linux the default build is fine, and ufsecp
+buys a few percent. On Windows, build with clang either way. The Linux numbers come from
+`.github/workflows/bench.yml`, which you can rerun with `gh workflow run bench`.
 
 ## Two connections to the same feed
 
