@@ -24,6 +24,8 @@ yawc = "0.4"
 
 [dev-dependencies]
 base64 = "0.22"
+futures-util = "0.3"
+tokio-tungstenite = "0.30"
 
 [features]
 # Recover senders with UltrafastSecp256k1 instead of libsecp256k1. Needs its `ufsecp`
