@@ -22,6 +22,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 # and tungstenite does not implement it.
 yawc = "0.4"
 sonic-rs = "0.5.10"
+rayon = "1.12.0"
+asmcrypto = { version = "0.1.2", optional = true }
 
 [dev-dependencies]
 base64 = "0.22"
@@ -32,6 +34,10 @@ tokio-tungstenite = "0.30"
 # Recover senders with UltrafastSecp256k1 instead of libsecp256k1. Needs its `ufsecp`
 # static library built and UFSECP_LIB_DIR pointing at its build directory; see README.md.
 ufsecp = []
+# Recover senders 8 at a time with AVX-512 IFMA (asmcrypto), where the CPU has it.
+# Experimental: its author says not to use it in production. tests/golden.rs checks it
+# against libsecp256k1 on every signature we have.
+asmcrypto = ["dep:asmcrypto"]
 
 [profile.release]
 lto = "fat"

@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 
 use bytes::Bytes;
 use keccak_asm::Keccak256;
+use rayon::prelude::*;
 use serde::Deserialize;
 
 /// arbos/parse_l2.go: L2 message kinds. Only these two carry user transactions.
@@ -349,6 +350,13 @@ impl Tx {
     }
 
     fn recover(&self) -> Option<[u8; 20]> {
+        let sig = self.signature()?;
+        crate::secp::recover(&sig.digest, &sig.r, &sig.s, sig.recid)
+    }
+
+    /// What was signed and the signature over it, ready for ECDSA recovery. None when
+    /// the transaction isn't modeled or its signature fields make no sense.
+    pub fn signature(&self) -> Option<crate::secp::Signature> {
         let (body, f) = (self.body(), &self.fields);
         let n = f.len();
         if n < 4 {
@@ -383,7 +391,29 @@ impl Tx {
             }
             (v, rlp_list(&[self.tx_type], &[&body[f[0].0..f[n - 4].2]]))
         };
-        crate::secp::recover(&keccak(&payload), &pad32(r), &pad32(s), parity as u8)
+        Some(crate::secp::Signature {
+            digest: keccak(&payload),
+            r: pad32(r),
+            s: pad32(s),
+            recid: parity as u8,
+        })
+    }
+}
+
+/// Recover the sender of every transaction in `txs` at once and cache it, so later
+/// `sender()` calls are free. Uses every core (and AVX-512 batches with the `asmcrypto`
+/// feature). One message's worth of senders takes about as long as one recovery,
+/// where calling `sender()` in a loop takes one recovery per transaction.
+pub fn recover_senders<'a>(txs: impl IntoIterator<Item = &'a Tx>) {
+    let pending: Vec<&Tx> = txs
+        .into_iter()
+        .filter(|t| t.sender.get().is_none())
+        .collect();
+    // Building what was signed means hashing each transaction, so do that in parallel too.
+    let sigs: Vec<Option<crate::secp::Signature>> =
+        pending.par_iter().map(|t| t.signature()).collect();
+    for (tx, sender) in pending.iter().zip(crate::secp::recover_many(&sigs)) {
+        let _ = tx.sender.set(sender);
     }
 }
 

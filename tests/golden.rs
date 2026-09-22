@@ -15,7 +15,8 @@ use serde_json::Value;
 use rhfeed::codec::{Entry, L2_BATCH, L2_SIGNED_TX, MAX_BATCH_DEPTH, decode_l2_message};
 use rhfeed::{
     FEED_PREFIX, MAINNET_CHAIN_ID, MAINNET_SIGNER, MAINNET_VERIFIER, Tx, Verifier,
-    decode_transaction, frame_from_slice, parse_frame, recover_signer, signature_payload,
+    decode_transaction, frame_from_slice, parse_frame, recover_senders, recover_signer,
+    signature_payload,
 };
 
 fn golden() -> Vec<Value> {
@@ -100,6 +101,28 @@ fn every_captured_frame_decodes_exactly_as_python_does() {
         }
     }
     assert!(txs > 100, "capture decoded only {txs} transactions");
+}
+
+#[test]
+fn recovering_senders_in_bulk_matches_python() {
+    let frames = frames();
+    let mut checked = 0;
+    for line in golden().iter().filter(|g| g.get("line").is_some()) {
+        let i = line["line"].as_u64().unwrap() as usize;
+        let frame = frame_from_slice(frames[i].as_bytes()).unwrap();
+        for (m, w) in parse_frame(&frame, true)
+            .iter()
+            .zip(line["messages"].as_array().unwrap())
+        {
+            recover_senders(&m.txs);
+            for (t, wt) in m.txs.iter().zip(w["txs"].as_array().unwrap()) {
+                let got = t.sender().map_or(Value::Null, Value::String);
+                assert_eq!(got, wt["sender"], "seq {}", m.seq);
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 100);
 }
 
 #[test]
@@ -300,4 +323,52 @@ fn ufsecp_and_libsecp256k1_recover_the_same_addresses() {
         }
     }
     assert!(n >= 4);
+}
+
+/// The AVX-512 batch path against libsecp256k1, one signature at a time: every
+/// transaction in the capture, plus inputs the batch must not accept.
+#[cfg(feature = "asmcrypto")]
+#[test]
+fn asmcrypto_batches_agree_with_libsecp256k1() {
+    use rhfeed::secp::{Signature, libsecp, recover_many};
+    let frames = frames();
+    let mut sigs: Vec<Option<Signature>> = frames
+        .iter()
+        .flat_map(|l| parse_frame(&frame_from_slice(l.as_bytes()).unwrap(), true))
+        .flat_map(|m| m.txs)
+        .map(|t| t.signature())
+        .collect();
+    let real = sigs[0].clone().unwrap();
+    let order =
+        hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141").unwrap();
+    for (r, s, recid) in [
+        (order.clone().try_into().unwrap(), real.s, real.recid),
+        (real.r, order.try_into().unwrap(), real.recid),
+        ([0xff; 32], real.s, real.recid),
+        ([0; 32], real.s, real.recid),
+        (real.r, [0; 32], real.recid),
+        (real.r, real.s, 2),
+        (real.r, real.s, 3),
+        (real.r, real.s, 1 - real.recid),
+    ] {
+        // Spread the odd ones between real ones so they share batches.
+        sigs.insert(
+            sigs.len() / 2,
+            Some(Signature {
+                r,
+                s,
+                recid,
+                ..real.clone()
+            }),
+        );
+        sigs.push(None);
+    }
+    let want: Vec<_> = sigs
+        .iter()
+        .map(|s| {
+            s.as_ref()
+                .and_then(|s| libsecp::recover(&s.digest, &s.r, &s.s, s.recid))
+        })
+        .collect();
+    assert_eq!(recover_many(&sigs), want);
 }

@@ -169,6 +169,46 @@ fn main() {
         "{:<44}{full_us:>10.3}",
         "all of it: frame, signature, every sender"
     );
+    // Senders of one message's transactions: one at a time, then all at once.
+    let messages_txs: Vec<Vec<Bytes>> = frames
+        .iter()
+        .flat_map(|f| parse_frame(f, true))
+        .map(|m| m.txs.into_iter().map(|t| t.raw).collect())
+        .collect();
+    let decoded = || -> Vec<Vec<rhfeed::Tx>> {
+        messages_txs
+            .iter()
+            .map(|txs| {
+                txs.iter()
+                    .map(|r| decode_transaction(r.clone()).unwrap())
+                    .collect()
+            })
+            .collect()
+    };
+    let one_by_one = best_of(10, messages, || {
+        for txs in decoded() {
+            for t in &txs {
+                black_box(t.sender_bytes());
+            }
+        }
+    });
+    println!(
+        "{one_label:<44}{one_by_one:>10.3}",
+        one_label = "every sender, one by one"
+    );
+    let bulk = best_of(10, messages, || {
+        for txs in decoded() {
+            rhfeed::recover_senders(&txs);
+            black_box(&txs);
+        }
+    });
+    println!(
+        "{:<44}{bulk:>10.3}",
+        format!(
+            "every sender, recover_senders ({} threads)",
+            rayon::current_num_threads()
+        )
+    );
 
     // The bare primitive, on the feed signatures' real digests.
     let sigs: Vec<Sig> = entries
@@ -198,6 +238,26 @@ fn main() {
     prim("libsecp256k1", rhfeed::secp::libsecp::recover);
     #[cfg(feature = "ufsecp")]
     prim("ufsecp", rhfeed::secp::ufsecp::recover);
+    #[cfg(feature = "asmcrypto")]
+    {
+        let batch: Vec<Option<rhfeed::secp::Signature>> = sigs
+            .iter()
+            .map(|&(digest, r, s, recid)| {
+                Some(rhfeed::secp::Signature {
+                    digest,
+                    r,
+                    s,
+                    recid,
+                })
+            })
+            .collect();
+        let us = best_of(50, batch.len(), || {
+            for chunk in batch.chunks(8) {
+                black_box(rhfeed::secp::asmcrypto::recover8(chunk));
+            }
+        });
+        println!("{:<44}{us:>10.3}", "asmcrypto, 8 per batch, one core");
+    }
 
     println!("\none core, full decode incl. sender: ~{:.0} tx/s", {
         let us = best_of(20, raws.len(), || {

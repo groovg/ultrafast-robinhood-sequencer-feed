@@ -87,24 +87,23 @@ impl Filter {
         self.to.is_some() || self.selector.is_some() || self.sender.is_some()
     }
 
-    fn keep(&self, tx: &Tx) -> bool {
-        let pass = |set: &Option<HashSet<[u8; 20]>>, v: Option<[u8; 20]>| {
-            set.as_ref()
-                .is_none_or(|s| v.is_some_and(|v| s.contains(&v)))
-        };
-        pass(&self.to, tx.to_bytes)
+    /// The filters that need no ECDSA: `to` and `selector`.
+    fn cheap(&self, tx: &Tx) -> bool {
+        self.to
+            .as_ref()
+            .is_none_or(|s| tx.to_bytes.is_some_and(|v| s.contains(&v)))
             && self
                 .selector
                 .as_ref()
                 .is_none_or(|s| tx.selector.is_some_and(|v| s.contains(&v)))
-            && pass(
-                &self.sender,
-                if self.sender.is_some() {
-                    tx.sender_bytes()
-                } else {
-                    None
-                },
-            )
+    }
+
+    /// The `sender` filter. Run `recover_senders` on the candidates first, so this
+    /// reads cached senders instead of recovering them one at a time.
+    fn sender(&self, tx: &Tx) -> bool {
+        self.sender
+            .as_ref()
+            .is_none_or(|s| tx.sender_bytes().is_some_and(|v| s.contains(&v)))
     }
 }
 
@@ -227,11 +226,12 @@ async fn main() {
 
     let stream = async {
         while let Some(msg) = feed.recv().await {
-            let txs: Vec<&Tx> = msg
-                .txs
-                .iter()
-                .filter(|t| !keep.active() || keep.keep(t))
-                .collect();
+            let mut txs: Vec<&Tx> = msg.txs.iter().filter(|t| keep.cheap(t)).collect();
+            if show_sender {
+                // All of this message's senders at once, spread over the cores.
+                rhfeed::recover_senders(txs.iter().copied());
+                txs.retain(|t| keep.sender(t));
+            }
             if txs.is_empty() && keep.active() {
                 continue;
             }
