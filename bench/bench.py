@@ -17,7 +17,7 @@ from coincurve import PublicKey
 from eth_hash.auto import keccak
 from orjson import loads
 
-from rhfeed import MAINNET_CHAIN_ID, decode_transaction, parse_frame, recover_signer
+from rhfeed import MAINNET_CHAIN_ID, MAINNET_VERIFIER, decode_transaction, parse_frame, recover_signer
 from rhfeed.verify import signature_hash
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,6 +70,16 @@ def main() -> None:
             recover_signer(e, MAINNET_CHAIN_ID)
 
     print(f"{'feed signature check':<44}{best_of(5, len(entries), verify):>10.3f}")
+
+    def feed_path():
+        # What the consumer does to a new live message with verification on.
+        for line in lines:
+            frame = loads(line)
+            for e in frame.get("messages") or ():
+                if MAINNET_VERIFIER.accepts(e):
+                    parse_frame({"messages": [e]})
+
+    print(f"{'feed path: parse, verify, decode':<44}{best_of(5, messages, feed_path):>10.3f}")
 
     def everything():
         for line in lines:
