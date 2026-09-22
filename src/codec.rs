@@ -10,8 +10,8 @@ use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use bytes::Bytes;
+use keccak_asm::Keccak256;
 use serde::Deserialize;
-use tiny_keccak::{Hasher, Keccak};
 
 /// arbos/parse_l2.go: L2 message kinds. Only these two carry user transactions.
 pub const L2_BATCH: u8 = 3;
@@ -49,12 +49,9 @@ pub(crate) fn b64(s: &str) -> Option<Vec<u8>> {
     base64_simd::STANDARD.decode_to_vec(s).ok()
 }
 
+/// Keccak-256 through XKCP's assembly, ~1.2x tiny-keccak. The same crate alloy uses.
 pub fn keccak(data: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    let mut k = Keccak::v256();
-    k.update(data);
-    k.finalize(&mut out);
-    out
+    Keccak256::digest(data).into()
 }
 
 /// 4-byte selector for a function signature: `selector_of("transfer(address,uint256)")`.
