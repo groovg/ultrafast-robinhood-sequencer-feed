@@ -8,13 +8,19 @@ license = "Apache-2.0"
 [dependencies]
 base64 = "0.22"
 bytes = "1"
+clap = { version = "4", features = ["derive"] }
 hex = "0.4"
+log = "0.4"
 # libsecp256k1, the same C library coincurve wraps, so the Python baseline and this
 # port recover senders with the same code and differ only in what surrounds it.
 secp256k1 = { version = "0.31", features = ["recovery", "global-context"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 tiny-keccak = { version = "2", features = ["keccak"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "signal"] }
+# Not tokio-tungstenite: the public feed refuses a handshake without permessage-deflate,
+# and tungstenite does not implement it.
+yawc = "0.4"
 
 
 [profile.release]
