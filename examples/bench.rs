@@ -104,12 +104,42 @@ fn main() {
         }
     });
     println!("{:<44}{frame_us:>10.3}", "frame JSON -> decoded txs");
+    // Where that goes: the JSON alone, then the base64 inside it.
+    let json_us = best_of(50, messages, || {
+        for line in &lines {
+            black_box(serde_json::from_str::<Frame>(black_box(line)).unwrap());
+        }
+    });
+    println!("{:<44}{json_us:>10.3}", "  of which JSON parse");
+    let b64_us = best_of(50, messages, || {
+        for f in &frames {
+            for e in f.entries() {
+                if let Some(m) = e.incoming().and_then(|i| i.l2_msg.as_deref()) {
+                    black_box(base64::engine::general_purpose::STANDARD.decode(m).unwrap());
+                }
+            }
+        }
+    });
+    println!("{:<44}{b64_us:>10.3}", "  of which base64 l2Msg");
     let verify_us = best_of(20, entries.len(), || {
         for e in &entries {
             black_box(recover_signer(e, MAINNET_CHAIN_ID));
         }
     });
     println!("{:<44}{verify_us:>10.3}", "feed signature check");
+    // What Feed does to every new live message before handing it over: the latency
+    // this crate adds on top of the network.
+    let path_us = best_of(20, messages, || {
+        for line in &lines {
+            let frame: Frame = serde_json::from_str(black_box(line)).unwrap();
+            for e in frame.entries() {
+                if recover_signer(e, MAINNET_CHAIN_ID).is_some() {
+                    black_box(rhfeed::codec::parse_entry(e, true));
+                }
+            }
+        }
+    });
+    println!("{:<44}{path_us:>10.3}", "feed path: parse, verify, decode");
     let full_us = best_of(10, messages, || {
         for line in &lines {
             let frame: Frame = serde_json::from_str(black_box(line)).unwrap();
