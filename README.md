@@ -11,8 +11,7 @@ explains what the feed is, why there is no public mempool, and what the decoded 
 and cannot tell you.
 
 ```bash
-cargo run --release                         # stream decoded transactions off mainnet
-cargo run --release -- --verify             # ...dropping any not signed by the sequencer
+cargo run --release                         # stream decoded, signature-checked transactions off mainnet
 cargo run --release -- --feed mainnet --feed mainnet   # race two connections, see below
 cargo test
 ```
@@ -40,6 +39,8 @@ uv run --project ../robinhood-chain-sequencer-feed --extra dev python tests/gold
 
 - **Defaults to the public feed**, not a local relay: this client speaks the
   permessage-deflate the public feed requires, which is what the relay was for.
+- **Signatures are checked by default.** Every message must be signed by the
+  sequencer key (one ECDSA recovery, ~40 us); `--no-verify` turns that off.
 - **Several sources, first copy wins.** `Feed::builder().source(a).source(b).spawn()`
   reads each source on its own task and delivers every message once, from whichever
   had it first. `Feed::recv().await` returns the next live message.
@@ -101,7 +102,7 @@ docker run -d --name relay -p 127.0.0.1:9642:9642 --entrypoint relay   offchainl
 ```
 
 A relay verifies no signatures and hides reorgs (it dedups by sequence number), so
-pass `--verify` and prefer the direct feed when reorgs matter.
+keep signature checking on (the default) and prefer the direct feed when reorgs matter.
 
 ## License
 

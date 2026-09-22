@@ -34,10 +34,11 @@ struct Args {
     /// One JSON object per message
     #[arg(long)]
     json: bool,
-    /// Drop messages not signed by Robinhood Chain mainnet's sequencer key. Mainnet only —
-    /// the chain id is signed, so this cannot check testnet
+    /// Accept messages without checking they are signed by Robinhood Chain mainnet's
+    /// sequencer key. Checking is the default; it costs one signature recovery per
+    /// message and only knows mainnet, so testnet needs this flag
     #[arg(long)]
-    verify: bool,
+    no_verify: bool,
     /// Only transactions to this address
     #[arg(long)]
     to: Vec<String>,
@@ -198,12 +199,13 @@ async fn main() {
             other => other,
         })
         .collect();
-    if args.verify && urls.contains(&TESTNET_FEED) {
+    let verify = !args.no_verify;
+    if verify && urls.contains(&TESTNET_FEED) {
         // The chain id is signed, so every testnet message would be dropped and the run
         // would read like a dead feed rather than a verifier pointed at the wrong chain.
         eprintln!(
-            "rhfeed: --verify only knows mainnet's chain id and signer, and the chain id is \
-             signed, so every testnet message would be dropped. Drop --verify, or build a \
+            "rhfeed: verification only knows mainnet's chain id and signer, and the chain id \
+             is signed, so every testnet message would be dropped. Pass --no-verify, or build a \
              Verifier with the testnet chain id and signer and pass it to Feed::builder() directly."
         );
         exit(1);
@@ -214,7 +216,7 @@ async fn main() {
     });
 
     let mut builder = urls.iter().fold(Feed::builder(), |b, url| b.source(*url));
-    if args.verify {
+    if verify {
         builder = builder.verify(MAINNET_VERIFIER.clone());
     }
     let mut feed = builder.spawn();
@@ -277,7 +279,7 @@ async fn main() {
     let s = feed.stats();
     let counted = if keep.active() { "matched" } else { "seen" };
     // Report the verification result even when it is zero: that is the point of asking.
-    let checked = if args.verify {
+    let checked = if verify {
         format!(", {} unverified dropped", s.unverified_messages)
     } else {
         String::new()
