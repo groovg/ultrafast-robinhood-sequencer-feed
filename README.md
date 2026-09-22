@@ -20,6 +20,13 @@ cargo run --release -- --json --to 0xabc...            # JSON lines, one contrac
 cargo test
 ```
 
+Or with Docker (the image is built with UltrafastSecp256k1):
+
+```bash
+docker build -t rhfeed .
+docker run --rm rhfeed --feed mainnet --feed mainnet
+```
+
 Speed numbers are in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Using it as a library
