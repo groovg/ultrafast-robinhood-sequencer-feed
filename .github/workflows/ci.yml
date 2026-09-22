@@ -31,3 +31,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
+
+  ufsecp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get install -y --no-install-recommends clang ninja-build
+      - uses: actions/cache@v4
+        with:
+          path: ufsecp
+          key: ufsecp-${{ hashFiles('scripts/build-ufsecp.sh') }}
+      - run: scripts/build-ufsecp.sh ufsecp x86-64-v3
+      - run: cargo test --locked --features ufsecp
+        env:
+          UFSECP_LIB_DIR: ${{ github.workspace }}/ufsecp/build
