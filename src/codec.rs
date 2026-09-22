@@ -579,13 +579,27 @@ pub fn parse_frame(frame: &Frame, decode_txs: bool) -> Vec<FeedMessage> {
 
 /// One entry of a frame's `messages` array.
 pub fn parse_entry(entry: &Entry, decode_txs: bool) -> FeedMessage {
-    let header = entry.header();
-    let txs = match entry.incoming().and_then(|i| i.l2_msg.as_deref()) {
-        Some(l2) if decode_txs && !l2.is_empty() => b64(l2)
-            .map(|raw| decode_l2_message(&Bytes::from(raw)))
-            .unwrap_or_default(),
-        _ => Vec::new(),
+    let l2 = if decode_txs {
+        l2_msg(entry).ok().flatten()
+    } else {
+        None
     };
+    parse_entry_with(entry, l2.as_ref())
+}
+
+/// An entry's l2Msg, base64-decoded - once, so verification and decoding can share it.
+/// `Ok(None)` when absent or empty.
+pub fn l2_msg(entry: &Entry) -> Result<Option<Bytes>, base64_simd::Error> {
+    match entry.incoming().and_then(|i| i.l2_msg.as_deref()) {
+        Some(l2) if !l2.is_empty() => Ok(Some(base64_simd::STANDARD.decode_to_vec(l2)?.into())),
+        _ => Ok(None),
+    }
+}
+
+/// `parse_entry` with the l2Msg already decoded: transactions are decoded iff it is given.
+pub fn parse_entry_with(entry: &Entry, l2: Option<&Bytes>) -> FeedMessage {
+    let header = entry.header();
+    let txs = l2.map(decode_l2_message).unwrap_or_default();
     FeedMessage {
         seq: entry.sequence_number.unwrap_or(-1),
         l1_kind: header.and_then(|h| h.kind).unwrap_or(-1),

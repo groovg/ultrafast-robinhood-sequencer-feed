@@ -7,7 +7,9 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-use crate::codec::{Entry, b64, keccak};
+use keccak_asm::{Digest, Keccak256};
+
+use crate::codec::{Entry, b64, l2_msg};
 
 /// Domain separator, so a feed signature cannot be replayed as one over anything else.
 pub const FEED_PREFIX: &[u8] = b"Arbitrum Nitro Feed:";
@@ -28,66 +30,83 @@ fn unhex(value: &str) -> Option<Vec<u8>> {
 /// The exact bytes the sequencer hashed, rebuilt from one raw envelope — Nitro's
 /// `BroadcastFeedMessage.SignatureHash`. None when a field cannot be encoded at all.
 pub fn signature_payload(entry: &Entry, chain_id: u64) -> Option<Vec<u8>> {
+    let l2 = l2_msg(entry).ok()?;
+    let mut out = Vec::new();
+    preimage(entry, chain_id, l2.as_deref(), &mut |b| {
+        out.extend_from_slice(b)
+    })?;
+    Some(out)
+}
+
+/// keccak of the preimage, hashed as it is produced rather than assembled first.
+fn signature_hash(entry: &Entry, chain_id: u64, l2: Option<&[u8]>) -> Option<[u8; 32]> {
+    let mut hasher = Keccak256::new();
+    preimage(entry, chain_id, l2, &mut |b| hasher.update(b))?;
+    Some(hasher.finalize().into())
+}
+
+/// Hand every piece of the preimage to `out`, in order, with the l2Msg pre-decoded.
+fn preimage(
+    entry: &Entry,
+    chain_id: u64,
+    l2: Option<&[u8]>,
+    out: &mut impl FnMut(&[u8]),
+) -> Option<()> {
     let wrapper = entry.message.as_ref();
-    let incoming = entry.incoming();
     let header = entry.header();
 
-    let mut out = FEED_PREFIX.to_vec();
-    out.extend_from_slice(&chain_id.to_be_bytes());
-    out.extend_from_slice(
-        &u64::try_from(entry.sequence_number.unwrap_or(0))
-            .ok()?
-            .to_be_bytes(),
-    );
+    out(FEED_PREFIX);
+    out(&chain_id.to_be_bytes());
+    out(&u64::try_from(entry.sequence_number.unwrap_or(0))
+        .ok()?
+        .to_be_bytes());
 
     // Skipped when absent, per Nitro. Present in practice on this chain.
     if let Some(hash) = entry.block_hash.as_deref().filter(|h| !h.is_empty()) {
-        out.extend(unhex(hash)?);
+        out(&unhex(hash)?);
     }
     // Timeboost's express-lane bitmap: absent here, present on Arbitrum One, signed either way.
     if let Some(meta) = entry.block_metadata.as_deref().filter(|m| !m.is_empty()) {
-        out.extend(b64(meta)?);
+        out(&b64(meta)?);
     }
-    out.extend_from_slice(
-        &wrapper
-            .and_then(|w| w.delayed_messages_read)
-            .unwrap_or(0)
-            .to_be_bytes(),
-    );
+    out(&wrapper
+        .and_then(|w| w.delayed_messages_read)
+        .unwrap_or(0)
+        .to_be_bytes());
 
-    out.push(u8::try_from(header.and_then(|h| h.kind).unwrap_or(0)).ok()?);
-    out.extend(unhex(
+    out(&[u8::try_from(header.and_then(|h| h.kind).unwrap_or(0)).ok()?]);
+    out(&unhex(
         header.and_then(|h| h.sender.as_deref()).unwrap_or(""),
     )?);
-    out.extend_from_slice(
-        &header
-            .and_then(|h| h.block_number)
-            .unwrap_or(0)
-            .to_be_bytes(),
-    );
-    out.extend_from_slice(&header.and_then(|h| h.timestamp).unwrap_or(0).to_be_bytes());
+    out(&header
+        .and_then(|h| h.block_number)
+        .unwrap_or(0)
+        .to_be_bytes());
+    out(&header.and_then(|h| h.timestamp).unwrap_or(0).to_be_bytes());
 
     // Both omitted when null rather than zero-padded.
     if let Some(id) = header.and_then(|h| h.request_id.as_deref()) {
-        out.extend(unhex(id)?);
+        out(&unhex(id)?);
     }
     if let Some(fee) = header.and_then(|h| h.base_fee_l1) {
         // Go's big.Int.Bytes(): big-endian, no leading zeros, empty for zero.
-        out.extend_from_slice(&fee.to_be_bytes()[(fee.leading_zeros() / 8) as usize..]);
+        out(&fee.to_be_bytes()[(fee.leading_zeros() / 8) as usize..]);
     }
 
-    if let Some(l2) = incoming
-        .and_then(|i| i.l2_msg.as_deref())
-        .filter(|m| !m.is_empty())
-    {
-        out.extend(b64(l2)?);
+    if let Some(l2) = l2 {
+        out(l2);
     }
-    Some(out)
+    Some(())
 }
 
 /// The address that signed this message, or None if that cannot be had. None means
 /// unusable, not forged: a forged message recovers some address, just not one you accept.
 pub fn recover_signer(entry: &Entry, chain_id: u64) -> Option<[u8; 20]> {
+    recover_signer_with(entry, chain_id, l2_msg(entry).ok()?.as_deref())
+}
+
+/// `recover_signer` with the entry's l2Msg already decoded (see `codec::l2_msg`).
+pub fn recover_signer_with(entry: &Entry, chain_id: u64, l2: Option<&[u8]>) -> Option<[u8; 20]> {
     let sig = b64(entry.signature_v2.as_deref()?)?;
     let sig: [u8; 65] = sig.try_into().ok()?;
     let recid = match sig[64] {
@@ -95,7 +114,7 @@ pub fn recover_signer(entry: &Entry, chain_id: u64) -> Option<[u8; 20]> {
         v @ 0..=3 => v,
         _ => return None,
     };
-    let digest = keccak(&signature_payload(entry, chain_id)?);
+    let digest = signature_hash(entry, chain_id, l2)?;
     crate::secp::recover(
         &digest,
         sig[..32].try_into().unwrap(),
@@ -129,6 +148,11 @@ impl Verifier {
     pub fn accepts(&self, entry: &Entry) -> bool {
         self.signer_of(entry)
             .is_some_and(|s| self.signers.contains(&s))
+    }
+
+    /// `accepts` with the entry's l2Msg already decoded (see `codec::l2_msg`).
+    pub fn accepts_with(&self, entry: &Entry, l2: Option<&[u8]>) -> bool {
+        recover_signer_with(entry, self.chain_id, l2).is_some_and(|s| self.signers.contains(&s))
     }
 }
 

@@ -17,5 +17,5 @@ pub use codec::{
 pub use consume::{Feed, FeedBuilder, LOCAL_RELAY, MAINNET_FEED, SourceStats, Stats, TESTNET_FEED};
 pub use verify::{
     FEED_PREFIX, MAINNET_CHAIN_ID, MAINNET_SIGNER, MAINNET_VERIFIER, Verifier, recover_signer,
-    signature_payload,
+    recover_signer_with, signature_payload,
 };

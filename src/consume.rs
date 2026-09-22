@@ -50,7 +50,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinSet;
 use yawc::{HttpRequestBuilder, MaybeTlsStream, OpCode, Options, WebSocket};
 
-use crate::codec::{Entry, FeedMessage, Frame, parse_entry};
+use crate::codec::{Entry, FeedMessage, Frame, l2_msg, parse_entry_with};
 use crate::verify::Verifier;
 
 /// Where a local Nitro relay listens by default (see README.md for running one).
@@ -243,11 +243,24 @@ impl Shared {
                     continue;
                 }
             }
-            if !self.verify.as_ref().is_none_or(|v| v.accepts(entry)) {
-                self.reject(entry, seq);
-                continue;
+            // Decoded once, for the signature and the transactions both; a backlog
+            // message that is not being verified needs neither.
+            let l2 = if live || self.verify.is_some() {
+                l2_msg(entry)
+            } else {
+                Ok(None)
+            };
+            if let Some(v) = &self.verify {
+                let good = l2
+                    .as_ref()
+                    .is_ok_and(|l2| v.accepts_with(entry, l2.as_deref()));
+                if !good {
+                    self.reject(entry, seq);
+                    continue;
+                }
             }
-            let mut msg = parse_entry(entry, live);
+            let l2 = if live { l2.ok().flatten() } else { None };
+            let mut msg = parse_entry_with(entry, l2.as_ref());
 
             let mut st = self.lock();
             match st.classify(seq, hash) {

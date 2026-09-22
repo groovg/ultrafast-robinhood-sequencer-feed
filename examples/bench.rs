@@ -16,7 +16,8 @@ use bytes::Bytes;
 
 use rhfeed::codec::Frame;
 use rhfeed::{
-    MAINNET_CHAIN_ID, decode_transaction, keccak, parse_frame, recover_signer, signature_payload,
+    MAINNET_CHAIN_ID, MAINNET_VERIFIER, decode_transaction, keccak, parse_frame, recover_signer,
+    signature_payload,
 };
 
 /// A digest, r, s and recovery id.
@@ -133,8 +134,9 @@ fn main() {
         for line in &lines {
             let frame: Frame = serde_json::from_str(black_box(line)).unwrap();
             for e in frame.entries() {
-                if recover_signer(e, MAINNET_CHAIN_ID).is_some() {
-                    black_box(rhfeed::codec::parse_entry(e, true));
+                let l2 = rhfeed::codec::l2_msg(e).unwrap();
+                if MAINNET_VERIFIER.accepts_with(e, l2.as_deref()) {
+                    black_box(rhfeed::codec::parse_entry_with(e, l2.as_ref()));
                 }
             }
         }
