@@ -7,10 +7,7 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as B64;
-
-use crate::codec::{Entry, keccak};
+use crate::codec::{Entry, b64, keccak};
 
 /// Domain separator, so a feed signature cannot be replayed as one over anything else.
 pub const FEED_PREFIX: &[u8] = b"Arbitrum Nitro Feed:";
@@ -49,7 +46,7 @@ pub fn signature_payload(entry: &Entry, chain_id: u64) -> Option<Vec<u8>> {
     }
     // Timeboost's express-lane bitmap: absent here, present on Arbitrum One, signed either way.
     if let Some(meta) = entry.block_metadata.as_deref().filter(|m| !m.is_empty()) {
-        out.extend(B64.decode(meta).ok()?);
+        out.extend(b64(meta)?);
     }
     out.extend_from_slice(
         &wrapper
@@ -83,7 +80,7 @@ pub fn signature_payload(entry: &Entry, chain_id: u64) -> Option<Vec<u8>> {
         .and_then(|i| i.l2_msg.as_deref())
         .filter(|m| !m.is_empty())
     {
-        out.extend(B64.decode(l2).ok()?);
+        out.extend(b64(l2)?);
     }
     Some(out)
 }
@@ -91,7 +88,7 @@ pub fn signature_payload(entry: &Entry, chain_id: u64) -> Option<Vec<u8>> {
 /// The address that signed this message, or None if that cannot be had. None means
 /// unusable, not forged: a forged message recovers some address, just not one you accept.
 pub fn recover_signer(entry: &Entry, chain_id: u64) -> Option<[u8; 20]> {
-    let sig = B64.decode(entry.signature_v2.as_deref()?).ok()?;
+    let sig = b64(entry.signature_v2.as_deref()?)?;
     let sig: [u8; 65] = sig.try_into().ok()?;
     let recid = match sig[64] {
         v @ 27..=30 => v - 27, // a signer that normalised v the Ethereum way

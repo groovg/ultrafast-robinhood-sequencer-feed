@@ -115,7 +115,7 @@ fn main() {
         for f in &frames {
             for e in f.entries() {
                 if let Some(m) = e.incoming().and_then(|i| i.l2_msg.as_deref()) {
-                    black_box(base64::engine::general_purpose::STANDARD.decode(m).unwrap());
+                    black_box(base64_simd::STANDARD.decode_to_vec(m).unwrap());
                 }
             }
         }

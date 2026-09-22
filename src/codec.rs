@@ -9,8 +9,6 @@
 use std::borrow::Cow;
 use std::sync::OnceLock;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as B64;
 use bytes::Bytes;
 use serde::Deserialize;
 use tiny_keccak::{Hasher, Keccak};
@@ -45,6 +43,11 @@ pub fn l1_kind_name(kind: i64) -> Cow<'static, str> {
 // --------------------------------------------------------------------------- //
 // helpers for building filters
 // --------------------------------------------------------------------------- //
+
+/// Standard base64 with padding, as Nitro writes it. SIMD: ~3x the `base64` crate.
+pub(crate) fn b64(s: &str) -> Option<Vec<u8>> {
+    base64_simd::STANDARD.decode_to_vec(s).ok()
+}
 
 pub fn keccak(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -581,8 +584,7 @@ pub fn parse_frame(frame: &Frame, decode_txs: bool) -> Vec<FeedMessage> {
 pub fn parse_entry(entry: &Entry, decode_txs: bool) -> FeedMessage {
     let header = entry.header();
     let txs = match entry.incoming().and_then(|i| i.l2_msg.as_deref()) {
-        Some(l2) if decode_txs && !l2.is_empty() => B64
-            .decode(l2)
+        Some(l2) if decode_txs && !l2.is_empty() => b64(l2)
             .map(|raw| decode_l2_message(&Bytes::from(raw)))
             .unwrap_or_default(),
         _ => Vec::new(),
