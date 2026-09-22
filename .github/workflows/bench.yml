@@ -1,0 +1,23 @@
+name: bench
+
+# Run by hand: gh workflow run bench
+# Shared runners are noisy, so compare the two builds within one run, not across runs.
+on: workflow_dispatch
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get install -y --no-install-recommends clang ninja-build
+      - run: lscpu | grep -E "Model name|^CPU\(s\)"
+      - run: scripts/build-ufsecp.sh ufsecp x86-64-v3
+      - run: cargo build --release --example bench
+      - run: cargo build --release --example bench --features ufsecp --target-dir target/ufsecp
+        env:
+          UFSECP_LIB_DIR: ${{ github.workspace }}/ufsecp/build
+      - name: libsecp256k1 (gcc)
+        run: target/release/examples/bench
+      - name: ufsecp (clang, x86-64-v3)
+        run: target/ufsecp/release/examples/bench
