@@ -47,3 +47,12 @@ jobs:
       - run: cargo test --locked --features ufsecp
         env:
           UFSECP_LIB_DIR: ${{ github.workspace }}/ufsecp/build
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t rhfeed .
+      - run: docker run --rm rhfeed --help
+      # 10 s against mainnet: connects, checks signatures, exits cleanly.
+      - run: docker run --rm rhfeed --seconds 10
