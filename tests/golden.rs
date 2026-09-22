@@ -12,10 +12,10 @@ use std::path::Path;
 use bytes::Bytes;
 use serde_json::Value;
 
-use rhfeed::codec::{Entry, Frame, L2_BATCH, L2_SIGNED_TX, MAX_BATCH_DEPTH, decode_l2_message};
+use rhfeed::codec::{Entry, L2_BATCH, L2_SIGNED_TX, MAX_BATCH_DEPTH, decode_l2_message};
 use rhfeed::{
     FEED_PREFIX, MAINNET_CHAIN_ID, MAINNET_SIGNER, MAINNET_VERIFIER, Tx, Verifier,
-    decode_transaction, parse_frame, recover_signer, signature_payload,
+    decode_transaction, frame_from_slice, parse_frame, recover_signer, signature_payload,
 };
 
 fn golden() -> Vec<Value> {
@@ -78,7 +78,7 @@ fn every_captured_frame_decodes_exactly_as_python_does() {
     let frames = frames();
     for line in golden().iter().filter(|g| g.get("line").is_some()) {
         let i = line["line"].as_u64().unwrap() as usize;
-        let frame: Frame = serde_json::from_str(&frames[i]).unwrap();
+        let frame = frame_from_slice(frames[i].as_bytes()).unwrap();
         let got = parse_frame(&frame, true);
         let want = line["messages"].as_array().unwrap();
         assert_eq!(got.len(), want.len(), "frame {i}");
@@ -167,7 +167,7 @@ fn with(field: &str, value: Value) -> String {
 }
 
 fn entry(json: &str) -> Entry<'_> {
-    serde_json::from_str(json).unwrap()
+    sonic_rs::from_str(json).unwrap()
 }
 
 #[test]
@@ -283,7 +283,7 @@ fn ufsecp_and_libsecp256k1_recover_the_same_addresses() {
     // Real feed signatures. Transaction senders go through ufsecp in the golden tests
     // above whenever this feature is on, and are held to Python's answers there.
     for line in frames() {
-        let frame: Frame = serde_json::from_str(&line).unwrap();
+        let frame = frame_from_slice(line.as_bytes()).unwrap();
         for e in frame.entries() {
             if let Some(sig) = e.signature_v2.as_deref() {
                 use base64::Engine;

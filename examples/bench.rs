@@ -16,8 +16,8 @@ use bytes::Bytes;
 
 use rhfeed::codec::Frame;
 use rhfeed::{
-    MAINNET_CHAIN_ID, MAINNET_VERIFIER, decode_transaction, keccak, parse_frame, recover_signer,
-    signature_payload,
+    MAINNET_CHAIN_ID, MAINNET_VERIFIER, decode_transaction, frame_from_slice, keccak, parse_frame,
+    recover_signer, signature_payload,
 };
 
 /// A digest, r, s and recovery id.
@@ -47,7 +47,7 @@ fn main() {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let frames: Vec<Frame> = lines
         .iter()
-        .map(|l| serde_json::from_str(l).unwrap())
+        .map(|l| frame_from_slice(l.as_bytes()).unwrap())
         .collect();
     let messages: usize = frames.iter().map(|f| f.entries().len()).sum();
     let raws: Vec<Bytes> = frames
@@ -100,7 +100,7 @@ fn main() {
     println!("\n{:<44}{:>10}", "per message", "us");
     let frame_us = best_of(50, messages, || {
         for line in &lines {
-            let frame: Frame = serde_json::from_str(black_box(line)).unwrap();
+            let frame = frame_from_slice(black_box(line).as_bytes()).unwrap();
             black_box(parse_frame(&frame, true));
         }
     });
@@ -111,7 +111,19 @@ fn main() {
             black_box(serde_json::from_str::<Frame>(black_box(line)).unwrap());
         }
     });
-    println!("{:<44}{json_us:>10.3}", "  of which JSON parse");
+    println!(
+        "{:<44}{json_us:>10.3}",
+        "  of which JSON parse (serde_json)"
+    );
+    let sonic_us = best_of(50, messages, || {
+        for line in &lines {
+            black_box(frame_from_slice(black_box(line).as_bytes()).unwrap());
+        }
+    });
+    println!(
+        "{:<44}{sonic_us:>10.3}",
+        "  of which JSON parse (sonic-rs, used)"
+    );
     let b64_us = best_of(50, messages, || {
         for f in &frames {
             for e in f.entries() {
@@ -132,7 +144,7 @@ fn main() {
     // this crate adds on top of the network.
     let path_us = best_of(20, messages, || {
         for line in &lines {
-            let frame: Frame = serde_json::from_str(black_box(line)).unwrap();
+            let frame = frame_from_slice(black_box(line).as_bytes()).unwrap();
             for e in frame.entries() {
                 let l2 = rhfeed::codec::l2_msg(e).unwrap();
                 if MAINNET_VERIFIER.accepts_with(e, l2.as_deref()) {
@@ -144,7 +156,7 @@ fn main() {
     println!("{:<44}{path_us:>10.3}", "feed path: parse, verify, decode");
     let full_us = best_of(10, messages, || {
         for line in &lines {
-            let frame: Frame = serde_json::from_str(black_box(line)).unwrap();
+            let frame = frame_from_slice(black_box(line).as_bytes()).unwrap();
             for (e, m) in frame.entries().iter().zip(parse_frame(&frame, true)) {
                 black_box(recover_signer(e, MAINNET_CHAIN_ID));
                 for t in &m.txs {

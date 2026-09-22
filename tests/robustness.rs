@@ -12,8 +12,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use bytes::Bytes;
 
-use rhfeed::codec::{Frame, decode_l2_message};
-use rhfeed::{MAINNET_CHAIN_ID, decode_transaction, parse_frame, recover_signer};
+use rhfeed::codec::decode_l2_message;
+use rhfeed::{MAINNET_CHAIN_ID, decode_transaction, frame_from_slice, parse_frame, recover_signer};
 
 /// xorshift64*: small, fast, and good enough to pick bytes to break.
 struct Rng(u64);
@@ -94,7 +94,7 @@ fn l2_messages(lines: &[String]) -> Vec<Vec<u8>> {
     lines
         .iter()
         .flat_map(|l| {
-            let frame: Frame = serde_json::from_str(l).unwrap();
+            let frame = frame_from_slice(l.as_bytes()).unwrap();
             frame
                 .entries()
                 .iter()
@@ -114,7 +114,7 @@ fn mutated_transactions_never_panic() {
     let lines = capture();
     let raws: Vec<Bytes> = lines
         .iter()
-        .flat_map(|l| parse_frame(&serde_json::from_str(l).unwrap(), true))
+        .flat_map(|l| parse_frame(&frame_from_slice(l.as_bytes()).unwrap(), true))
         .flat_map(|m| m.txs)
         .map(|t| t.raw)
         .collect();
@@ -147,7 +147,7 @@ fn mutated_frames_never_panic() {
         let line = &lines[rng.below(lines.len())];
         let bytes = mutate(&mut rng, line.as_bytes());
         // Most mutations break the JSON; the ones that survive exercise the rest.
-        let Ok(frame) = serde_json::from_slice::<Frame>(&bytes) else {
+        let Ok(frame) = frame_from_slice(&bytes) else {
             continue;
         };
         for entry in frame.entries() {

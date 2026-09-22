@@ -47,7 +47,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinSet;
 use yawc::{HttpRequestBuilder, MaybeTlsStream, OpCode, Options, WebSocket};
 
-use crate::codec::{Entry, FeedMessage, Frame, l2_msg, parse_entry_with};
+use crate::codec::{Entry, FeedMessage, Frame, frame_from_slice, l2_msg, parse_entry_with};
 use crate::verify::Verifier;
 
 /// Where a local Nitro relay listens by default (see README.md for running one).
@@ -596,7 +596,7 @@ impl Source {
             last_frame = now;
             stall_warned = false;
 
-            let parsed: Frame = match serde_json::from_slice(frame.payload()) {
+            let parsed = match frame_from_slice(frame.payload()) {
                 Ok(parsed) => parsed,
                 Err(err) => return End::Failed(format!("unreadable frame: {err}")),
             };
@@ -674,7 +674,7 @@ mod tests {
         entries: &[String],
     ) -> Vec<(i64, bool)> {
         let json = format!(r#"{{"version":1,"messages":[{}]}}"#, entries.join(","));
-        let frame: Frame = serde_json::from_str(&json).unwrap();
+        let frame = frame_from_slice(json.as_bytes()).unwrap();
         s.ingest(source, &frame, live, 0.0, now)
             .iter()
             .map(|m| (m.seq, m.reorg))
@@ -734,7 +734,7 @@ mod tests {
     fn a_backlog_message_is_counted_but_not_decoded() {
         let s = shared(1, None);
         let json = format!(r#"{{"messages":[{}]}}"#, entry_json(1, &hash_of(1)));
-        let frame: Frame = serde_json::from_str(&json).unwrap();
+        let frame = frame_from_slice(json.as_bytes()).unwrap();
         let out = s.ingest(0, &frame, false, 0.0, Instant::now());
         assert!(!out[0].live && out[0].txs.is_empty());
         assert_eq!(s.lock().stats.backlog_messages, 1);

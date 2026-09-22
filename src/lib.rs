@@ -13,7 +13,7 @@ pub mod verify;
 
 pub use codec::{
     FeedMessage, Frame, Tx, addr, checksum, decode_l2_message, decode_transaction,
-    is_filtered_call, keccak, parse_frame, sel, selector_of,
+    frame_from_slice, is_filtered_call, keccak, parse_frame, sel, selector_of,
 };
 pub use consume::{Feed, FeedBuilder, LOCAL_RELAY, MAINNET_FEED, SourceStats, Stats, TESTNET_FEED};
 pub use verify::{

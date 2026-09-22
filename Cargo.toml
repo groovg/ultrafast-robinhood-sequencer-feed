@@ -21,6 +21,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 # Not tokio-tungstenite: the public feed refuses a handshake without permessage-deflate,
 # and tungstenite does not implement it.
 yawc = "0.4"
+sonic-rs = "0.5.10"
 
 [dev-dependencies]
 base64 = "0.22"
