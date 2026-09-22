@@ -10,8 +10,7 @@ use serde::Serialize;
 use serde_json::value::RawValue;
 
 use rhfeed::{
-    FeedConsumer, FeedMessage, LOCAL_RELAY, MAINNET_FEED, MAINNET_VERIFIER, TESTNET_FEED, Tx, addr,
-    sel,
+    Feed, FeedMessage, LOCAL_RELAY, MAINNET_FEED, MAINNET_VERIFIER, TESTNET_FEED, Tx, addr, sel,
 };
 
 /// How much of an address to print. Full hashes are worth their width because you paste
@@ -25,9 +24,10 @@ const ADDR_WIDTH: usize = 10;
 #[derive(Parser)]
 #[command(name = "rhfeed", version)]
 struct Args {
-    /// 'mainnet', 'testnet', 'relay' (ws://127.0.0.1:9642), or any feed URL
+    /// 'mainnet', 'testnet', 'relay' (ws://127.0.0.1:9642), or any feed URL. Repeat it
+    /// to race several sources; each message is taken from whichever has it first
     #[arg(long, default_value = "mainnet")]
-    feed: String,
+    feed: Vec<String>,
     /// Stop after this long, whether or not anything arrives
     #[arg(long)]
     seconds: Option<f64>,
@@ -181,26 +181,30 @@ impl log::Log for StderrLog {
     fn flush(&self) {}
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() {
     let args = Args::parse();
     log::set_logger(&StderrLog)
         .map(|()| log::set_max_level(log::LevelFilter::Info))
         .unwrap();
 
-    let url = match args.feed.as_str() {
-        "mainnet" => MAINNET_FEED,
-        "testnet" => TESTNET_FEED,
-        "relay" => LOCAL_RELAY,
-        other => other,
-    };
-    if args.verify && url == TESTNET_FEED {
+    let urls: Vec<&str> = args
+        .feed
+        .iter()
+        .map(|f| match f.as_str() {
+            "mainnet" => MAINNET_FEED,
+            "testnet" => TESTNET_FEED,
+            "relay" => LOCAL_RELAY,
+            other => other,
+        })
+        .collect();
+    if args.verify && urls.contains(&TESTNET_FEED) {
         // The chain id is signed, so every testnet message would be dropped and the run
         // would read like a dead feed rather than a verifier pointed at the wrong chain.
         eprintln!(
             "rhfeed: --verify only knows mainnet's chain id and signer, and the chain id is \
              signed, so every testnet message would be dropped. Drop --verify, or build a \
-             Verifier with the testnet chain id and signer and pass it to FeedConsumer directly."
+             Verifier with the testnet chain id and signer and pass it to Feed::builder() directly."
         );
         exit(1);
     }
@@ -209,18 +213,18 @@ async fn main() {
         exit(1);
     });
 
-    let mut consumer = FeedConsumer::new(url);
+    let mut builder = urls.iter().fold(Feed::builder(), |b, url| b.source(*url));
     if args.verify {
-        consumer.verify = Some(MAINNET_VERIFIER.clone());
+        builder = builder.verify(MAINNET_VERIFIER.clone());
     }
+    let mut feed = builder.spawn();
     // Recovering a sender is ~15x every other field put together, so it happens only
     // when a --sender filter already forced the work.
     let show_sender = keep.sender.is_some();
     let mut shown = 0usize;
 
     let stream = async {
-        loop {
-            let msg = consumer.next_live().await;
+        while let Some(msg) = feed.recv().await {
             let txs: Vec<&Tx> = msg
                 .txs
                 .iter()
@@ -270,7 +274,7 @@ async fn main() {
         _ = tokio::signal::ctrl_c() => {}
     }
 
-    let s = &consumer.stats;
+    let s = feed.stats();
     let counted = if keep.active() { "matched" } else { "seen" };
     // Report the verification result even when it is zero: that is the point of asking.
     let checked = if args.verify {
@@ -283,4 +287,20 @@ async fn main() {
          {} failed connections",
         s.live_messages, s.backlog_messages, s.reconnects
     );
+    if s.sources.len() > 1 {
+        // Which endpoint is actually fastest from here: the reason to run several.
+        for src in &s.sources {
+            let lag = src.lag_mean().map_or("-".into(), |m| {
+                format!("{:.1} ms mean, {:.1} ms max", ms(m), ms(src.lag_max))
+            });
+            eprintln!(
+                "#   {}: first on {} messages, behind on {} ({lag})",
+                src.url, src.first, src.late
+            );
+        }
+    }
+}
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1e3
 }

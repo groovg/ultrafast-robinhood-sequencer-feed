@@ -34,6 +34,21 @@ What it says:
   saves ~0.3 ms of latency per message. Without sender recovery the saving is ~27 µs
   per message. Network hops are milliseconds.
 
+## Racing two connections
+
+Latency to the feed is dominated by the network, not by decoding, so the
+biggest win is not in this table. Two connections to the same public endpoint
+(`rhfeed --feed mainnet --feed mainnet --seconds 30`, 2026-09-23, 292 messages):
+
+| | first on | behind on | mean lag when behind | max lag |
+|---|---:|---:|---:|---:|
+| connection 1 | 144 | 148 | 30.2 ms | 88.8 ms |
+| connection 2 | 148 | 144 | 30.9 ms | 108.3 ms |
+
+Neither connection is consistently faster, so racing them saves ~30 ms on about half
+of all messages — three orders of magnitude more than ECDSA backend choice. A third
+connection from the same IP is refused with HTTP 429.
+
 ## Reproduce
 
 ```bash

@@ -546,12 +546,14 @@ pub struct FeedMessage {
     pub block_hash: Option<String>,
     pub delayed_messages_read: u64,
     pub l1_block_number: u64,
-    /// Set by `FeedConsumer`; meaningless for a frame decoded straight off disk.
+    /// Set by `Feed`; meaningless for a frame decoded straight off disk.
     pub live: bool,
-    /// Unix seconds when the frame carrying this message arrived.
+    /// Unix seconds when the first copy of this message arrived, from any source.
     pub received_at: f64,
     /// This sequence number arrived before, carrying a different block hash.
     pub reorg: bool,
+    /// Index into `Feed`'s sources of the one that delivered this message first.
+    pub source: usize,
 }
 
 impl FeedMessage {
@@ -571,34 +573,38 @@ pub fn parse_frame(frame: &Frame, decode_txs: bool) -> Vec<FeedMessage> {
     frame
         .entries()
         .iter()
-        .map(|entry| {
-            let header = entry.header();
-            let txs = match entry.incoming().and_then(|i| i.l2_msg.as_deref()) {
-                Some(l2) if decode_txs && !l2.is_empty() => B64
-                    .decode(l2)
-                    .map(|raw| decode_l2_message(&Bytes::from(raw)))
-                    .unwrap_or_default(),
-                _ => Vec::new(),
-            };
-            FeedMessage {
-                seq: entry.sequence_number.unwrap_or(-1),
-                l1_kind: header.and_then(|h| h.kind).unwrap_or(-1),
-                l1_sender: header.and_then(|h| h.sender.as_deref()).map(str::to_owned),
-                timestamp: header.and_then(|h| h.timestamp).unwrap_or(0),
-                txs,
-                block_hash: entry.block_hash.as_deref().map(str::to_owned),
-                delayed_messages_read: entry
-                    .message
-                    .as_ref()
-                    .and_then(|w| w.delayed_messages_read)
-                    .unwrap_or(0),
-                l1_block_number: header.and_then(|h| h.block_number).unwrap_or(0),
-                live: true,
-                received_at: 0.0,
-                reorg: false,
-            }
-        })
+        .map(|entry| parse_entry(entry, decode_txs))
         .collect()
+}
+
+/// One entry of a frame's `messages` array.
+pub fn parse_entry(entry: &Entry, decode_txs: bool) -> FeedMessage {
+    let header = entry.header();
+    let txs = match entry.incoming().and_then(|i| i.l2_msg.as_deref()) {
+        Some(l2) if decode_txs && !l2.is_empty() => B64
+            .decode(l2)
+            .map(|raw| decode_l2_message(&Bytes::from(raw)))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    FeedMessage {
+        seq: entry.sequence_number.unwrap_or(-1),
+        l1_kind: header.and_then(|h| h.kind).unwrap_or(-1),
+        l1_sender: header.and_then(|h| h.sender.as_deref()).map(str::to_owned),
+        timestamp: header.and_then(|h| h.timestamp).unwrap_or(0),
+        txs,
+        block_hash: entry.block_hash.as_deref().map(str::to_owned),
+        delayed_messages_read: entry
+            .message
+            .as_ref()
+            .and_then(|w| w.delayed_messages_read)
+            .unwrap_or(0),
+        l1_block_number: header.and_then(|h| h.block_number).unwrap_or(0),
+        live: true,
+        received_at: 0.0,
+        reorg: false,
+        source: 0,
+    }
 }
 
 // --------------------------------------------------------------------------- //

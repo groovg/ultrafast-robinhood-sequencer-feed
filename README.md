@@ -13,6 +13,7 @@ and cannot tell you.
 ```bash
 cargo run --release                         # stream decoded transactions off mainnet
 cargo run --release -- --verify             # ...dropping any not signed by the sequencer
+cargo run --release -- --feed mainnet --feed mainnet   # race two connections, see below
 cargo test
 ```
 
@@ -39,8 +40,9 @@ uv run --project ../robinhood-chain-sequencer-feed --extra dev python tests/gold
 
 - **Defaults to the public feed**, not a local relay: this client speaks the
   permessage-deflate the public feed requires, which is what the relay was for.
-- **Pull, not a generator.** `FeedConsumer::next_live().await` returns the next live
-  message.
+- **Several sources, first copy wins.** `Feed::builder().source(a).source(b).spawn()`
+  reads each source on its own task and delivers every message once, from whichever
+  had it first. `Feed::recv().await` returns the next live message.
 - **Malformed fields leave a transaction unmodeled** (hash and raw bytes only) instead of
   carrying, say, a 30-byte `to` through. Every node rejects such an envelope anyway.
 - **WebSocket via [yawc](https://crates.io/crates/yawc)**, not tokio-tungstenite, because
@@ -75,6 +77,18 @@ cargo test --features ufsecp   # includes a check that both backends agree
 The wrapper rejects r or s ≥ n before calling `ufsecp_eth_ecrecover`, which would
 otherwise reduce them mod n where libsecp256k1 refuses them, and routes recovery ids 2
 and 3, which `ecrecover`'s v mapping cannot express, through `ufsecp_ecdsa_recover`.
+
+## Racing connections
+
+Two connections to the *same* public endpoint do not receive a message at the same
+moment: over 30 s of mainnet each won about half the messages, and the losing copy
+arrived **~30 ms later on average, up to ~100 ms**. Taking the first copy of each cuts
+that out, which is more than every decoding optimisation in this crate put together.
+The summary line on exit shows, per source, how often it was first and how far behind
+it was otherwise.
+
+The public feed allows two connections per IP and answers a third with HTTP 429, so
+racing beyond two needs more addresses or relays on other hosts.
 
 ## Running a relay
 

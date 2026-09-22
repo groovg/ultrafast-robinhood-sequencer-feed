@@ -17,7 +17,7 @@ secp256k1 = { version = "0.31", features = ["recovery", "global-context"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 tiny-keccak = { version = "2", features = ["keccak"] }
-tokio = { version = "1", features = ["rt", "macros", "net", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 # Not tokio-tungstenite: the public feed refuses a handshake without permessage-deflate,
 # and tungstenite does not implement it.
 yawc = "0.4"
