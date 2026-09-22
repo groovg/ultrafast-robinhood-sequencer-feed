@@ -50,7 +50,9 @@ fn main() {
     link_static(&dir, &["ufsecp_s.lib", "libufsecp.a"]);
     link_static(&dir, &["fastsecp256k1.lib", "libfastsecp256k1.a"]);
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        // C++ runtime, and libatomic for the std::atomic calls clang leaves to it.
         println!("cargo:rustc-link-lib=stdc++");
+        println!("cargo:rustc-link-lib=atomic");
     }
     // A clang-cl build calls compiler-rt builtins that MSVC's linker doesn't pull in.
     if let Ok(rt) = std::env::var("CLANG_RT_DIR") {
