@@ -1,9 +1,10 @@
-//! Decode an Arbitrum Orbit sequencer feed, fast enough to act on it.
+//! Read Robinhood Chain's sequencer feed and decode it quickly.
 //!
-//! A port of the Python package `rhfeed` (github.com/chainstacklabs/robinhood-chain-sequencer-feed), which stays as the baseline. The design
-//! notes — why the RLP scanner copies nothing, why `hash` and `sender` are lazy, what the
-//! feed signature covers, how reorgs show up — live in the Python module docstrings and
-//! are not repeated here; the code follows them line for line.
+//! Ported from Chainstack's Python package `rhfeed`
+//! (github.com/chainstacklabs/robinhood-chain-sequencer-feed). The Python module
+//! docstrings explain the design in more detail (why RLP is scanned instead of parsed,
+//! why `hash` and `sender` are computed lazily, what the feed signature covers, how
+//! reorgs show up). The code here follows them closely.
 
 pub mod codec;
 pub mod consume;

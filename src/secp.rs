@@ -1,9 +1,9 @@
-//! ECDSA public-key recovery to an Ethereum address — the one expensive primitive in the
-//! crate, used for both transaction senders and feed signatures.
+//! ECDSA public-key recovery, returning an Ethereum address. This is the expensive part
+//! of both sender recovery and feed signature checks.
 //!
-//! Two backends so they can be measured against each other: libsecp256k1 always, and
-//! UltrafastSecp256k1 with the `ufsecp` feature, which then becomes the one `recover`
-//! uses. Both must agree on every input; `tests/golden.rs` checks that they do.
+//! There are two implementations so we can compare them. libsecp256k1 is always built.
+//! UltrafastSecp256k1 is used instead when the `ufsecp` feature is on. `tests/golden.rs`
+//! checks that they return the same thing.
 
 use crate::codec::keccak;
 

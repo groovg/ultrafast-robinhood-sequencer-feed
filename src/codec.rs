@@ -1,10 +1,11 @@
-//! Decode Nitro sequencer-feed frames into transactions. Pure functions over bytes.
+//! Decode Nitro sequencer-feed frames into transactions. No I/O, just bytes in and
+//! values out.
 //!
-//! Port of upstream `src/rhfeed/codec.py`; see its docstring for the design. One deliberate
-//! difference: a field that cannot fit what geth itself would parse it into (a nonce or
-//! gas past 64 bits, a value past 256, a `to` that is neither empty nor 20 bytes) leaves
-//! the transaction unmodeled — hash and raw bytes only — where Python would carry the
-//! odd value through. Such an envelope is rejected by every node, so nothing executes.
+//! Ported from the Python version's `src/rhfeed/codec.py`, whose docstring explains the
+//! design. One difference: if a field can't fit the type geth would parse it into (a
+//! nonce or gas over 64 bits, a value over 256 bits, a `to` that isn't empty or 20
+//! bytes), we keep only the hash and raw bytes. Python passes the odd value through.
+//! Nodes reject such transactions, so they never execute either way.
 
 use std::borrow::Cow;
 use std::sync::OnceLock;
@@ -81,7 +82,7 @@ pub fn addr(hex_address: &str) -> Result<[u8; 20], String> {
     fixed(hex_address, "address")
 }
 
-/// EIP-55 checksummed hex. One keccak — which is why `Tx::to` is computed on demand.
+/// EIP-55 checksummed hex. Costs one keccak, which is why `Tx::to` is computed on demand.
 pub fn checksum(address: &[u8]) -> String {
     let lower = hex::encode(address);
     let digest = keccak(lower.as_bytes());
@@ -301,7 +302,7 @@ impl Tx {
         self.to_bytes.as_ref().map(|t| checksum(t))
     }
 
-    /// ECDSA recovery — by far the most expensive thing here. Cached.
+    /// Recovers the sender with ECDSA, by far the most expensive thing here. Cached.
     pub fn sender_bytes(&self) -> Option<[u8; 20]> {
         *self.sender.get_or_init(|| self.recover())
     }
@@ -315,7 +316,7 @@ impl Tx {
         &self.body()[self.value.0..self.value.1]
     }
 
-    /// Value in wei as a decimal string — it can exceed any primitive integer.
+    /// Value in wei as a decimal string, since it can be bigger than any integer type.
     pub fn value_dec(&self) -> String {
         let mut n = self.value_be().to_vec();
         let mut digits = Vec::new();
@@ -404,7 +405,7 @@ pub fn decode_transaction(raw: Bytes) -> Option<Tx> {
     let typed = head < 0x80;
     let tx_type = if typed { head } else { 0 };
     let body = usize::from(typed);
-    // An envelope type we do not model, or one that does not scan: keep the hash.
+    // A type we don't handle, or one that doesn't parse: keep just the hash and raw bytes.
     let m = layout(tx_type).and_then(|l| model(&raw[body..], l));
     let m = m.unwrap_or(Modeled {
         nonce: 0,
@@ -465,7 +466,7 @@ fn walk(payload: &Bytes, depth: usize, out: &mut Vec<Tx>) {
 // --------------------------------------------------------------------------- //
 
 /// A relay frame, `{"version":1,"messages":[...]}`, borrowing its strings from the
-/// buffer it was parsed from. Every field is optional because Python's `.get()` chain is.
+/// buffer it was parsed from. Every field is optional, like the Python version's `.get()` calls.
 #[derive(Deserialize, Default, Clone)]
 pub struct Frame<'a> {
     #[serde(borrow, default)]
@@ -568,7 +569,7 @@ impl FeedMessage {
 }
 
 /// One frame can carry several sequencer messages. With `decode_txs == false` the
-/// envelope is read but `txs` is left empty — how the consumer skips the backlog.
+/// envelope is read but `txs` is left empty. The consumer uses this to skip the backlog.
 pub fn parse_frame(frame: &Frame, decode_txs: bool) -> Vec<FeedMessage> {
     frame
         .entries()
@@ -587,7 +588,8 @@ pub fn parse_entry(entry: &Entry, decode_txs: bool) -> FeedMessage {
     parse_entry_with(entry, l2.as_ref())
 }
 
-/// An entry's l2Msg, base64-decoded - once, so verification and decoding can share it.
+/// An entry's l2Msg, base64-decoded. Decode it once and pass it to both verification and
+/// decoding.
 /// `Ok(None)` when absent or empty.
 pub fn l2_msg(entry: &Entry) -> Result<Option<Bytes>, base64_simd::Error> {
     match entry.incoming().and_then(|i| i.l2_msg.as_deref()) {

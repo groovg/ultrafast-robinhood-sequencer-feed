@@ -1,9 +1,9 @@
-//! Hold the port to the Python baseline, field by field.
+//! Checks the Rust decoder against the Python version, field by field.
 //!
-//! `golden.jsonl` is what the baseline decodes from `tests/fixtures/frames.jsonl` plus envelopes
-//! signed from its test templates, written by `golden.py`. The Python side is itself
-//! cross-checked against eth-account, eth_utils and rlp, so matching it here inherits
-//! those checks. Regenerate after changing the Python decoder:
+//! `golden.jsonl` holds what the Python code decodes from `tests/fixtures/frames.jsonl`,
+//! plus transactions signed from its test templates. `golden.py` writes it. The Python
+//! code is itself tested against eth-account, eth_utils and rlp, so matching it here
+//! means matching those too. Regenerate the file after changing the Python decoder:
 //!
 //!     uv run --project ../robinhood-chain-sequencer-feed --extra dev python tests/golden.py > tests/golden.jsonl
 

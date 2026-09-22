@@ -1,9 +1,10 @@
-//! The decoder reads untrusted bytes off the network, so nothing it is handed may panic.
+//! The decoder reads untrusted bytes from the network, so no input may make it panic.
 //!
-//! Real transactions, batches and frames from the capture, mutated at random — bytes
-//! flipped, cut short, extended, length prefixes rewritten — and every field read,
-//! including the lazy ones. A seeded generator, so a failure reproduces; set
-//! `RHFEED_ROUNDS` for a longer run than CI's (500 000 in release passed on 2026-09-23).
+//! We take real transactions, batches and frames from the recording, break them at
+//! random (flip bits, cut them short, add junk, rewrite length prefixes) and read every
+//! field, including the lazy ones. The random generator is seeded, so failures
+//! reproduce. Set `RHFEED_ROUNDS` for a longer run than CI does. 500,000 rounds in
+//! release mode passed on 2026-09-23.
 
 use std::path::Path;
 

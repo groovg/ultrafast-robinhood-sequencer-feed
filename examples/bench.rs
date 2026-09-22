@@ -1,11 +1,11 @@
-//! The Rust half of the Python-vs-Rust comparison; `bench/bench.py` is the other half
-//! and measures the same rows the same way (best of N rounds).
+//! The Rust half of the Python vs Rust benchmark. `bench/bench.py` is the Python half and
+//! measures the same things the same way (best of N rounds).
 //!
 //!     cargo run --release --example bench [capture.jsonl]
 //!     cargo run --release --example bench --features ufsecp [capture.jsonl]
 //!
-//! Per-transaction rows each read one more field than the row above, as in
-//! `examples/bench.py`, so the differences are what that field costs.
+//! Each per-transaction row reads one more field than the row above it, so the
+//! difference between two rows is what that field costs.
 
 use std::hint::black_box;
 use std::path::PathBuf;

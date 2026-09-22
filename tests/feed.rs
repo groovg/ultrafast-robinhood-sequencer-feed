@@ -1,5 +1,5 @@
-//! `Feed` against real WebSocket servers on localhost: the network code path end to
-//! end — handshake headers, backlog, reconnects, and racing two sources.
+//! Runs `Feed` against real WebSocket servers on localhost. Covers what the unit tests
+//! can't: handshake headers, the backlog, reconnects, and two sources at once.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

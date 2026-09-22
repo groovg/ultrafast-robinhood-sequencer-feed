@@ -1,4 +1,4 @@
-//! Read frames from one or more Nitro feeds and hand the decoded messages over.
+//! Read one or more Nitro feeds and hand over decoded messages.
 //!
 //! ```no_run
 //! # async fn run() {
@@ -13,31 +13,28 @@
 //! # }
 //! ```
 //!
-//! **Several sources, first copy wins.** Each source is a connection with its own task:
-//! it reads, parses, verifies and decodes on its own, so a slow consumer or a slow
-//! source never delays the others. Every sequence number is delivered once, from
-//! whichever source had it first; later copies are counted per source with how far
-//! behind the first they arrived (`Stats::sources`), which is how you find out which
-//! endpoint is actually fastest from where you run.
+//! Each source gets its own connection and its own task, which reads, parses, verifies
+//! and decodes. A slow source or a slow consumer doesn't hold up the others. Every
+//! sequence number is delivered once, from the source that had it first. Later copies
+//! are counted per source along with how late they were (`Stats::sources`), so you can
+//! see which endpoint is fastest from where you are.
 //!
-//! The rest follows the baseline's `consume.py` — its docstring is the reference:
+//! The rest works like the Python version's `consume.py`:
 //!
-//! - **Backlog.** A new connection is replayed the relay's backlog first. It is
-//!   counted, not decoded and not delivered; a message is live once the sequencer's own
-//!   timestamp on it is seconds old.
-//! - **Reconnects** re-request the *last* seen sequence number, not the next: one past
-//!   the tail is a failed lookup, and Nitro answers that with the entire backlog.
-//! - **Reorgs.** Nitro has no reorg message; the replacement arrives under a sequence
-//!   number already seen, with a different block hash. That is delivered with
-//!   `reorg` set and rewinds the watermark. With several sources, a lagging one can
-//!   still be sending the pre-reorg blocks; those match a remembered hash and are
-//!   dropped as duplicates.
-//! - **Verification** happens before the watermark moves, so an injected frame cannot
-//!   make a reconnect skip real messages. A copy of an already-delivered message
-//!   (same sequence number, same block hash) is dropped without verifying: the block
-//!   hash is signed, and the first copy was checked.
-//! - **Silence** is narrated through `log`: which source cannot connect, which one is
-//!   connected but quiet.
+//! - Backlog: a new connection first gets replayed the relay's backlog. We count those
+//!   messages but don't decode or deliver them. A message counts as live once its
+//!   sequencer timestamp is only a few seconds old.
+//! - Reconnects: we ask for the last sequence number we saw, not the one after it. If
+//!   you ask for a number past the end, Nitro can't find it and sends the whole backlog.
+//! - Reorgs: Nitro has no reorg message. The new block just arrives again under a
+//!   sequence number we've already seen, with a different block hash. We deliver it with
+//!   `reorg` set and move the watermark back. With several sources, a slower one may
+//!   still send the old blocks afterwards. Those match a hash we remember and get dropped.
+//! - Verification happens before the watermark moves, so a forged frame can't make a
+//!   reconnect skip real messages. A copy of a message we already delivered (same
+//!   sequence number, same block hash) is dropped without checking it again. The block
+//!   hash is part of the signed data and the first copy was already checked.
+//! - Problems are logged: which source can't connect, which one is connected but silent.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -56,7 +53,7 @@ use crate::verify::Verifier;
 /// Where a local Nitro relay listens by default (see README.md for running one).
 pub const LOCAL_RELAY: &str = "ws://127.0.0.1:9642";
 
-/// Robinhood's public endpoints. Rate-limited per client, not per connection.
+/// Robinhood's public endpoints. At most two connections per IP.
 pub const MAINNET_FEED: &str = "wss://feed.mainnet.chain.robinhood.com";
 pub const TESTNET_FEED: &str = "wss://feed.testnet.chain.robinhood.com";
 
@@ -145,8 +142,8 @@ impl State {
                     Verdict::Reorg
                 }
             }
-            // Same block, or unknown on either side: better a missed reorg than a
-            // rewind we cannot justify.
+            // Same block, or a hash missing on one side. If we can't tell, we treat it
+            // as a duplicate rather than rewinding on a guess.
             Some(_) => Verdict::Duplicate,
             None if seq > self.highest_seq => Verdict::New,
             None => Verdict::Duplicate,
@@ -212,7 +209,7 @@ impl Shared {
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
-        // A panic while holding this lock leaves counters, nothing that can be torn.
+        // The lock only guards counters and a map, so a poisoned lock is still usable.
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -243,8 +240,8 @@ impl Shared {
                     continue;
                 }
             }
-            // Decoded once, for the signature and the transactions both; a backlog
-            // message that is not being verified needs neither.
+            // Decode l2Msg once and use it for both the signature and the transactions.
+            // A backlog message that isn't being verified needs neither.
             let l2 = if live || self.verify.is_some() {
                 l2_msg(entry)
             } else {
@@ -300,13 +297,13 @@ impl Shared {
         out
     }
 
-    /// Drop an unverified message without advancing the watermark — otherwise one
+    /// Drop an unverified message without moving the watermark. Otherwise one
     /// injected frame could make the next reconnect skip the real messages behind it.
     fn reject(&self, entry: &Entry, seq: i64) {
         {
             let mut st = self.lock();
             st.stats.unverified_messages += 1;
-            // Once, then counted: a wrong chain id rejects *every* message.
+            // Log only the first one. With a wrong chain id every message fails.
             if std::mem::replace(&mut st.warned_unverified, true) {
                 return;
             }
@@ -499,8 +496,8 @@ impl Source {
                 st.stats.sources[self.index].reconnects += 1;
             }
             if err.contains("429") {
-                // The public feed admits two connections per client IP and answers the
-                // rest with 429. Retrying fast only keeps hitting the limit.
+                // The public feed allows two connections per IP and answers the rest with
+                // 429. Retrying quickly would just hit the limit again.
                 delay = MAX_RECONNECT_DELAY;
                 warn!(
                     "{} refused the connection as rate-limited (HTTP 429): the public feed allows \
@@ -511,10 +508,10 @@ impl Source {
                 tokio::time::sleep(delay).await;
                 continue;
             }
-            // Never fail silently: the retry loop would otherwise hide an unreachable
-            // feed forever behind an empty terminal.
+            // Always log the failure. Otherwise a feed that can't be reached just looks
+            // like a quiet feed.
             warn!(
-                "cannot read {} ({err}) — retrying in {:.1}s{}",
+                "cannot read {} ({err}), retrying in {:.1}s{}",
                 self.url,
                 delay.as_secs_f64(),
                 if failures == 1 {
@@ -553,8 +550,8 @@ impl Source {
     }
 
     fn poll_interval(&self) -> Duration {
-        // Well inside the threshold, or a stall starting just after a tick goes
-        // unreported for twice as long as advertised.
+        // Check four times per stall_warning period, so a stall gets reported close to
+        // when it hits the threshold.
         if self.stall_warning.is_zero() {
             Duration::from_secs(3600)
         } else {
@@ -578,7 +575,7 @@ impl Source {
                     {
                         stall_warned = true; // once per stall, not once per poll
                         warn!(
-                            "no frames from {} for {:.0}s — connected, but nothing is \
+                            "no frames from {} for {:.0}s. Connected, but nothing is \
                              arriving. For a relay, usually its own upstream is down",
                             self.url,
                             idle.as_secs_f64(),
@@ -615,7 +612,7 @@ impl Source {
                 if live {
                     info!("{} is live", self.url);
                 } else if last_narrated.elapsed() >= interval {
-                    // Frames flowing, none current yet: a relay replaying its backlog.
+                    // Frames are arriving but none are recent yet, so we're still in the backlog.
                     last_narrated = now;
                     info!("{}: draining backlog, none current yet", self.url);
                 }

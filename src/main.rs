@@ -1,5 +1,6 @@
-//! Command line: stream decoded transactions from a Nitro feed. Port of
-//! upstream `src/rhfeed/cli.py`, same flags and same output, so the two can be diffed.
+//! The `rhfeed` command: stream decoded transactions from the feed. It takes the same
+//! flags and prints the same output as the Python version's `cli.py`, so you can diff
+//! the two.
 
 use std::collections::HashSet;
 use std::process::exit;
@@ -13,8 +14,8 @@ use rhfeed::{
     Feed, FeedMessage, LOCAL_RELAY, MAINNET_FEED, MAINNET_VERIFIER, TESTNET_FEED, Tx, addr, sel,
 };
 
-/// How much of an address to print. Full hashes are worth their width because you paste
-/// them into an explorer; several 42-character addresses per line are not.
+/// How many characters of an address to print. Hashes are printed in full because
+/// people paste them into explorers. Full addresses would make the lines too long.
 const ADDR_WIDTH: usize = 10;
 
 /// Stream decoded transactions from Robinhood Chain's sequencer feed.
@@ -51,8 +52,8 @@ struct Args {
     sender: Vec<String>,
 }
 
-/// The filters, applied cheapest first: `to` and `selector` are set lookups on bytes
-/// already sliced out; `sender` costs an ECDSA recovery, so it goes last.
+/// The filters, cheapest first. `to` and `selector` are just set lookups. `sender` needs
+/// an ECDSA recovery, so it's checked last.
 struct Filter {
     to: Option<HashSet<[u8; 20]>>,
     selector: Option<HashSet<[u8; 4]>>,
@@ -119,7 +120,7 @@ struct JsonTx {
     hash: String,
     tx_type: u8,
     to: Option<String>,
-    /// Wei can exceed any JSON-safe integer; written as a bare number, like Python does.
+    /// Written as a raw JSON number like the Python version does, since wei can exceed u64.
     value: Box<RawValue>,
     nonce: u64,
     gas: u64,
@@ -166,8 +167,7 @@ fn json_line(msg: &FeedMessage, txs: &[&Tx], show_sender: bool) -> String {
     serde_json::to_string(&line).unwrap()
 }
 
-/// Connection notes and warnings, on stderr and prefixed like the summary line, so
-/// redirecting stdout still leaves them visible.
+/// Logs go to stderr with a `#` prefix, so they stay visible when stdout is redirected.
 struct StderrLog;
 
 impl log::Log for StderrLog {
@@ -201,8 +201,8 @@ async fn main() {
         .collect();
     let verify = !args.no_verify;
     if verify && urls.contains(&TESTNET_FEED) {
-        // The chain id is signed, so every testnet message would be dropped and the run
-        // would read like a dead feed rather than a verifier pointed at the wrong chain.
+        // The chain id is part of the signed data, so every testnet message would fail
+        // and it would look like the feed is dead.
         eprintln!(
             "rhfeed: verification only knows mainnet's chain id and signer, and the chain id \
              is signed, so every testnet message would be dropped. Pass --no-verify, or build a \
@@ -220,8 +220,8 @@ async fn main() {
         builder = builder.verify(MAINNET_VERIFIER.clone());
     }
     let mut feed = builder.spawn();
-    // Recovering a sender is ~15x every other field put together, so it happens only
-    // when a --sender filter already forced the work.
+    // Recovering a sender costs about 15 times more than all other fields together, so
+    // we only show senders when --sender already made us recover them.
     let show_sender = keep.sender.is_some();
     let mut shown = 0usize;
 
@@ -262,8 +262,8 @@ async fn main() {
             }
         }
     };
-    // A deadline rather than a per-message check: --seconds bounds a run that might see
-    // no messages at all.
+    // A timer instead of checking the time per message, so --seconds works even when
+    // nothing arrives.
     let deadline = async {
         match args.seconds {
             Some(s) => tokio::time::sleep(Duration::from_secs_f64(s)).await,
@@ -278,7 +278,7 @@ async fn main() {
 
     let s = feed.stats();
     let counted = if keep.active() { "matched" } else { "seen" };
-    // Report the verification result even when it is zero: that is the point of asking.
+    // Print the count even when it's zero, so you can see the check ran.
     let checked = if verify {
         format!(", {} unverified dropped", s.unverified_messages)
     } else {
@@ -290,7 +290,7 @@ async fn main() {
         s.live_messages, s.backlog_messages, s.reconnects
     );
     if s.sources.len() > 1 {
-        // Which endpoint is actually fastest from here: the reason to run several.
+        // Shows which source was fastest from this machine.
         for src in &s.sources {
             let lag = src.lag_mean().map_or("-".into(), |m| {
                 format!("{:.1} ms mean, {:.1} ms max", ms(m), ms(src.lag_max))

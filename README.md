@@ -1,61 +1,80 @@
 # ultrafast-robinhood-sequencer-feed
 
-Decode Robinhood Chain's sequencer feed — the ordered transactions, before any RPC
-can show them — in Rust, as fast as the hardware allows.
+A Rust client for Robinhood Chain's sequencer feed. It shows you transactions in the
+order the sequencer picked, before they reach any RPC node.
 
-This started as a port of Chainstack's
-[robinhood-chain-sequencer-feed](https://github.com/chainstacklabs/robinhood-chain-sequencer-feed),
-which stays the reference: the Rust decoder is tested field by field against it, and
-benchmarked against it. Its [README](https://github.com/chainstacklabs/robinhood-chain-sequencer-feed#readme)
-explains what the feed is, why there is no public mempool, and what the decoded data can
-and cannot tell you.
+It started as a port of Chainstack's
+[robinhood-chain-sequencer-feed](https://github.com/chainstacklabs/robinhood-chain-sequencer-feed)
+(Python). We still use that project as the reference: the tests check our decoder
+against it field by field, and the benchmarks compare the two. If you want to know how
+the feed works and what you can and can't learn from it, their
+[README](https://github.com/chainstacklabs/robinhood-chain-sequencer-feed#readme) is
+the place to start.
+
+## Quick start
 
 ```bash
-cargo run --release                         # stream decoded, signature-checked transactions off mainnet
-cargo run --release -- --feed mainnet --feed mainnet   # race two connections, see below
+cargo run --release                                    # mainnet, signatures checked
+cargo run --release -- --feed mainnet --feed mainnet   # two connections, first copy wins
+cargo run --release -- --json --to 0xabc...            # JSON lines, one contract
 cargo test
 ```
 
-Performance against the baseline: [BENCHMARKS.md](BENCHMARKS.md).
+Speed numbers are in [BENCHMARKS.md](BENCHMARKS.md).
 
-## Layout
+## Using it as a library
 
-| | |
-|---|---|
-| `src/` | the crate: `codec` (decoder), `verify` (feed signatures), `secp` (ECDSA backends), `consume` (WebSocket consumer), `main` (CLI) |
-| `tests/golden.rs` | holds the decoder to the baseline, from `tests/golden.jsonl` |
-| `tests/golden.py` | writes `golden.jsonl` from the baseline |
-| `tests/fixtures/` | real mainnet frames and a signed message, from upstream |
-| `examples/bench.rs`, `bench/` | the Rust and Python halves of the benchmark, and a feed capture script |
+```rust
+let mut feed = rhfeed::Feed::builder()
+    .source(rhfeed::MAINNET_FEED)
+    .source(rhfeed::MAINNET_FEED)
+    .verify(rhfeed::MAINNET_VERIFIER.clone())
+    .spawn();
 
-The Python scripts run against a checkout of the baseline next to this repository:
-
-```bash
-git clone https://github.com/chainstacklabs/robinhood-chain-sequencer-feed ../robinhood-chain-sequencer-feed
-uv run --project ../robinhood-chain-sequencer-feed --extra dev python tests/golden.py > tests/golden.jsonl
+while let Some(msg) = feed.recv().await {
+    for tx in &msg.txs {
+        // tx.to_bytes and tx.selector are free, tx.hash() and tx.sender() cost a hash / an ECDSA recovery
+    }
+}
 ```
 
-## Differences from the baseline
+## Two connections are faster than one
 
-- **Defaults to the public feed**, not a local relay: this client speaks the
-  permessage-deflate the public feed requires, which is what the relay was for.
-- **Signatures are checked by default.** Every message must be signed by the
-  sequencer key (one ECDSA recovery, ~40 us); `--no-verify` turns that off.
-- **Several sources, first copy wins.** `Feed::builder().source(a).source(b).spawn()`
-  reads each source on its own task and delivers every message once, from whichever
-  had it first. `Feed::recv().await` returns the next live message.
-- **Malformed fields leave a transaction unmodeled** (hash and raw bytes only) instead of
-  carrying, say, a 30-byte `to` through. Every node rejects such an envelope anyway.
-- **WebSocket via [yawc](https://crates.io/crates/yawc)**, not tokio-tungstenite, because
-  the public feed requires permessage-deflate and tungstenite has none.
+We opened two connections to the same public endpoint and compared arrival times. Each
+connection got about half the messages first. The other copy showed up about 30 ms
+later on average, sometimes 100 ms later. `Feed` keeps whichever copy arrives first and
+drops the other, so you get the better of the two on every message. That's worth far
+more than all the decoding work in this crate.
 
-## UltrafastSecp256k1 backend
+The public feed allows two connections per IP. A third one gets HTTP 429. To race more
+than two you need more IPs, or relays on other machines.
 
-Sender and signature recovery use libsecp256k1 by default — the same C library
-coincurve wraps on the Python side. `--features ufsecp` switches to
-[UltrafastSecp256k1](https://github.com/shrec/UltrafastSecp256k1) through its C ABI.
-Its Rust crates are not on crates.io, so build its static library first — with
-clang-cl, which makes it 1.66x libsecp256k1 where MSVC `cl` makes it 1.07x. From a VS x64
+When the program exits it prints, for each source, how often it was first and how far
+behind it was the rest of the time.
+
+## How it differs from the Python version
+
+- It connects to the public feed by default. The Python version expects a local relay,
+  mostly because the public feed requires permessage-deflate. This client handles that
+  itself.
+- It checks the sequencer's signature on every message by default. That costs about
+  40 µs per message. Use `--no-verify` to skip it (you'll need that for testnet).
+- It can read from several sources at once and deliver each message once.
+- If a transaction has a field that can't be valid (a 30-byte `to` address, a nonce
+  over 64 bits) we keep only its hash and raw bytes. Python passes the odd value
+  through. No node would accept such a transaction anyway.
+- The WebSocket client is [yawc](https://crates.io/crates/yawc). tokio-tungstenite
+  doesn't support permessage-deflate.
+
+## Faster ECDSA with UltrafastSecp256k1
+
+Most of the time spent on a message goes to ECDSA. By default we use libsecp256k1, the
+same C library the Python version calls through coincurve.
+[UltrafastSecp256k1](https://github.com/shrec/UltrafastSecp256k1) is about 1.65x faster
+at recovering a public key, if you build it with clang. With MSVC it's barely faster at
+all. Turn it on with `--features ufsecp`.
+
+It isn't on crates.io, so you build it yourself first. On Windows, from a VS x64
 developer prompt with LLVM and Ninja on `PATH`:
 
 ```bat
@@ -65,46 +84,64 @@ cmake --preset windows-clang-cl -DSECP256K1_ENABLE_OPENMP=OFF -DSECP256K1_BUILD_
 cmake --build out/windows-clang-cl --target ufsecp_static
 ```
 
-Static because the clang-cl build of its DLL does not compile (a `thread_local` inside a
-`dllexport` function); OpenMP off because recovering one signature does not use it and
-it would need its runtime linked. Then point cargo at the build directory:
+Then point cargo at the build directory:
 
 ```bash
 export UFSECP_LIB_DIR=/path/to/UltrafastSecp256k1/out/windows-clang-cl
 export CLANG_RT_DIR="C:/Program Files/LLVM/lib/clang/22/lib/windows"   # clang-cl builds only
-cargo test --features ufsecp   # includes a check that both backends agree
+cargo test --features ufsecp   # also checks that both libraries give the same answers
 ```
 
-The wrapper rejects r or s ≥ n before calling `ufsecp_eth_ecrecover`, which would
-otherwise reduce them mod n where libsecp256k1 refuses them, and routes recovery ids 2
-and 3, which `ecrecover`'s v mapping cannot express, through `ufsecp_ecdsa_recover`.
+A few notes on the build:
 
-## Racing connections
-
-Two connections to the *same* public endpoint do not receive a message at the same
-moment: over 30 s of mainnet each won about half the messages, and the losing copy
-arrived **~30 ms later on average, up to ~100 ms**. Taking the first copy of each cuts
-that out, which is more than every decoding optimisation in this crate put together.
-The summary line on exit shows, per source, how often it was first and how far behind
-it was otherwise.
-
-The public feed allows two connections per IP and answers a third with HTTP 429, so
-racing beyond two needs more addresses or relays on other hosts.
+- We link the static library because the clang-cl build of the DLL fails to compile
+  (a `thread_local` inside a `dllexport` function).
+- OpenMP is off. Recovering a single signature doesn't use it, and leaving it on means
+  linking its runtime too.
+- `ufsecp_eth_ecrecover` reduces r and s modulo n, while libsecp256k1 rejects values
+  that are too large. Our wrapper rejects them before the call so both libraries agree.
+  Recovery ids 2 and 3 go through `ufsecp_ecdsa_recover` because `ecrecover` has no way
+  to express them.
 
 ## Running a relay
 
-The public feed rate-limits per client, not per connection. To share one upstream
-connection between several consumers, run Offchain Labs' relay and point them at it
-with `--feed relay`:
+The public feed limits connections per client. If several programs on one machine
+need the feed, run Offchain Labs' relay once and point them all at it with
+`--feed relay`:
 
 ```bash
-docker run -d --name relay -p 127.0.0.1:9642:9642 --entrypoint relay   offchainlabs/nitro-node:v3.11.4-7d5ac27   --node.feed.output.addr=0.0.0.0 --chain.id=4663   --node.feed.input.url=wss://feed.mainnet.chain.robinhood.com
+docker run -d --name relay -p 127.0.0.1:9642:9642 --entrypoint relay \
+  offchainlabs/nitro-node:v3.11.4-7d5ac27 \
+  --node.feed.output.addr=0.0.0.0 --chain.id=4663 \
+  --node.feed.input.url=wss://feed.mainnet.chain.robinhood.com
 ```
 
-A relay verifies no signatures and hides reorgs (it dedups by sequence number), so
-keep signature checking on (the default) and prefer the direct feed when reorgs matter.
+Keep in mind that the relay doesn't check signatures, and it hides reorgs because it
+drops any message whose sequence number it has already sent. Leave signature checking
+on, and connect to the feed directly if you care about reorgs.
+
+## Repository layout
+
+| Path | What's there |
+|---|---|
+| `src/codec.rs` | decoding frames and transactions |
+| `src/verify.rs` | checking the sequencer's signature |
+| `src/secp.rs` | ECDSA recovery, libsecp256k1 or UltrafastSecp256k1 |
+| `src/consume.rs` | `Feed`: connections, reconnects, dedup, reorgs |
+| `src/main.rs` | the `rhfeed` command |
+| `tests/golden.rs` | checks the decoder against the Python version's output in `tests/golden.jsonl` |
+| `tests/robustness.rs` | feeds the decoder broken input and makes sure it doesn't crash |
+| `tests/feed.rs` | runs `Feed` against local WebSocket servers |
+| `tests/fixtures/` | real mainnet frames and a signed message (from the Python repo) |
+| `examples/bench.rs`, `bench/` | the Rust and Python benchmarks, and a script to record the feed |
+
+The Python scripts need the Python repo checked out next to this one:
+
+```bash
+git clone https://github.com/chainstacklabs/robinhood-chain-sequencer-feed ../robinhood-chain-sequencer-feed
+uv run --project ../robinhood-chain-sequencer-feed --extra dev python tests/golden.py > tests/golden.jsonl
+```
 
 ## License
 
-Apache-2.0, as upstream: the Rust sources are a derivative work of Chainstack's
-robinhood-chain-sequencer-feed.
+Apache-2.0, same as the Python version this code is derived from.

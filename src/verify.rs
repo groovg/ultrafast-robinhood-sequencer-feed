@@ -1,8 +1,10 @@
-//! Check that a feed message really came from the chain's sequencer key.
+//! Check that a feed message was signed by the chain's sequencer key.
 //!
-//! Port of upstream `src/rhfeed/verify.py`; its docstring explains why this matters even behind
-//! TLS and a relay you run, and the two preimage traps (`requestId` and `baseFeeL1` are
-//! skipped when null, and `baseFeeL1` is minimal big-endian, so zero adds no bytes).
+//! Ported from the Python version's `src/rhfeed/verify.py`. Its docstring explains why
+//! this is worth doing even over TLS or through your own relay. It also covers two
+//! details that are easy to get wrong in the signed data: `requestId` and `baseFeeL1`
+//! are left out entirely when null, and `baseFeeL1` is written as minimal big-endian
+//! bytes, so a zero base fee adds nothing.
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -11,7 +13,7 @@ use keccak_asm::{Digest, Keccak256};
 
 use crate::codec::{Entry, b64, l2_msg};
 
-/// Domain separator, so a feed signature cannot be replayed as one over anything else.
+/// Prefix on the signed data, so a feed signature can't be reused for anything else.
 pub const FEED_PREFIX: &[u8] = b"Arbitrum Nitro Feed:";
 
 pub const MAINNET_CHAIN_ID: u64 = 4663;
@@ -27,7 +29,7 @@ fn unhex(value: &str) -> Option<Vec<u8>> {
     hex::decode(value.strip_prefix("0x").unwrap_or(value)).ok()
 }
 
-/// The exact bytes the sequencer hashed, rebuilt from one raw envelope — Nitro's
+/// The exact bytes the sequencer signed, rebuilt from one raw envelope. See Nitro's
 /// `BroadcastFeedMessage.SignatureHash`. None when a field cannot be encoded at all.
 pub fn signature_payload(entry: &Entry, chain_id: u64) -> Option<Vec<u8>> {
     let l2 = l2_msg(entry).ok()?;
@@ -65,7 +67,7 @@ fn preimage(
     if let Some(hash) = entry.block_hash.as_deref().filter(|h| !h.is_empty()) {
         out(&unhex(hash)?);
     }
-    // Timeboost's express-lane bitmap: absent here, present on Arbitrum One, signed either way.
+    // Timeboost's express-lane bitmap. Robinhood Chain doesn't send it, Arbitrum One does.
     if let Some(meta) = entry.block_metadata.as_deref().filter(|m| !m.is_empty()) {
         out(&b64(meta)?);
     }
@@ -84,7 +86,7 @@ fn preimage(
         .to_be_bytes());
     out(&header.and_then(|h| h.timestamp).unwrap_or(0).to_be_bytes());
 
-    // Both omitted when null rather than zero-padded.
+    // Both are left out when null. They are not zero-padded.
     if let Some(id) = header.and_then(|h| h.request_id.as_deref()) {
         out(&unhex(id)?);
     }
@@ -99,8 +101,9 @@ fn preimage(
     Some(())
 }
 
-/// The address that signed this message, or None if that cannot be had. None means
-/// unusable, not forged: a forged message recovers some address, just not one you accept.
+/// The address that signed this message, or None if there's no usable signature. A
+/// forged message still recovers some address, so compare the result, don't just check
+/// for None.
 pub fn recover_signer(entry: &Entry, chain_id: u64) -> Option<[u8; 20]> {
     recover_signer_with(entry, chain_id, l2_msg(entry).ok()?.as_deref())
 }
@@ -123,8 +126,9 @@ pub fn recover_signer_with(entry: &Entry, chain_id: u64, l2: Option<&[u8]>) -> O
     )
 }
 
-/// A chain id and the signers you will accept for it. A fixed set rather than Nitro's
-/// runtime L1 lookup, so verification stays offline; a key rotation needs a new set.
+/// A chain id and the signers you accept for it. Nitro looks the signer up on L1 at
+/// runtime. We use a fixed list so checking works offline, which means a key rotation
+/// needs a new list.
 #[derive(Clone, Debug)]
 pub struct Verifier {
     pub chain_id: u64,
