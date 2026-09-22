@@ -6,7 +6,8 @@ Run it with the baseline checked out next to this repository (or at $RHFEED_BASE
 
     git clone https://github.com/chainstacklabs/robinhood-chain-sequencer-feed ../robinhood-chain-sequencer-feed
 
-Two kinds of line: one per frame in `tests/fixtures/frames.jsonl` (real traffic), and one
+Two kinds of line: one per frame in `tests/fixtures/frames.jsonl` (real traffic), keyed by
+its index among the non-empty lines, and one
 per envelope signed from the baseline's `tests/test_codec.py` templates (every layout the decoder models,
 plus a pre-EIP-155 legacy signature, which the capture does not contain).
 """
@@ -27,9 +28,9 @@ from test_codec import ACCOUNT, TEMPLATES  # noqa: E402
 from rhfeed import decode_transaction, parse_frame  # noqa: E402
 
 
-def tx_record(tx) -> dict:
-    return {
-        "raw": tx.raw.hex(),
+def tx_record(tx, raw: bool = False) -> dict:
+    # Raw bytes only where the Rust side has nothing else to decode from.
+    return ({"raw": tx.raw.hex()} if raw else {}) | {
         "hash": tx.hash,
         "tx_type": tx.tx_type,
         "to": tx.to,
@@ -44,9 +45,8 @@ def tx_record(tx) -> dict:
 
 
 def main() -> None:
-    for line in (ROOT / "tests" / "fixtures" / "frames.jsonl").read_text().splitlines():
-        if not line.strip():
-            continue
+    frames = (ROOT / "tests" / "fixtures" / "frames.jsonl").read_text().splitlines()
+    for index, line in enumerate(f for f in frames if f.strip()):
         messages = [
             {
                 "seq": m.seq,
@@ -60,12 +60,12 @@ def main() -> None:
             }
             for m in parse_frame(json.loads(line))
         ]
-        print(json.dumps({"frame": line, "messages": messages}))
+        print(json.dumps({"line": index, "messages": messages}))
 
     pre155 = {k: v for k, v in TEMPLATES["legacy"].items() if k != "chainId"}
     for name, spec in [*sorted(TEMPLATES.items()), ("pre155", pre155)]:
         raw = bytes(ACCOUNT.sign_transaction(spec).raw_transaction)
-        print(json.dumps({"template": name, "tx": tx_record(decode_transaction(raw))}))
+        print(json.dumps({"template": name, "tx": tx_record(decode_transaction(raw), raw=True)}))
 
 
 if __name__ == "__main__":

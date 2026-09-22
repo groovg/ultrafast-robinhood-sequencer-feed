@@ -28,6 +28,18 @@ fn golden() -> Vec<Value> {
         .collect()
 }
 
+/// The capture's non-empty lines, which golden.jsonl refers to by index.
+fn frames() -> Vec<String> {
+    std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/frames.jsonl"),
+    )
+    .unwrap()
+    .lines()
+    .filter(|l| !l.trim().is_empty())
+    .map(str::to_owned)
+    .collect()
+}
+
 fn verified_message() -> String {
     std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/verified_message.json"),
@@ -37,11 +49,9 @@ fn verified_message() -> String {
 
 fn assert_tx(tx: &Tx, want: &Value, ctx: &str) {
     let hex_or_null = |v: Option<String>| v.map_or(Value::Null, Value::String);
-    assert_eq!(
-        hex::encode(&tx.raw),
-        want["raw"].as_str().unwrap(),
-        "{ctx}: raw"
-    );
+    if let Some(raw) = want.get("raw") {
+        assert_eq!(hex::encode(&tx.raw), raw.as_str().unwrap(), "{ctx}: raw");
+    }
     assert_eq!(tx.hash_hex(), want["hash"], "{ctx}: hash");
     assert_eq!(tx.tx_type as u64, want["tx_type"], "{ctx}: tx_type");
     assert_eq!(hex_or_null(tx.to()), want["to"], "{ctx}: to");
@@ -65,12 +75,10 @@ fn assert_tx(tx: &Tx, want: &Value, ctx: &str) {
 #[test]
 fn every_captured_frame_decodes_exactly_as_python_does() {
     let mut txs = 0;
-    for (i, line) in golden()
-        .iter()
-        .filter(|g| g.get("frame").is_some())
-        .enumerate()
-    {
-        let frame: Frame = serde_json::from_str(line["frame"].as_str().unwrap()).unwrap();
+    let frames = frames();
+    for line in golden().iter().filter(|g| g.get("line").is_some()) {
+        let i = line["line"].as_u64().unwrap() as usize;
+        let frame: Frame = serde_json::from_str(&frames[i]).unwrap();
         let got = parse_frame(&frame, true);
         let want = line["messages"].as_array().unwrap();
         assert_eq!(got.len(), want.len(), "frame {i}");
@@ -274,8 +282,8 @@ fn ufsecp_and_libsecp256k1_recover_the_same_addresses() {
     check(&digest, &[0; 32], &[1; 32]);
     // Real feed signatures. Transaction senders go through ufsecp in the golden tests
     // above whenever this feature is on, and are held to Python's answers there.
-    for line in golden().iter().filter(|g| g.get("frame").is_some()) {
-        let frame: Frame = serde_json::from_str(line["frame"].as_str().unwrap()).unwrap();
+    for line in frames() {
+        let frame: Frame = serde_json::from_str(&line).unwrap();
         for e in frame.entries() {
             if let Some(sig) = e.signature_v2.as_deref() {
                 use base64::Engine;
