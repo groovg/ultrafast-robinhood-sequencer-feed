@@ -14,7 +14,7 @@ pub use codec::{
     FeedMessage, Frame, Tx, addr, checksum, decode_l2_message, decode_transaction,
     is_filtered_call, keccak, parse_frame, sel, selector_of,
 };
-pub use consume::{DEFAULT_RELAY, FeedConsumer, MAINNET_FEED, TESTNET_FEED};
+pub use consume::{FeedConsumer, LOCAL_RELAY, MAINNET_FEED, TESTNET_FEED};
 pub use verify::{
     FEED_PREFIX, MAINNET_CHAIN_ID, MAINNET_SIGNER, MAINNET_VERIFIER, Verifier, recover_signer,
     signature_payload,

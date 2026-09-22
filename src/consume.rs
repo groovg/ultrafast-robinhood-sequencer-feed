@@ -1,8 +1,8 @@
-//! Read frames from a Nitro relay and hand them to the decoder.
+//! Read frames from a Nitro feed — the public one or a relay — and hand them to the decoder.
 //!
 //! ```no_run
 //! # async fn run() {
-//! let mut feed = rhfeed::FeedConsumer::new(rhfeed::DEFAULT_RELAY);
+//! let mut feed = rhfeed::FeedConsumer::new(rhfeed::MAINNET_FEED);
 //! loop {
 //!     let msg = feed.next_live().await;
 //!     for tx in &msg.txs { /* ... */ }
@@ -29,10 +29,10 @@ use yawc::{HttpRequestBuilder, MaybeTlsStream, OpCode, Options, WebSocket};
 use crate::codec::{Entry, FeedMessage, Frame, parse_frame};
 use crate::verify::Verifier;
 
-/// A relay you run. The default because it is what you should be pointing at.
-pub const DEFAULT_RELAY: &str = "ws://127.0.0.1:9642";
+/// Where a local Nitro relay listens by default (see README.md for running one).
+pub const LOCAL_RELAY: &str = "ws://127.0.0.1:9642";
 
-/// Robinhood's public endpoints. Rate-limited per client — point a relay at these.
+/// Robinhood's public endpoints. Rate-limited per client, not per connection.
 pub const MAINNET_FEED: &str = "wss://feed.mainnet.chain.robinhood.com";
 pub const TESTNET_FEED: &str = "wss://feed.testnet.chain.robinhood.com";
 
@@ -56,7 +56,7 @@ pub struct Stats {
     pub reorgs: u64,
 }
 
-/// One connection to a relay, reconnecting, with backlog and duplicate handling.
+/// One connection to a feed, reconnecting, with backlog and duplicate handling.
 pub struct FeedConsumer {
     pub url: String,
     /// Drop messages without a good signature from an allowed signer. Off by default
@@ -215,14 +215,14 @@ impl FeedConsumer {
         if self.failures == 1 {
             self.delay = self.reconnect_delay;
         }
-        // Never fail silently: a relay that was never started is the most common way to
-        // end up staring at an empty terminal, and the retry loop would hide it forever.
+        // Never fail silently: the retry loop would otherwise hide an unreachable feed
+        // forever behind an empty terminal.
         warn!(
             "cannot read {} ({err}) — retrying in {:.1}s{}",
             self.url,
             self.delay.as_secs_f64(),
             if self.failures == 1 {
-                "; is the relay running? (docker compose up -d relay)"
+                "; is the URL right and reachable?"
             } else {
                 ""
             },
@@ -238,7 +238,7 @@ impl FeedConsumer {
             self.stall_warned = true; // once per stall, not once per poll
             warn!(
                 "no frames from {} for {:.0}s — connected, but nothing is arriving. \
-                 Usually the relay's own upstream is down (check: docker compose logs relay)",
+                 For a relay, usually its own upstream is down",
                 self.url,
                 idle.as_secs_f64(),
             );
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn a_duplicate_is_dropped_silently() {
-        let mut c = FeedConsumer::new(DEFAULT_RELAY);
+        let mut c = FeedConsumer::new(LOCAL_RELAY);
         assert_eq!(feed(&mut c, &[entry_json(1, &hash_of(1))]).len(), 1);
         assert!(feed(&mut c, &[entry_json(1, &hash_of(1))]).is_empty());
         assert_eq!((c.stats.duplicate_messages, c.stats.reorgs), (1, 0));
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn a_changed_block_hash_is_a_reorg_and_rewinds_the_watermark() {
-        let mut c = FeedConsumer::new(DEFAULT_RELAY);
+        let mut c = FeedConsumer::new(LOCAL_RELAY);
         feed(
             &mut c,
             &[
@@ -439,7 +439,7 @@ mod tests {
 
     #[test]
     fn an_unknown_hash_is_not_a_reorg() {
-        let mut c = FeedConsumer::new(DEFAULT_RELAY);
+        let mut c = FeedConsumer::new(LOCAL_RELAY);
         c.reorg_window = 2;
         let seqs: Vec<String> = (1..=10).map(|n| entry_json(n, &hash_of(n as u8))).collect();
         feed(&mut c, &seqs);
@@ -454,14 +454,14 @@ mod tests {
 
     #[test]
     fn a_verifying_consumer_drops_a_forgery_without_advancing() {
-        let mut c = FeedConsumer::new(DEFAULT_RELAY).with_verifier(MAINNET_VERIFIER.clone());
+        let mut c = FeedConsumer::new(LOCAL_RELAY).with_verifier(MAINNET_VERIFIER.clone());
         assert!(feed(&mut c, &[entry_json(99_999_999, &hash_of(1))]).is_empty());
         assert_eq!((c.stats.unverified_messages, c.highest_seq()), (1, -1));
     }
 
     #[test]
     fn a_backlog_message_is_not_decoded() {
-        let mut c = FeedConsumer::new(DEFAULT_RELAY);
+        let mut c = FeedConsumer::new(LOCAL_RELAY);
         let old = r#"{"sequenceNumber":1,"message":{"message":{"header":{"kind":3,"timestamp":1},"l2Msg":"BAAAAAAAAAAA"}}}"#;
         let out = feed(&mut c, &[old.to_string()]);
         assert!(!out[0].live && out[0].txs.is_empty());

@@ -11,9 +11,8 @@ explains what the feed is, why there is no public mempool, and what the decoded 
 and cannot tell you.
 
 ```bash
-docker compose up -d --wait relay           # the official Nitro relay, see docker-compose.yml
-cargo run --release                         # stream decoded transactions from it
-cargo run --release -- --feed mainnet --verify
+cargo run --release                         # stream decoded transactions off mainnet
+cargo run --release -- --verify             # ...dropping any not signed by the sequencer
 cargo test
 ```
 
@@ -38,6 +37,8 @@ uv run --project ../robinhood-chain-sequencer-feed --extra dev python tests/gold
 
 ## Differences from the baseline
 
+- **Defaults to the public feed**, not a local relay: this client speaks the
+  permessage-deflate the public feed requires, which is what the relay was for.
 - **Pull, not a generator.** `FeedConsumer::next_live().await` returns the next live
   message.
 - **Malformed fields leave a transaction unmodeled** (hash and raw bytes only) instead of
@@ -75,7 +76,20 @@ The wrapper rejects r or s ≥ n before calling `ufsecp_eth_ecrecover`, which wo
 otherwise reduce them mod n where libsecp256k1 refuses them, and routes recovery ids 2
 and 3, which `ecrecover`'s v mapping cannot express, through `ufsecp_ecdsa_recover`.
 
+## Running a relay
+
+The public feed rate-limits per client, not per connection. To share one upstream
+connection between several consumers, run Offchain Labs' relay and point them at it
+with `--feed relay`:
+
+```bash
+docker run -d --name relay -p 127.0.0.1:9642:9642 --entrypoint relay   offchainlabs/nitro-node:v3.11.4-7d5ac27   --node.feed.output.addr=0.0.0.0 --chain.id=4663   --node.feed.input.url=wss://feed.mainnet.chain.robinhood.com
+```
+
+A relay verifies no signatures and hides reorgs (it dedups by sequence number), so
+pass `--verify` and prefer the direct feed when reorgs matter.
+
 ## License
 
-Apache-2.0, as upstream. The Rust sources are a derivative work of the baseline; see
-[NOTICE](NOTICE).
+Apache-2.0, as upstream: the Rust sources are a derivative work of Chainstack's
+robinhood-chain-sequencer-feed.

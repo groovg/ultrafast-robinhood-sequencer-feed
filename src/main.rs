@@ -1,4 +1,4 @@
-//! Command line: stream decoded transactions from a Nitro relay. Port of
+//! Command line: stream decoded transactions from a Nitro feed. Port of
 //! upstream `src/rhfeed/cli.py`, same flags and same output, so the two can be diffed.
 
 use std::collections::HashSet;
@@ -10,23 +10,23 @@ use serde::Serialize;
 use serde_json::value::RawValue;
 
 use rhfeed::{
-    DEFAULT_RELAY, FeedConsumer, FeedMessage, MAINNET_FEED, MAINNET_VERIFIER, TESTNET_FEED, Tx,
-    addr, sel,
+    FeedConsumer, FeedMessage, LOCAL_RELAY, MAINNET_FEED, MAINNET_VERIFIER, TESTNET_FEED, Tx, addr,
+    sel,
 };
 
 /// How much of an address to print. Full hashes are worth their width because you paste
 /// them into an explorer; several 42-character addresses per line are not.
 const ADDR_WIDTH: usize = 10;
 
-/// Stream decoded transactions from a Nitro relay.
+/// Stream decoded transactions from Robinhood Chain's sequencer feed.
 ///
-/// Defaults to ws://127.0.0.1:9642, where `docker compose up -d relay` puts the official
-/// Nitro relay. Progress and problems go to stderr, transactions to stdout.
+/// Defaults to the public mainnet feed. Progress and problems go to stderr,
+/// transactions to stdout.
 #[derive(Parser)]
 #[command(name = "rhfeed", version)]
 struct Args {
-    /// Relay URL, or 'mainnet' / 'testnet' for Robinhood's public feed
-    #[arg(long, default_value = DEFAULT_RELAY)]
+    /// 'mainnet', 'testnet', 'relay' (ws://127.0.0.1:9642), or any feed URL
+    #[arg(long, default_value = "mainnet")]
     feed: String,
     /// Stop after this long, whether or not anything arrives
     #[arg(long)]
@@ -191,7 +191,7 @@ async fn main() {
     let url = match args.feed.as_str() {
         "mainnet" => MAINNET_FEED,
         "testnet" => TESTNET_FEED,
-        "relay" => DEFAULT_RELAY,
+        "relay" => LOCAL_RELAY,
         other => other,
     };
     if args.verify && url == TESTNET_FEED {
