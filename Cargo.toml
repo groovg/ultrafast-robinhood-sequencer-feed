@@ -22,6 +22,10 @@ tokio = { version = "1", features = ["rt", "macros", "net", "time", "signal"] }
 # and tungstenite does not implement it.
 yawc = "0.4"
 
+[features]
+# Recover senders with UltrafastSecp256k1 instead of libsecp256k1. Needs its `ufsecp`
+# static library built and UFSECP_LIB_DIR pointing at its build directory; see README.md.
+ufsecp = []
 
 [profile.release]
 lto = "fat"

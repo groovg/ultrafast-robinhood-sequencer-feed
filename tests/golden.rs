@@ -244,3 +244,52 @@ fn an_unusable_signature_is_not_accepted() {
         );
     }
 }
+
+// --------------------------------------------------------------------------- //
+// backends agree
+// --------------------------------------------------------------------------- //
+
+/// Every signature in the capture and the fixtures, through both backends directly.
+#[cfg(feature = "ufsecp")]
+#[test]
+fn ufsecp_and_libsecp256k1_recover_the_same_addresses() {
+    use rhfeed::secp::{libsecp, ufsecp};
+    let mut n = 0;
+    let mut check = |digest: &[u8; 32], r: &[u8; 32], s: &[u8; 32]| {
+        for recid in 0..4 {
+            assert_eq!(
+                libsecp::recover(digest, r, s, recid),
+                ufsecp::recover(digest, r, s, recid)
+            );
+        }
+        n += 1;
+    };
+    let digest = rhfeed::keccak(b"rhfeed");
+    // Out of range: n itself, and all ones. libsecp256k1 rejects these; so must ufsecp.
+    let order =
+        hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141").unwrap();
+    check(&digest, order.as_slice().try_into().unwrap(), &[1; 32]);
+    check(&digest, &[0xff; 32], &[1; 32]);
+    check(&digest, &[1; 32], &[0xff; 32]);
+    check(&digest, &[0; 32], &[1; 32]);
+    // Real feed signatures. Transaction senders go through ufsecp in the golden tests
+    // above whenever this feature is on, and are held to Python's answers there.
+    for line in golden().iter().filter(|g| g.get("frame").is_some()) {
+        let frame: Frame = serde_json::from_str(line["frame"].as_str().unwrap()).unwrap();
+        for e in frame.entries() {
+            if let Some(sig) = e.signature_v2.as_deref() {
+                use base64::Engine;
+                let sig = base64::engine::general_purpose::STANDARD
+                    .decode(sig)
+                    .unwrap();
+                let digest = rhfeed::keccak(&signature_payload(e, MAINNET_CHAIN_ID).unwrap());
+                check(
+                    &digest,
+                    sig[..32].try_into().unwrap(),
+                    sig[32..64].try_into().unwrap(),
+                );
+            }
+        }
+    }
+    assert!(n >= 4);
+}
