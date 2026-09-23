@@ -114,7 +114,7 @@ fn mutated_transactions_never_panic() {
     let lines = capture();
     let raws: Vec<Bytes> = lines
         .iter()
-        .flat_map(|l| parse_frame(&frame_from_slice(l.as_bytes()).unwrap(), true))
+        .flat_map(|l| parse_frame(&frame_from_slice(l.as_bytes()).unwrap()))
         .flat_map(|m| m.txs)
         .map(|t| t.raw)
         .collect();
@@ -153,7 +153,7 @@ fn mutated_frames_never_panic() {
         for entry in frame.entries() {
             let _ = recover_signer(entry, MAINNET_CHAIN_ID);
         }
-        for msg in parse_frame(&frame, true) {
+        for msg in parse_frame(&frame) {
             msg.txs.iter().for_each(touch);
         }
     }

@@ -52,7 +52,7 @@ fn main() {
     let messages: usize = frames.iter().map(|f| f.entries().len()).sum();
     let raws: Vec<Bytes> = frames
         .iter()
-        .flat_map(|f| parse_frame(f, true))
+        .flat_map(|f| parse_frame(f))
         .flat_map(|m| m.txs)
         .map(|t| t.raw)
         .collect();
@@ -101,7 +101,7 @@ fn main() {
     let frame_us = best_of(50, messages, || {
         for line in &lines {
             let frame = frame_from_slice(black_box(line).as_bytes()).unwrap();
-            black_box(parse_frame(&frame, true));
+            black_box(parse_frame(&frame));
         }
     });
     println!("{:<44}{frame_us:>10.3}", "frame JSON -> decoded txs");
@@ -157,7 +157,7 @@ fn main() {
     let full_us = best_of(10, messages, || {
         for line in &lines {
             let frame = frame_from_slice(black_box(line).as_bytes()).unwrap();
-            for (e, m) in frame.entries().iter().zip(parse_frame(&frame, true)) {
+            for (e, m) in frame.entries().iter().zip(parse_frame(&frame)) {
                 black_box(recover_signer(e, MAINNET_CHAIN_ID));
                 for t in &m.txs {
                     black_box((t.hash(), t.to(), t.sender()));
@@ -172,7 +172,7 @@ fn main() {
     // Senders of one message's transactions: one at a time, then all at once.
     let messages_txs: Vec<Vec<Bytes>> = frames
         .iter()
-        .flat_map(|f| parse_frame(f, true))
+        .flat_map(|f| parse_frame(f))
         .map(|m| m.txs.into_iter().map(|t| t.raw).collect())
         .collect();
     let decoded = || -> Vec<Vec<rhfeed::Tx>> {

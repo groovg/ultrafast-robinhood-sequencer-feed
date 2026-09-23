@@ -586,24 +586,13 @@ impl FeedMessage {
     }
 }
 
-/// One frame can carry several sequencer messages. With `decode_txs == false` the
-/// envelope is read but `txs` is left empty. The consumer uses this to skip the backlog.
-pub fn parse_frame(frame: &Frame, decode_txs: bool) -> Vec<FeedMessage> {
+/// Every message in a frame, transactions decoded. One frame can carry several.
+pub fn parse_frame(frame: &Frame) -> Vec<FeedMessage> {
     frame
         .entries()
         .iter()
-        .map(|entry| parse_entry(entry, decode_txs))
+        .map(|e| parse_entry_with(e, l2_msg(e).ok().flatten().as_ref()))
         .collect()
-}
-
-/// One entry of a frame's `messages` array.
-pub fn parse_entry(entry: &Entry, decode_txs: bool) -> FeedMessage {
-    let l2 = if decode_txs {
-        l2_msg(entry).ok().flatten()
-    } else {
-        None
-    };
-    parse_entry_with(entry, l2.as_ref())
 }
 
 /// An entry's l2Msg, base64-decoded. Decode it once and pass it to both verification and
@@ -616,7 +605,8 @@ pub fn l2_msg(entry: &Entry) -> Result<Option<Bytes>, base64_simd::Error> {
     }
 }
 
-/// `parse_entry` with the l2Msg already decoded: transactions are decoded iff it is given.
+/// One entry of a frame, with its l2Msg already decoded by `l2_msg`. Transactions are
+/// decoded only if `l2` is given, which is how the consumer skips decoding the backlog.
 pub fn parse_entry_with(entry: &Entry, l2: Option<&Bytes>) -> FeedMessage {
     let header = entry.header();
     let txs = l2.map(decode_l2_message).unwrap_or_default();

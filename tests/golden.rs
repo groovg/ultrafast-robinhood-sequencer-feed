@@ -80,7 +80,7 @@ fn every_captured_frame_decodes_exactly_as_python_does() {
     for line in golden().iter().filter(|g| g.get("line").is_some()) {
         let i = line["line"].as_u64().unwrap() as usize;
         let frame = frame_from_slice(frames[i].as_bytes()).unwrap();
-        let got = parse_frame(&frame, true);
+        let got = parse_frame(&frame);
         let want = line["messages"].as_array().unwrap();
         assert_eq!(got.len(), want.len(), "frame {i}");
         for (m, w) in got.iter().zip(want) {
@@ -110,7 +110,7 @@ fn recovering_senders_in_bulk_matches_python() {
     for line in golden().iter().filter(|g| g.get("line").is_some()) {
         let i = line["line"].as_u64().unwrap() as usize;
         let frame = frame_from_slice(frames[i].as_bytes()).unwrap();
-        for (m, w) in parse_frame(&frame, true)
+        for (m, w) in parse_frame(&frame)
             .iter()
             .zip(line["messages"].as_array().unwrap())
         {
