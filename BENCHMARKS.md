@@ -76,6 +76,32 @@ UltrafastSecp256k1, about 5% apart. So on Linux the default build is fine, and u
 buys a few percent. On Windows, build with clang either way. The Linux numbers come from
 `.github/workflows/bench.yml`, which you can rerun with `gh workflow run bench`.
 
+## Zen 4 in AWS, and what AVX-512 buys
+
+c7a.large (AMD EPYC 9R14, Zen 4, Linux), same recording, µs per message unless noted.
+"generic" is a plain `cargo build --release`, "native" adds `-C target-cpu=native`:
+
+| | generic | native | native, scalar keccak | native + ufsecp |
+|---|---:|---:|---:|---:|
+| feed path | 68.7 | 66.6 | 67.6 | **62.9** |
+| JSON parse (sonic-rs) | 2.40 | 1.71 | 1.70 | 1.78 |
+| transaction hash, µs per tx | 3.26 | 3.13 | 3.25 | 3.13 |
+| ECDSA recover, µs | 40.5 | 40.6 | 40.5 | 37.2 |
+| every sender of a message, one by one | 307 | 305 | 306 | 280 |
+| every sender of a message, `recover_senders` (2 cores) | 184 | 183 | 183 | 170 |
+
+- `target-cpu=native` makes sonic-rs 29% faster. keccak-asm switches to OpenSSL's
+  AVX-512 code, which is only 4% faster per hash here.
+- ufsecp saves 8% on each ECDSA recovery.
+- `recover_senders` spreads a message's senders across cores. Even with two cores it
+  cuts the time by 40%. With more cores the gain grows with the number of transactions.
+- We also tried [asmcrypto](https://crates.io/crates/asmcrypto), which recovers 8
+  signatures at once with AVX-512 IFMA. It took 53.6 µs per signature here and 28.6 µs
+  on the Zen 5 desktop, slower than libsecp256k1 on both (40.5 and 21.4 µs), so we
+  removed it again.
+- On Windows, forcing keccak-asm's AVX-512 variant made the benchmark hang. We didn't
+  look into it further, since the default build on Windows doesn't use it.
+
 ## Two connections to the same feed
 
 `rhfeed --feed mainnet --feed mainnet --seconds 30`, 2026-09-23, 292 messages:

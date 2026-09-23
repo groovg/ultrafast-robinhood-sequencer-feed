@@ -27,7 +27,11 @@ docker build -t rhfeed .
 docker run --rm rhfeed --feed mainnet --feed mainnet
 ```
 
-Speed numbers are in [BENCHMARKS.md](BENCHMARKS.md).
+For the machine you'll run it on, build with `RUSTFLAGS="-C target-cpu=native"`. That
+makes JSON parsing about 30% faster and lets keccak use AVX-512 where the CPU has it.
+
+Speed numbers are in [BENCHMARKS.md](BENCHMARKS.md). The short version on where to
+run it: the feed reaches AWS us-east-1 (Virginia) about 30 ms before us-east-2 (Ohio).
 
 ## Using it as a library
 
