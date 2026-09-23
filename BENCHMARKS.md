@@ -91,6 +91,31 @@ messages. That's roughly a thousand times more than the entire feed path above.
 
 A third connection from the same IP was refused with HTTP 429.
 
+## Where to run it
+
+On 2026-09-23 we ran `rhfeed --feed mainnet --feed mainnet --json --seconds 1800` on
+three c7a.large instances at once, in us-east-2 (Ohio), us-east-1 (Virginia) and
+eu-central-1 (Frankfurt). Their clocks were synced with Amazon Time Sync to within a
+microsecond. For each of the 17,851 messages all three received, we compared arrival
+times (`bench/regions.py`):
+
+| Region | Got it first | Median behind the first | p90 | p99 |
+|---|---:|---:|---:|---:|
+| us-east-1 (Virginia) | 99.8% | 0 ms | 0 ms | 0 ms |
+| us-east-2 (Ohio) | 0.1% | 32.5 ms | 57.3 ms | 113 ms |
+| eu-central-1 (Frankfurt) | 0% | 109.5 ms | 159.9 ms | 198.4 ms |
+
+Virginia gets the feed about 32 ms before Ohio. The feed goes through Cloudflare, and whatever serves it is
+closer to Cloudflare's Virginia location. Time from the TLS handshake to the WebSocket
+upgrade response: 72 ms from Virginia, 153 ms from Ohio, 386 ms from Frankfurt.
+
+So a bot reading the feed should run in us-east-1.
+
+Within one region the two connections weren't equal either. In Virginia one
+connection was first on 85% of messages and the other trailed it by about 9 ms on
+average. In Ohio they split about evenly, 18 to 25 ms apart on average, with some
+spikes near a second.
+
 ## Running the benchmarks yourself
 
 ```bash
@@ -102,6 +127,9 @@ uv run --project ../robinhood-chain-sequencer-feed python bench/bench.py bench/c
 
 # Rust
 cargo run --release --example bench -- bench/capture.jsonl
+
+# compare arrival times recorded in several places (seq<TAB>received_at per line)
+python bench/regions.py virginia=a.tsv ohio=b.tsv
 UFSECP_LIB_DIR=<ufsecp build dir> [CLANG_RT_DIR=<llvm>/lib/clang/22/lib/windows] \
   cargo run --release --example bench --features ufsecp -- bench/capture.jsonl
 ```
