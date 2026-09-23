@@ -14,7 +14,8 @@ ARG MARCH=x86-64-v3
 RUN scripts/build-ufsecp.sh /ufsecp "$MARCH"
 COPY . .
 # The same target for our own code: sonic-rs and keccak-asm pick faster code paths with it.
-RUN UFSECP_LIB_DIR=/ufsecp/build RUSTFLAGS="-C target-cpu=$MARCH" \n    cargo build --release --locked --features ufsecp
+RUN UFSECP_LIB_DIR=/ufsecp/build RUSTFLAGS="-C target-cpu=$MARCH" \
+    cargo build --release --locked --features ufsecp
 
 FROM debian:trixie-slim
 RUN apt-get update \
