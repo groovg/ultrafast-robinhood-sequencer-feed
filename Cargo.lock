@@ -78,12 +78,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
-name = "asmcrypto"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "230f430ddda11b08734715988c989575e3d0d59122aba8c0119479790285e018"
-
-[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1146,7 +1140,6 @@ checksum = "663ba70707f96e871406fe10d68128412e619b06d1d47cb91c3a4c6501176240"
 name = "rhfeed"
 version = "0.3.0"
 dependencies = [
- "asmcrypto",
  "base64",
  "base64-simd",
  "bytes",

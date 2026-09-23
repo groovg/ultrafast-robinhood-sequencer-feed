@@ -401,8 +401,7 @@ impl Tx {
 }
 
 /// Recover the sender of every transaction in `txs` at once and cache it, so later
-/// `sender()` calls are free. Uses every core (and AVX-512 batches with the `asmcrypto`
-/// feature). One message's worth of senders takes about as long as one recovery,
+/// `sender()` calls are free. Uses every core. One message's worth of senders takes about as long as one recovery,
 /// where calling `sender()` in a loop takes one recovery per transaction.
 pub fn recover_senders<'a>(txs: impl IntoIterator<Item = &'a Tx>) {
     let pending: Vec<&Tx> = txs

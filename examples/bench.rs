@@ -238,26 +238,6 @@ fn main() {
     prim("libsecp256k1", rhfeed::secp::libsecp::recover);
     #[cfg(feature = "ufsecp")]
     prim("ufsecp", rhfeed::secp::ufsecp::recover);
-    #[cfg(feature = "asmcrypto")]
-    {
-        let batch: Vec<Option<rhfeed::secp::Signature>> = sigs
-            .iter()
-            .map(|&(digest, r, s, recid)| {
-                Some(rhfeed::secp::Signature {
-                    digest,
-                    r,
-                    s,
-                    recid,
-                })
-            })
-            .collect();
-        let us = best_of(50, batch.len(), || {
-            for chunk in batch.chunks(8) {
-                black_box(rhfeed::secp::asmcrypto::recover8(chunk));
-            }
-        });
-        println!("{:<44}{us:>10.3}", "asmcrypto, 8 per batch, one core");
-    }
 
     println!("\none core, full decode incl. sender: ~{:.0} tx/s", {
         let us = best_of(20, raws.len(), || {
