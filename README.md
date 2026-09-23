@@ -60,6 +60,10 @@ more than all the decoding work in this crate.
 The public feed allows two connections per IP. A third one gets HTTP 429. To race more
 than two you need more IPs, or relays on other machines.
 
+Usually the two connections split the wins about evenly. Now and then one of them lands
+on a path that's about 9 ms slower and stays there. If a connection is first on fewer
+than 1 in 10 of its last 500 messages, `Feed` drops it and opens a new one.
+
 When the program exits it prints, for each source, how often it was first and how far
 behind it was the rest of the time.
 

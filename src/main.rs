@@ -296,8 +296,14 @@ async fn main() {
                 format!("{:.1} ms mean, {:.1} ms max", ms(m), ms(src.lag_max))
             });
             eprintln!(
-                "#   {}: first on {} messages, behind on {} ({lag})",
-                src.url, src.first, src.late
+                "#   {}: first on {} messages, behind on {} ({lag}){}",
+                src.url,
+                src.first,
+                src.late,
+                match src.replaced {
+                    0 => String::new(),
+                    n => format!(", reconnected {n}x for being slow"),
+                }
             );
         }
     }

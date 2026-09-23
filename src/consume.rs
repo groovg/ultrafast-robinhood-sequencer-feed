@@ -65,6 +65,12 @@ const LIVE_THRESHOLD: f64 = 5.0;
 /// Fallback for a skewed clock: the backlog is finite, so stop waiting for it.
 const MAX_BACKLOG: Duration = Duration::from_secs(120);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+/// A source that was first on fewer than 1 in `SLOW_SHARE` of its last `SLOW_WINDOW`
+/// live messages gets a new connection. Measured in Virginia: most connections split
+/// the wins about evenly, but now and then one lands on a path that's ~9 ms slower and
+/// stays there.
+const SLOW_WINDOW: u32 = 500;
+const SLOW_SHARE: u32 = 10;
 
 type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
@@ -93,6 +99,8 @@ pub struct SourceStats {
     pub late: u64,
     pub lag_total: Duration,
     pub lag_max: Duration,
+    /// Times this source's connection was replaced for being slower than the others.
+    pub replaced: u64,
 }
 
 impl SourceStats {
@@ -128,6 +136,10 @@ struct State {
     seen: HashMap<i64, Seen>,
     stats: Stats,
     warned_unverified: bool,
+    /// Per source: (first, late) live messages since its window last reset.
+    recent: Vec<(u32, u32)>,
+    /// Per source: it should drop its connection and open a new one.
+    replace: Vec<bool>,
 }
 
 impl State {
@@ -160,6 +172,21 @@ impl State {
             s.late += 1;
             s.lag_total += lag;
             s.lag_max = s.lag_max.max(lag);
+            self.recent[source].1 += 1;
+            self.check_slow(source);
+        }
+    }
+
+    /// Mark `source` for a new connection if it has been losing nearly every race.
+    fn check_slow(&mut self, source: usize) {
+        let (first, late) = self.recent[source];
+        if first + late < SLOW_WINDOW {
+            return;
+        }
+        self.recent[source] = (0, 0);
+        let others = self.stats.sources.iter().filter(|s| s.connected).count() > 1;
+        if others && first * SLOW_SHARE < first + late {
+            self.replace[source] = true;
         }
     }
 
@@ -204,6 +231,8 @@ impl Shared {
                     ..Stats::default()
                 },
                 warned_unverified: false,
+                recent: vec![(0, 0); urls.len()],
+                replace: vec![false; urls.len()],
             }),
         }
     }
@@ -285,6 +314,8 @@ impl Shared {
             st.remember(seq, hash, now, self.reorg_window);
             st.stats.sources[source].first += 1;
             if live {
+                st.recent[source].0 += 1;
+                st.check_slow(source);
                 st.stats.live_messages += 1;
             } else {
                 st.stats.backlog_messages += 1;
@@ -463,6 +494,8 @@ struct Source {
 enum End {
     /// The `Feed` was dropped; stop for good.
     Stopped,
+    /// This connection keeps losing to the others; open a new one right away.
+    Slow,
     Failed(String),
 }
 
@@ -485,6 +518,15 @@ impl Source {
                     self.set_connected(false);
                     match end {
                         End::Stopped => return,
+                        End::Slow => {
+                            info!(
+                                "{}: first on under 1 in {SLOW_SHARE} of the last \
+                                 {SLOW_WINDOW} messages, trying a new connection",
+                                self.url
+                            );
+                            self.shared.lock().stats.sources[self.index].replaced += 1;
+                            continue;
+                        }
                         End::Failed(err) => err,
                     }
                 }
@@ -618,10 +660,11 @@ impl Source {
                 }
             }
 
-            for msg in self
+            let msgs = self
                 .shared
-                .ingest(self.index, &parsed, live, received_at, now)
-            {
+                .ingest(self.index, &parsed, live, received_at, now);
+            let slow = std::mem::take(&mut self.shared.lock().replace[self.index]);
+            for msg in msgs {
                 if !msg.live {
                     continue;
                 }
@@ -642,6 +685,9 @@ impl Source {
                         }
                     }
                 }
+            }
+            if slow {
+                return End::Slow;
             }
         }
     }
@@ -754,6 +800,41 @@ mod tests {
         let (a, b) = (&st.stats.sources[0], &st.stats.sources[1]);
         assert_eq!((a.first, a.late, b.first, b.late), (0, 1, 1, 0));
         assert_eq!(a.lag_mean(), Some(Duration::from_millis(12)));
+    }
+
+    #[test]
+    fn a_source_that_keeps_losing_is_marked_for_a_new_connection() {
+        let s = shared(2, None);
+        s.lock()
+            .stats
+            .sources
+            .iter_mut()
+            .for_each(|x| x.connected = true);
+        let t0 = Instant::now();
+        for seq in 1..=SLOW_WINDOW as i64 {
+            let e = [entry_json(seq, &hash_of((seq % 250) as u8))];
+            feed_at(&s, 0, true, t0, &e);
+            feed_at(&s, 1, true, t0 + Duration::from_millis(9), &e);
+        }
+        assert_eq!(s.lock().replace, [false, true]);
+    }
+
+    #[test]
+    fn an_even_split_replaces_nothing() {
+        let s = shared(2, None);
+        s.lock()
+            .stats
+            .sources
+            .iter_mut()
+            .for_each(|x| x.connected = true);
+        let t0 = Instant::now();
+        for seq in 1..=SLOW_WINDOW as i64 {
+            let e = [entry_json(seq, &hash_of((seq % 250) as u8))];
+            let (a, b) = if seq % 2 == 0 { (0, 1) } else { (1, 0) };
+            feed_at(&s, a, true, t0, &e);
+            feed_at(&s, b, true, t0 + Duration::from_millis(3), &e);
+        }
+        assert_eq!(s.lock().replace, [false, false]);
     }
 
     #[test]
