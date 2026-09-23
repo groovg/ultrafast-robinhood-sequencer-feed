@@ -4,10 +4,6 @@
 //! There are two implementations so we can compare them. libsecp256k1 is always built.
 //! UltrafastSecp256k1 is used instead when the `ufsecp` feature is on. `tests/golden.rs`
 //! checks that they return the same thing.
-//!
-//! `recover_many` does a whole batch at once, spread over all cores.
-
-use rayon::prelude::*;
 
 use crate::codec::keccak;
 
@@ -17,25 +13,6 @@ const N: [u8; 32] = [
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
     0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
 ];
-
-/// A signature and the digest it signs, as recovery needs them.
-#[derive(Clone, Debug)]
-pub struct Signature {
-    pub digest: [u8; 32],
-    pub r: [u8; 32],
-    pub s: [u8; 32],
-    pub recid: u8,
-}
-
-/// Recover every signature in `sigs`, in order, using all cores. `None` in, `None` out.
-pub fn recover_many(sigs: &[Option<Signature>]) -> Vec<Option<[u8; 20]>> {
-    sigs.par_iter()
-        .map(|s| {
-            s.as_ref()
-                .and_then(|s| recover(&s.digest, &s.r, &s.s, s.recid))
-        })
-        .collect()
-}
 
 /// 20-byte address that produced (r, s, recid) over `digest`, or None if there is none.
 pub fn recover(digest: &[u8; 32], r: &[u8; 32], s: &[u8; 32], recid: u8) -> Option<[u8; 20]> {
