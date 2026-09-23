@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 
 use keccak_asm::{Digest, Keccak256};
 
-use crate::codec::{Entry, b64, l2_msg};
+use crate::codec::{Entry, b64, l2_msg, unhex};
 
 /// Prefix on the signed data, so a feed signature can't be reused for anything else.
 pub const FEED_PREFIX: &[u8] = b"Arbitrum Nitro Feed:";
@@ -24,10 +24,6 @@ pub const MAINNET_SIGNER: [u8; 20] = [
     0xda, 0xa5, 0x26, 0x08, 0x67, 0x87, 0xd9, 0xde, 0xbe, 0x1d, 0x7f, 0x3f, 0xfd, 0xb1, 0xfe, 0x50,
     0xcf, 0x86, 0x87, 0xf4,
 ];
-
-fn unhex(value: &str) -> Option<Vec<u8>> {
-    hex::decode(value.strip_prefix("0x").unwrap_or(value)).ok()
-}
 
 /// The exact bytes the sequencer signed, rebuilt from one raw envelope. See Nitro's
 /// `BroadcastFeedMessage.SignatureHash`. None when a field cannot be encoded at all.
@@ -65,7 +61,7 @@ fn preimage(
 
     // Skipped when absent, per Nitro. Present in practice on this chain.
     if let Some(hash) = entry.block_hash.as_deref().filter(|h| !h.is_empty()) {
-        out(&unhex(hash)?);
+        out(&unhex(hash, "block hash").ok()?);
     }
     // Timeboost's express-lane bitmap. Robinhood Chain doesn't send it, Arbitrum One does.
     if let Some(meta) = entry.block_metadata.as_deref().filter(|m| !m.is_empty()) {
@@ -77,9 +73,8 @@ fn preimage(
         .to_be_bytes());
 
     out(&[u8::try_from(header.and_then(|h| h.kind).unwrap_or(0)).ok()?]);
-    out(&unhex(
-        header.and_then(|h| h.sender.as_deref()).unwrap_or(""),
-    )?);
+    let sender = header.and_then(|h| h.sender.as_deref()).unwrap_or("");
+    out(&unhex(sender, "sender").ok()?);
     out(&header
         .and_then(|h| h.block_number)
         .unwrap_or(0)
@@ -88,7 +83,7 @@ fn preimage(
 
     // Both are left out when null. They are not zero-padded.
     if let Some(id) = header.and_then(|h| h.request_id.as_deref()) {
-        out(&unhex(id)?);
+        out(&unhex(id, "request id").ok()?);
     }
     if let Some(fee) = header.and_then(|h| h.base_fee_l1) {
         // Go's big.Int.Bytes(): big-endian, no leading zeros, empty for zero.

@@ -25,23 +25,6 @@ pub const MAX_BATCH_DEPTH: usize = 16;
 pub const FILTER_PRECOMPILE: &str = "0x0000000000000000000000000000000000000074";
 pub const IS_FILTERED_SELECTOR: &str = "0x85c733a4";
 
-/// arbostypes: L1 message kinds. Anything but L2Message reached the chain through Ethereum.
-pub fn l1_kind_name(kind: i64) -> Cow<'static, str> {
-    Cow::Borrowed(match kind {
-        3 => "L2Message",
-        6 => "EndOfBlock",
-        7 => "L2FundedByL1",
-        8 => "RollupEvent",
-        9 => "SubmitRetryable",
-        10 => "BatchForGasEstimation",
-        11 => "Initialize",
-        12 => "EthDeposit",
-        13 => "BatchPostingReport",
-        0xFF => "Invalid",
-        _ => return Cow::Owned(format!("kind{kind}")),
-    })
-}
-
 // --------------------------------------------------------------------------- //
 // helpers for building filters
 // --------------------------------------------------------------------------- //
@@ -248,6 +231,7 @@ pub struct Tx {
     sender: OnceLock<Option<[u8; 20]>>,
 }
 
+#[derive(Default)]
 struct Modeled {
     nonce: u64,
     gas: u64,
@@ -419,15 +403,7 @@ pub fn decode_transaction(raw: Bytes) -> Option<Tx> {
     let body = usize::from(typed);
     // A type we don't handle, or one that doesn't parse: keep just the hash and raw bytes.
     let m = layout(tx_type).and_then(|l| model(&raw[body..], l));
-    let m = m.unwrap_or(Modeled {
-        nonce: 0,
-        gas: 0,
-        to_bytes: None,
-        selector: None,
-        data_len: 0,
-        value: (0, 0),
-        fields: Vec::new(),
-    });
+    let m = m.unwrap_or_default();
     Some(Tx {
         raw,
         tx_type,
@@ -479,13 +455,13 @@ fn walk(payload: &Bytes, depth: usize, out: &mut Vec<Tx>) {
 
 /// A relay frame, `{"version":1,"messages":[...]}`, borrowing its strings from the
 /// buffer it was parsed from. Every field is optional, like the Python version's `.get()` calls.
-#[derive(Deserialize, Default, Clone)]
+#[derive(Deserialize)]
 pub struct Frame<'a> {
-    #[serde(borrow, default)]
+    #[serde(borrow)]
     pub messages: Option<Vec<Entry<'a>>>,
 }
 
-#[derive(Deserialize, Default, Clone)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Entry<'a> {
     pub sequence_number: Option<i64>,
@@ -499,7 +475,7 @@ pub struct Entry<'a> {
     pub signature_v2: Option<Cow<'a, str>>,
 }
 
-#[derive(Deserialize, Default, Clone)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Wrapper<'a> {
     #[serde(borrow)]
@@ -507,7 +483,7 @@ pub struct Wrapper<'a> {
     pub delayed_messages_read: Option<u64>,
 }
 
-#[derive(Deserialize, Default, Clone)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Incoming<'a> {
     #[serde(borrow)]
@@ -516,7 +492,7 @@ pub struct Incoming<'a> {
     pub l2_msg: Option<Cow<'a, str>>,
 }
 
-#[derive(Deserialize, Default, Clone)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Header<'a> {
     pub kind: Option<i64>,
@@ -576,8 +552,21 @@ pub struct FeedMessage {
 }
 
 impl FeedMessage {
+    /// arbostypes: L1 message kinds. Anything but L2Message reached the chain through Ethereum.
     pub fn l1_kind_name(&self) -> Cow<'static, str> {
-        l1_kind_name(self.l1_kind)
+        Cow::Borrowed(match self.l1_kind {
+            3 => "L2Message",
+            6 => "EndOfBlock",
+            7 => "L2FundedByL1",
+            8 => "RollupEvent",
+            9 => "SubmitRetryable",
+            10 => "BatchForGasEstimation",
+            11 => "Initialize",
+            12 => "EthDeposit",
+            13 => "BatchPostingReport",
+            0xFF => "Invalid",
+            _ => return Cow::Owned(format!("kind{}", self.l1_kind)),
+        })
     }
 
     /// Anything not an L2Message entered through Ethereum, not the sequencer.
