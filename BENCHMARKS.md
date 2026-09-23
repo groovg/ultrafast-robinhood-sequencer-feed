@@ -119,45 +119,29 @@ A third connection from the same IP was refused with HTTP 429.
 
 ## Where to run it
 
-On 2026-09-23 we ran `rhfeed --feed mainnet --feed mainnet --json --seconds 1800` on
-three c7a.large instances at once, in us-east-2 (Ohio), us-east-1 (Virginia) and
-eu-central-1 (Frankfurt). Their clocks were synced with Amazon Time Sync to within a
-microsecond. For each of the 17,851 messages all three received, we compared arrival
-times (`bench/regions.py`):
+In September 2026 we recorded the feed at the same time from several AWS regions, with
+clocks synced through Amazon Time Sync, and compared when each place got the same
+message (`bench/regions.py`). Two rounds, 30 and 15 minutes, about 27,000 messages:
 
-| Region | Got it first | Median behind the first | p90 | p99 |
-|---|---:|---:|---:|---:|
-| us-east-1 (Virginia) | 99.8% | 0 ms | 0 ms | 0 ms |
-| us-east-2 (Ohio) | 0.1% | 32.5 ms | 57.3 ms | 113 ms |
-| eu-central-1 (Frankfurt) | 0% | 109.5 ms | 159.9 ms | 198.4 ms |
+| Region | Median behind the fastest place |
+|---|---:|
+| us-east-1 (Virginia) | fastest in both rounds |
+| ca-central-1 (Montreal) | ~12 ms |
+| us-west-2 (Oregon) | ~18 ms |
+| us-east-2 (Ohio) | ~31 ms |
+| eu-central-1 (Frankfurt) | ~110 ms |
 
-Virginia gets the feed about 32 ms before Ohio. The feed goes through Cloudflare, and whatever serves it is
-closer to Cloudflare's Virginia location. Time from the TLS handshake to the WebSocket
-upgrade response: 72 ms from Virginia, 153 ms from Ohio, 386 ms from Frankfurt.
+What we took from it:
 
-A second, 15-minute round the same night added another Virginia zone, Oregon and
-Montreal (8,950 messages seen everywhere):
-
-| Where | Got it first | Median behind the first | p90 | p99 |
-|---|---:|---:|---:|---:|
-| us-east-1a (Virginia) | 95.6% | 0 ms | 0 ms | 11.0 ms |
-| us-east-1d (Virginia) | 3.7% | 9.5 ms | 15.3 ms | 19.7 ms |
-| ca-central-1 (Montreal) | 0.5% | 12.3 ms | 18.6 ms | 30.2 ms |
-| us-west-2 (Oregon) | 0% | 17.9 ms | 29.0 ms | 78.0 ms |
-| us-east-2c (Ohio) | 0.1% | 30.9 ms | 43.7 ms | 87.6 ms |
-
-Distance to the sequencer doesn't explain this. Oregon beats Ohio by 14 ms, and two
-machines in the same Virginia region were 9.5 ms apart. What matters is the route the
-connection gets through Cloudflare, which seems to depend on the Cloudflare location
-and maybe on the connection itself.
-
-So a bot reading the feed should run in us-east-1, and it's worth checking more than
-one machine there.
-
-Within one region the two connections weren't equal either. In Virginia one
-connection was first on 85% of messages and the other trailed it by about 9 ms on
-average. In Ohio they split about evenly, 18 to 25 ms apart on average, with some
-spikes near a second.
+- The feed is served through Cloudflare, so what counts is the route from your
+  Cloudflare location to wherever the feed is served from. Distance to the sequencer
+  doesn't predict it: Oregon was ahead of Ohio.
+- Virginia was the best place to read the feed from.
+- Machines in the same region can differ too. Two instances in Virginia were about
+  10 ms apart. If you care about milliseconds, try a few and keep the fastest.
+- Two connections from one machine usually trade places message by message, a few ms
+  apart. Sometimes one gets stuck on a slower path for a long time, which is why
+  `Feed` replaces a connection that keeps losing.
 
 ## Running the benchmarks yourself
 
@@ -172,7 +156,7 @@ uv run --project ../robinhood-chain-sequencer-feed python bench/bench.py bench/c
 cargo run --release --example bench -- bench/capture.jsonl
 
 # compare arrival times recorded in several places (seq<TAB>received_at per line)
-python bench/regions.py virginia=a.tsv ohio=b.tsv
+python bench/regions.py place1=a.tsv place2=b.tsv
 UFSECP_LIB_DIR=<ufsecp build dir> [CLANG_RT_DIR=<llvm>/lib/clang/22/lib/windows] \
   cargo run --release --example bench --features ufsecp -- bench/capture.jsonl
 ```

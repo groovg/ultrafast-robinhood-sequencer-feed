@@ -30,8 +30,9 @@ docker run --rm rhfeed --feed mainnet --feed mainnet
 For the machine you'll run it on, build with `RUSTFLAGS="-C target-cpu=native"`. That
 makes JSON parsing about 30% faster and lets keccak use AVX-512 where the CPU has it.
 
-Speed numbers are in [BENCHMARKS.md](BENCHMARKS.md). The short version on where to
-run it: the feed reaches AWS us-east-1 (Virginia) about 30 ms before us-east-2 (Ohio).
+Speed numbers are in [BENCHMARKS.md](BENCHMARKS.md), along with measurements of where
+the feed arrives first. In short: the network costs milliseconds and all our decoding
+costs microseconds, so where you run it matters far more than anything else here.
 
 ## Using it as a library
 
@@ -48,6 +49,36 @@ while let Some(msg) = feed.recv().await {
     }
 }
 ```
+
+## Plugging it into a bot
+
+Add the crate as a git dependency:
+
+```toml
+[dependencies]
+rhfeed = { git = "https://github.com/groovg/ultrafast-robinhood-sequencer-feed" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+[`examples/copy_trade.rs`](examples/copy_trade.rs) is the reading half of a
+copy-trading bot. It follows a list of wallets and prints a JSON line the moment the
+sequencer orders one of their transactions:
+
+```bash
+cargo run --release --example copy_trade -- 0xWALLET_1 0xWALLET_2
+```
+
+A few things to keep in mind:
+
+- Filter on `to_bytes` and `selector` first. They're already sliced out and cost
+  nothing. Senders need ECDSA, so run `recover_senders` on what's left. It does the
+  whole message in parallel.
+- A transaction in the feed has been ordered, not executed. It can still revert.
+- This crate only reads. Signing and sending your own transactions is up to you, for
+  example with [alloy](https://github.com/alloy-rs/alloy).
+- `Feed::recv()` hands you messages through a buffer of 1024. If your bot takes longer
+  per message than the feed produces them, the buffer fills up and you get a warning.
+  Do slow work on another task.
 
 ## Two connections are faster than one
 
@@ -157,7 +188,8 @@ on, and connect to the feed directly if you care about reorgs.
 | `tests/robustness.rs` | feeds the decoder broken input and makes sure it doesn't crash |
 | `tests/feed.rs` | runs `Feed` against local WebSocket servers |
 | `tests/fixtures/` | real mainnet frames and a signed message (from the Python repo) |
-| `examples/bench.rs`, `bench/` | the Rust and Python benchmarks, and a script to record the feed |
+| `examples/copy_trade.rs` | following wallets, the reading half of a copy-trading bot |
+| `examples/bench.rs`, `bench/` | the Rust and Python benchmarks, a script to record the feed, and one to compare recordings from different places |
 
 The Python scripts need the Python repo checked out next to this one:
 
