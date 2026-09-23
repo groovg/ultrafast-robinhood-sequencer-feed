@@ -8,8 +8,6 @@
 
 use std::path::Path;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as B64;
 use bytes::Bytes;
 
 use rhfeed::codec::decode_l2_message;
@@ -102,7 +100,7 @@ fn l2_messages(lines: &[String]) -> Vec<Vec<u8>> {
                     e.incoming()?
                         .l2_msg
                         .as_deref()
-                        .map(|m| B64.decode(m).unwrap())
+                        .map(|m| base64_simd::STANDARD.decode_to_vec(m).unwrap())
                 })
                 .collect::<Vec<_>>()
         })

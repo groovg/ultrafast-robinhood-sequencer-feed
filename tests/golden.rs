@@ -257,8 +257,7 @@ fn changing_any_signed_field_breaks_verification() {
 
 #[test]
 fn an_unusable_signature_is_not_accepted() {
-    use base64::Engine;
-    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let b64 = |b: &[u8]| base64_simd::STANDARD.encode_to_string(b);
     for sig in [
         Value::Null,
         "".into(),
@@ -309,10 +308,7 @@ fn ufsecp_and_libsecp256k1_recover_the_same_addresses() {
         let frame = frame_from_slice(line.as_bytes()).unwrap();
         for e in frame.entries() {
             if let Some(sig) = e.signature_v2.as_deref() {
-                use base64::Engine;
-                let sig = base64::engine::general_purpose::STANDARD
-                    .decode(sig)
-                    .unwrap();
+                let sig = base64_simd::STANDARD.decode_to_vec(sig).unwrap();
                 let digest = rhfeed::keccak(&signature_payload(e, MAINNET_CHAIN_ID).unwrap());
                 check(
                     &digest,

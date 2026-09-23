@@ -1140,7 +1140,6 @@ checksum = "663ba70707f96e871406fe10d68128412e619b06d1d47cb91c3a4c6501176240"
 name = "rhfeed"
 version = "0.3.0"
 dependencies = [
- "base64",
  "base64-simd",
  "bytes",
  "clap",
