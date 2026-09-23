@@ -71,12 +71,18 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 /// stays there.
 const SLOW_WINDOW: u32 = 500;
 const SLOW_SHARE: u32 = 10;
+/// Warn after this long connected with no frames.
+const STALL_WARNING: Duration = Duration::from_secs(30);
+/// Check for a stall four times per `STALL_WARNING`, so it's reported close to when it
+/// crosses the threshold.
+const POLL_INTERVAL: Duration = Duration::from_millis(7500);
+/// How many recent block hashes to keep for reorg and duplicate detection (~2 minutes).
+const REORG_WINDOW: i64 = 1024;
 
 type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug, Default, Clone)]
 pub struct Stats {
-    pub frames: u64,
     pub backlog_messages: u64,
     pub live_messages: u64,
     pub duplicate_messages: u64,
@@ -91,7 +97,6 @@ pub struct Stats {
 pub struct SourceStats {
     pub url: String,
     pub connected: bool,
-    pub frames: u64,
     pub reconnects: u64,
     /// Messages this source delivered before any other.
     pub first: u64,
@@ -253,11 +258,6 @@ impl Shared {
         received_at: f64,
         now: Instant,
     ) -> Vec<FeedMessage> {
-        {
-            let mut st = self.lock();
-            st.stats.frames += 1;
-            st.stats.sources[source].frames += 1;
-        }
         let mut out = Vec::new();
         for entry in frame.entries() {
             let seq = entry.sequence_number.unwrap_or(-1);
@@ -380,8 +380,6 @@ impl Feed {
             sources: Vec::new(),
             verify: None,
             reconnect_delay: Duration::from_millis(500),
-            stall_warning: Duration::from_secs(30),
-            reorg_window: 1024,
             capacity: 1024,
         }
     }
@@ -395,19 +393,12 @@ impl Feed {
     pub fn stats(&self) -> Stats {
         self.shared.lock().stats.clone()
     }
-
-    /// Highest sequence number delivered or skipped. On this chain, the L2 block number.
-    pub fn highest_seq(&self) -> i64 {
-        self.shared.lock().highest_seq
-    }
 }
 
 pub struct FeedBuilder {
     sources: Vec<String>,
     verify: Option<Verifier>,
     reconnect_delay: Duration,
-    stall_warning: Duration,
-    reorg_window: i64,
     capacity: usize,
 }
 
@@ -431,18 +422,6 @@ impl FeedBuilder {
         self
     }
 
-    /// Warn after this long connected with no frames. Zero disables the check.
-    pub fn stall_warning(mut self, after: Duration) -> Self {
-        self.stall_warning = after;
-        self
-    }
-
-    /// How many recent block hashes to keep for reorg and duplicate detection.
-    pub fn reorg_window(mut self, blocks: i64) -> Self {
-        self.reorg_window = blocks;
-        self
-    }
-
     /// Messages buffered for a consumer that is behind. When full, sources stop
     /// reading until it catches up, and say so.
     pub fn capacity(mut self, messages: usize) -> Self {
@@ -453,7 +432,7 @@ impl FeedBuilder {
     /// Start every source on the current tokio runtime. Panics with no sources.
     pub fn spawn(self) -> Feed {
         assert!(!self.sources.is_empty(), "a feed needs at least one source");
-        let shared = Arc::new(Shared::new(&self.sources, self.verify, self.reorg_window));
+        let shared = Arc::new(Shared::new(&self.sources, self.verify, REORG_WINDOW));
         let (tx, rx) = mpsc::channel(self.capacity.max(1));
         let mut tasks = JoinSet::new();
         for (index, url) in self.sources.into_iter().enumerate() {
@@ -464,7 +443,6 @@ impl FeedBuilder {
                     shared: shared.clone(),
                     tx: tx.clone(),
                     reconnect_delay: self.reconnect_delay,
-                    stall_warning: self.stall_warning,
                 }
                 .run(),
             );
@@ -487,7 +465,6 @@ struct Source {
     shared: Arc<Shared>,
     tx: mpsc::Sender<FeedMessage>,
     reconnect_delay: Duration,
-    stall_warning: Duration,
 }
 
 /// Why a connection ended.
@@ -591,18 +568,7 @@ impl Source {
             .map_err(|e| e.to_string())
     }
 
-    fn poll_interval(&self) -> Duration {
-        // Check four times per stall_warning period, so a stall gets reported close to
-        // when it hits the threshold.
-        if self.stall_warning.is_zero() {
-            Duration::from_secs(3600)
-        } else {
-            (self.stall_warning / 4).max(Duration::from_millis(100))
-        }
-    }
-
     async fn read(&self, mut ws: Socket) -> End {
-        let interval = self.poll_interval();
         let started = Instant::now();
         let mut live = false;
         let mut last_frame = started;
@@ -610,11 +576,10 @@ impl Source {
         let mut stall_warned = false;
         let mut warned_full = false;
         loop {
-            let frame = match tokio::time::timeout(interval, ws.next_frame()).await {
+            let frame = match tokio::time::timeout(POLL_INTERVAL, ws.next_frame()).await {
                 Err(_) => {
                     let idle = last_frame.elapsed();
-                    if !self.stall_warning.is_zero() && idle >= self.stall_warning && !stall_warned
-                    {
+                    if idle >= STALL_WARNING && !stall_warned {
                         stall_warned = true; // once per stall, not once per poll
                         warn!(
                             "no frames from {} for {:.0}s. Connected, but nothing is \
@@ -653,7 +618,7 @@ impl Source {
                     || started.elapsed() > MAX_BACKLOG;
                 if live {
                     info!("{} is live", self.url);
-                } else if last_narrated.elapsed() >= interval {
+                } else if last_narrated.elapsed() >= POLL_INTERVAL {
                     // Frames are arriving but none are recent yet, so we're still in the backlog.
                     last_narrated = now;
                     info!("{}: draining backlog, none current yet", self.url);
