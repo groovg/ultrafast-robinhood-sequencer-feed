@@ -11,7 +11,10 @@ use std::path::Path;
 use bytes::Bytes;
 
 use rhfeed::codec::decode_l2_message;
-use rhfeed::{MAINNET_CHAIN_ID, decode_transaction, frame_from_slice, parse_frame, recover_signer};
+use rhfeed::{
+    MAINNET_CHAIN_ID, MAINNET_SIGNER, MAINNET_VERIFIER, decode_transaction, frame_from_slice,
+    parse_frame, recover_signer,
+};
 
 /// xorshift64*: small, fast, and good enough to pick bytes to break.
 struct Rng(u64);
@@ -149,7 +152,12 @@ fn mutated_frames_never_panic() {
             continue;
         };
         for entry in frame.entries() {
-            let _ = recover_signer(entry, MAINNET_CHAIN_ID);
+            // Whatever recovery attributes to the signer, the known-key check accepts.
+            if recover_signer(entry, MAINNET_CHAIN_ID) == Some(MAINNET_SIGNER) {
+                assert!(MAINNET_VERIFIER.accepts(entry));
+            } else {
+                let _ = MAINNET_VERIFIER.accepts(entry);
+            }
         }
         for msg in parse_frame(&frame) {
             msg.txs.iter().for_each(touch);
