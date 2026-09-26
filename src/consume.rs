@@ -37,14 +37,21 @@
 //! - Problems are logged: which source can't connect, which one is connected but silent.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use log::{info, warn};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinSet;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use yawc::{HttpRequestBuilder, MaybeTlsStream, OpCode, Options, WebSocket};
 
 use crate::codec::{Entry, FeedMessage, Frame, frame_from_slice, l2_msg, parse_entry_with};
@@ -79,7 +86,126 @@ const POLL_INTERVAL: Duration = Duration::from_millis(7500);
 /// How many recent block hashes to keep for reorg and duplicate detection (~2 minutes).
 const REORG_WINDOW: i64 = 1024;
 
-type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
+type Socket = WebSocket<Stamped<MaybeTlsStream<Stamped<TcpStream>>>>;
+
+/// When a message's frame finished each stage of `Feed`. The difference between two
+/// neighbouring fields is what that stage took. Add your own `Instant::now()` after
+/// `recv()` to see the hand-off. `rhfeed --timing` prints percentiles of all of them.
+#[derive(Debug, Clone, Copy)]
+pub struct Timing {
+    /// First socket read with bytes of this frame. If an earlier read already brought
+    /// the whole frame, the same as `last_read`.
+    pub first_read: Instant,
+    /// Last socket read the frame needed. Before this, the frame was still arriving.
+    pub last_read: Instant,
+    /// TLS has decrypted the frame's last bytes.
+    pub decrypted: Instant,
+    /// The WebSocket layer returned the whole frame, inflated.
+    pub inflated: Instant,
+    pub parsed: Instant,
+    /// Signature checked (equal to `parsed` without a verifier).
+    pub verified: Instant,
+    pub decoded: Instant,
+    /// Just before the message went into the channel.
+    pub sent: Instant,
+}
+
+/// Instants stored as nanoseconds since this, so they fit in an atomic. 0 means unset.
+static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn to_nanos(t: Instant) -> u64 {
+    (t.saturating_duration_since(*EPOCH).as_nanos() as u64).max(1)
+}
+
+fn from_nanos(n: u64) -> Instant {
+    *EPOCH + Duration::from_nanos(n)
+}
+
+/// When reads on a stream returned bytes: the first since the last `take` and the most
+/// recent. Written from inside yawc by `Stamped`, read by the source once per frame.
+#[derive(Default)]
+struct ReadTimes {
+    first: AtomicU64,
+    last: AtomicU64,
+}
+
+impl ReadTimes {
+    fn record(&self) {
+        let now = to_nanos(Instant::now());
+        self.last.store(now, Relaxed);
+        if self.first.load(Relaxed) == 0 {
+            self.first.store(now, Relaxed);
+        }
+    }
+
+    fn take(&self) -> (Instant, Instant) {
+        let last = self.last.load(Relaxed);
+        let first = match self.first.swap(0, Relaxed) {
+            0 => last,
+            first => first,
+        };
+        (from_nanos(first), from_nanos(last))
+    }
+}
+
+/// A stream that notes when its reads return bytes. One sits under TLS and one above
+/// it, which separates waiting for the network from decrypting.
+struct Stamped<S> {
+    inner: S,
+    times: Arc<ReadTimes>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Stamped<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if buf.filled().len() > before {
+            self.times.record();
+        }
+        res
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Stamped<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// The same TLS setup yawc uses on its own: webpki roots, HTTP/1.1 by ALPN, the process
+/// default crypto provider if one is installed and ring otherwise. We build it
+/// ourselves so the socket underneath can be `Stamped`.
+static TLS: LazyLock<TlsConnector> = LazyLock::new(|| {
+    let roots = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let provider = CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(ring::default_provider()));
+    let mut config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("the crypto provider supports TLS 1.2 and 1.3")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    TlsConnector::from(Arc::new(config))
+});
 
 #[derive(Debug, Default, Clone)]
 pub struct Stats {
@@ -256,8 +382,9 @@ impl Shared {
         frame: &Frame,
         live: bool,
         received_at: f64,
-        now: Instant,
+        mut timing: Timing,
     ) -> Vec<FeedMessage> {
+        let now = timing.inflated;
         let mut out = Vec::new();
         for entry in frame.entries() {
             let seq = entry.sequence_number.unwrap_or(-1);
@@ -284,9 +411,11 @@ impl Shared {
                     self.reject(entry, seq);
                     continue;
                 }
+                timing.verified = Instant::now();
             }
             let l2 = if live { l2.ok().flatten() } else { None };
             let mut msg = parse_entry_with(entry, l2.as_ref());
+            timing.decoded = Instant::now();
 
             let mut st = self.lock();
             match st.classify(seq, hash) {
@@ -323,6 +452,7 @@ impl Shared {
             msg.live = live;
             msg.source = source;
             msg.received_at = received_at;
+            msg.timing = Some(timing);
             out.push(msg);
         }
         out
@@ -484,14 +614,14 @@ impl Source {
             info!("connecting to {}", self.url);
             let err = match self.connect().await {
                 Err(err) => err,
-                Ok(ws) => {
+                Ok((ws, times)) => {
                     if failures > 0 {
                         warn!("{} is reachable again", self.url);
                     }
                     failures = 0;
                     delay = self.reconnect_delay;
                     self.set_connected(true);
-                    let end = self.read(ws).await;
+                    let end = self.read(ws, times).await;
                     self.set_connected(false);
                     match end {
                         End::Stopped => return,
@@ -548,27 +678,56 @@ impl Source {
         self.shared.lock().stats.sources[self.index].connected = connected;
     }
 
-    async fn connect(&self) -> Result<Socket, String> {
-        let url = self.url.parse().map_err(|e| format!("bad URL: {e}"))?;
+    /// A WebSocket over TLS over TCP, with the reads on both sides of TLS `Stamped`.
+    /// Returns the stamps of the (TCP, TLS) reads.
+    async fn connect(&self) -> Result<(Socket, [Arc<ReadTimes>; 2]), String> {
+        let url: url::Url = self.url.parse().map_err(|e| format!("bad URL: {e}"))?;
+        let host = url.host_str().ok_or("URL without a host")?.to_owned();
+        let port = url.port_or_known_default().ok_or("URL without a port")?;
         let mut request = HttpRequestBuilder::new().header(FEED_CLIENT_VERSION, "2");
         let highest = self.shared.lock().highest_seq;
         if highest >= 0 {
             request = request.header(REQUESTED_SEQ, highest.to_string());
         }
+        let err = |e: std::io::Error| e.to_string();
+        // host_str keeps an IPv6 address in brackets, which connect wants and TLS doesn't.
+        let tcp = TcpStream::connect(format!("{host}:{port}"))
+            .await
+            .map_err(err)?;
+        tcp.set_nodelay(true).map_err(err)?;
+        let times = [Arc::default(), Arc::default()];
+        let tcp = Stamped {
+            inner: tcp,
+            times: Arc::clone(&times[0]),
+        };
+        let stream = match url.scheme() {
+            "ws" => MaybeTlsStream::Plain(tcp),
+            "wss" => {
+                let name = host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_owned();
+                let name = ServerName::try_from(name).map_err(|e| e.to_string())?;
+                MaybeTlsStream::Tls(TLS.connect(name, tcp).await.map_err(err)?)
+            }
+            other => return Err(format!("not a WebSocket URL scheme: {other}")),
+        };
+        let stream = Stamped {
+            inner: stream,
+            times: Arc::clone(&times[1]),
+        };
         // Since 2026-09-17 the public feed refuses a handshake that does not offer
         // permessage-deflate. A local relay serves uncompressed and ignores the offer.
         let options = Options::default()
             .with_limits(1 << 24, 1 << 25)
-            .with_low_latency_compression()
-            .with_no_delay();
-        WebSocket::connect(url)
-            .with_options(options)
-            .with_request(request)
+            .with_low_latency_compression();
+        let ws = WebSocket::handshake_with_request(url, stream, options, request)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok((ws, times))
     }
 
-    async fn read(&self, mut ws: Socket) -> End {
+    async fn read(&self, mut ws: Socket, [tcp, tls]: [Arc<ReadTimes>; 2]) -> End {
         let started = Instant::now();
         let mut live = false;
         let mut last_frame = started;
@@ -593,19 +752,32 @@ impl Source {
                 Ok(Err(err)) => return End::Failed(err.to_string()),
                 Ok(Ok(frame)) => frame,
             };
+            let now = Instant::now();
+            let (first_read, last_read) = tcp.take();
+            let (_, decrypted) = tls.take();
             match frame.opcode() {
                 OpCode::Text | OpCode::Binary => {}
                 OpCode::Close => return End::Failed("closed by the server".into()),
                 _ => continue,
             }
             let received_at = unix_now();
-            let now = Instant::now();
             last_frame = now;
             stall_warned = false;
 
             let parsed = match frame_from_slice(frame.payload()) {
                 Ok(parsed) => parsed,
                 Err(err) => return End::Failed(format!("unreadable frame: {err}")),
+            };
+            let at = Instant::now();
+            let timing = Timing {
+                first_read,
+                last_read,
+                decrypted,
+                inflated: now,
+                parsed: at,
+                verified: at,
+                decoded: at,
+                sent: at,
             };
             if !live {
                 let stamp = parsed
@@ -627,11 +799,14 @@ impl Source {
 
             let msgs = self
                 .shared
-                .ingest(self.index, &parsed, live, received_at, now);
+                .ingest(self.index, &parsed, live, received_at, timing);
             let slow = std::mem::take(&mut self.shared.lock().replace[self.index]);
-            for msg in msgs {
+            for mut msg in msgs {
                 if !msg.live {
                     continue;
+                }
+                if let Some(t) = &mut msg.timing {
+                    t.sent = Instant::now();
                 }
                 match self.tx.try_send(msg) {
                     Ok(()) => {}
@@ -672,6 +847,19 @@ mod tests {
         )
     }
 
+    fn stamps(t: Instant) -> Timing {
+        Timing {
+            first_read: t,
+            last_read: t,
+            decrypted: t,
+            inflated: t,
+            parsed: t,
+            verified: t,
+            decoded: t,
+            sent: t,
+        }
+    }
+
     fn shared(sources: usize, verify: Option<Verifier>) -> Shared {
         let urls: Vec<String> = (0..sources).map(|i| format!("ws://source{i}")).collect();
         Shared::new(&urls, verify, 1024)
@@ -686,7 +874,7 @@ mod tests {
     ) -> Vec<(i64, bool)> {
         let json = format!(r#"{{"version":1,"messages":[{}]}}"#, entries.join(","));
         let frame = frame_from_slice(json.as_bytes()).unwrap();
-        s.ingest(source, &frame, live, 0.0, now)
+        s.ingest(source, &frame, live, 0.0, stamps(now))
             .iter()
             .map(|m| (m.seq, m.reorg))
             .collect()
@@ -746,7 +934,7 @@ mod tests {
         let s = shared(1, None);
         let json = format!(r#"{{"messages":[{}]}}"#, entry_json(1, &hash_of(1)));
         let frame = frame_from_slice(json.as_bytes()).unwrap();
-        let out = s.ingest(0, &frame, false, 0.0, Instant::now());
+        let out = s.ingest(0, &frame, false, 0.0, stamps(Instant::now()));
         assert!(!out[0].live && out[0].txs.is_empty());
         assert_eq!(s.lock().stats.backlog_messages, 1);
     }

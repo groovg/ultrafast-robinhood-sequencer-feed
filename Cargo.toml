@@ -18,6 +18,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 keccak-asm = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+# yawc's own TLS stack, set up here so the socket under it can be timed (consume.rs).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+url = "2"
+webpki-roots = "1"
 # Not tokio-tungstenite: the public feed refuses a handshake without permessage-deflate,
 # and tungstenite does not implement it. The zlib feature inflates with zlib-rs, about
 # 20% faster than yawc's default miniz_oxide on the feed's frames.
