@@ -35,6 +35,7 @@
 //!   sequence number, same block hash) is dropped without checking it again. The block
 //!   hash is part of the signed data and the first copy was already checked.
 //! - Problems are logged: which source can't connect, which one is connected but silent.
+//!   A connection that sends nothing at all for 15 s, not even a ping, is replaced.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -80,9 +81,12 @@ const SLOW_WINDOW: u32 = 500;
 const SLOW_SHARE: u32 = 10;
 /// Warn after this long connected with no frames.
 const STALL_WARNING: Duration = Duration::from_secs(30);
-/// Check for a stall four times per `STALL_WARNING`, so it's reported close to when it
-/// crosses the threshold.
-const POLL_INTERVAL: Duration = Duration::from_millis(7500);
+/// Reconnect after this long without any frame at all. Nitro servers ping every 5 s by
+/// default and the public feed every 2 s, so this means the connection is dead.
+const SILENCE_LIMIT: Duration = Duration::from_secs(15);
+/// How often a waiting source checks for a stall or silence, so either is caught soon
+/// after it crosses its threshold.
+const POLL_INTERVAL: Duration = Duration::from_millis(2500);
 /// With `busy_poll`, how long a source waits for a frame before running the last one
 /// through the path again to keep it in cache.
 const WARM_INTERVAL: Duration = Duration::from_millis(1);
@@ -813,6 +817,7 @@ impl Source {
         let started = Instant::now();
         let mut live = false;
         let mut last_frame = started;
+        let mut last_heard = started;
         let mut last_narrated = started;
         let mut stall_warned = false;
         let mut warned_full = false;
@@ -827,6 +832,12 @@ impl Source {
                 Err(_) => {
                     if !last.is_empty() {
                         self.shared.warm(&last);
+                    }
+                    if last_heard.elapsed() >= SILENCE_LIMIT {
+                        return End::Failed(format!(
+                            "nothing received for {}s, not even a ping",
+                            SILENCE_LIMIT.as_secs()
+                        ));
                     }
                     let idle = last_frame.elapsed();
                     if idle >= STALL_WARNING && !stall_warned {
@@ -846,6 +857,7 @@ impl Source {
             let now = Instant::now();
             let (first_read, last_read) = tcp.take();
             let (_, decrypted) = tls.take();
+            last_heard = now;
             match frame.opcode() {
                 OpCode::Text | OpCode::Binary => {}
                 OpCode::Close => return End::Failed("closed by the server".into()),
