@@ -120,6 +120,9 @@ behind it was the rest of the time.
 - If a transaction has a field that can't be valid (a 30-byte `to` address, a nonce
   over 64 bits) we keep only its hash and raw bytes. Python passes the odd value
   through. No node would accept such a transaction anyway.
+- It decodes transactions only from L2Message entries (kind 3), like arbos does. Python
+  decodes l2Msg for every kind, so an EthDeposit whose address happens to start with
+  byte 4 comes out as a bogus transaction there.
 - The WebSocket client is [yawc](https://crates.io/crates/yawc). tokio-tungstenite
   doesn't support permessage-deflate.
 

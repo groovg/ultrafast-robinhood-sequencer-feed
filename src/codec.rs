@@ -15,6 +15,9 @@ use keccak_asm::Keccak256;
 use rayon::prelude::*;
 use serde::Deserialize;
 
+/// arbostypes: the L1 message kind whose l2Msg holds sequenced transactions.
+pub const L1_L2_MESSAGE: i64 = 3;
+
 /// arbos/parse_l2.go: L2 message kinds. Only these two carry user transactions.
 pub const L2_BATCH: u8 = 3;
 pub const L2_SIGNED_TX: u8 = 4;
@@ -567,7 +570,7 @@ impl FeedMessage {
     /// arbostypes: L1 message kinds. Anything but L2Message reached the chain through Ethereum.
     pub fn l1_kind_name(&self) -> Cow<'static, str> {
         Cow::Borrowed(match self.l1_kind {
-            3 => "L2Message",
+            L1_L2_MESSAGE => "L2Message",
             6 => "EndOfBlock",
             7 => "L2FundedByL1",
             8 => "RollupEvent",
@@ -583,7 +586,7 @@ impl FeedMessage {
 
     /// Anything not an L2Message entered through Ethereum, not the sequencer.
     pub fn from_parent_chain(&self) -> bool {
-        self.l1_kind != 3
+        self.l1_kind != L1_L2_MESSAGE
     }
 }
 
@@ -610,10 +613,17 @@ pub fn l2_msg(entry: &Entry) -> Result<Option<Bytes>, base64_simd::Error> {
 /// decoded only if `l2` is given, which is how the consumer skips decoding the backlog.
 pub fn parse_entry_with(entry: &Entry, l2: Option<&Bytes>) -> FeedMessage {
     let header = entry.header();
-    let txs = l2.map(decode_l2_message).unwrap_or_default();
+    let kind = header.and_then(|h| h.kind).unwrap_or(-1);
+    // Only an L2Message carries signed transactions. Other kinds lay out l2Msg their own
+    // way (an EthDeposit is an address and an amount), and arbos never reads them as
+    // transactions, so neither do we.
+    let txs = match l2 {
+        Some(l2) if kind == L1_L2_MESSAGE => decode_l2_message(l2),
+        _ => Vec::new(),
+    };
     FeedMessage {
         seq: entry.sequence_number.unwrap_or(-1),
-        l1_kind: header.and_then(|h| h.kind).unwrap_or(-1),
+        l1_kind: kind,
         l1_sender: header.and_then(|h| h.sender.as_deref()).map(str::to_owned),
         timestamp: header.and_then(|h| h.timestamp).unwrap_or(0),
         txs,
@@ -776,6 +786,23 @@ mod tests {
             let tx = decode_transaction(Bytes::copy_from_slice(junk)).unwrap();
             assert_eq!(tx.to_bytes, None);
             assert_eq!(tx.sender_bytes(), None);
+        }
+    }
+
+    #[test]
+    fn only_an_l2_message_is_decoded_into_transactions() {
+        // A signed-transaction marker (0x04) at the start of l2Msg, under two kinds.
+        let l2 = Bytes::from([[4u8].as_slice(), &[0xc0; 51]].concat());
+        let json = |kind: i64| {
+            format!(
+                r#"{{"messages":[{{"message":{{"message":{{"header":{{"kind":{kind}}}}}}}}}]}}"#
+            )
+        };
+        for (kind, txs) in [(3, 1), (12, 0)] {
+            let text = json(kind);
+            let frame = frame_from_slice(text.as_bytes()).unwrap();
+            let msg = parse_entry_with(&frame.entries()[0], Some(&l2));
+            assert_eq!(msg.txs.len(), txs, "kind {kind}");
         }
     }
 
