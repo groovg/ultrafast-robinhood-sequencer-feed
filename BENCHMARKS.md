@@ -44,6 +44,14 @@ Notes:
   one core. Network delays are measured in milliseconds, which is why racing
   connections (below) helps more than anything in this table.
 
+The feed path starts after the WebSocket library has inflated the frame. The public feed
+compresses every frame (permessage-deflate), and inflating one takes 8.9 µs with
+zlib-rs, which we use, or 11.9 µs with miniz_oxide, yawc's default. Measured by
+recompressing the recording the way the protocol does it, since the feed's own
+compressed bytes aren't recorded. Tiny-message WebSocket benchmarks don't show this
+cost, and at ~10 frames a second it's the only part of the WebSocket layer that
+matters.
+
 How the Rust feed path went from 61.0 µs to 52.4 µs (libsecp256k1, same recording):
 
 | Change | Feed path |
