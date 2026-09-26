@@ -217,7 +217,8 @@ fn main() {
     paced.sort_by(f64::total_cmp);
     println!(
         "{:<44}{:>10.3}",
-        "  with 100 ms between messages (p50)", paced[50]
+        "  with 100 ms between messages (p50)",
+        paced[paced.len() / 2]
     );
     let full_us = best_of(10, messages, || {
         for line in &lines {
@@ -273,6 +274,35 @@ fn main() {
             "every sender, recover_senders ({} threads)",
             rayon::current_num_threads()
         )
+    );
+    // Again with a 20 ms pause before each message, which is when rayon's threads fall
+    // asleep. Median of 100 messages.
+    let paced = |recover: &mut dyn FnMut(&[rhfeed::Tx])| {
+        let mut us: Vec<f64> = decoded()
+            .iter()
+            .take(100)
+            .map(|txs| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let started = Instant::now();
+                recover(txs);
+                started.elapsed().as_secs_f64() * 1e6
+            })
+            .collect();
+        us.sort_by(f64::total_cmp);
+        us[us.len() / 2]
+    };
+    let rayon_paced = paced(&mut |txs| rhfeed::recover_senders(txs));
+    println!(
+        "{:<44}{rayon_paced:>10.3}",
+        "  20 ms between messages (p50)"
+    );
+    let mut pool = rhfeed::SenderPool::new(7);
+    let pool_paced = paced(&mut |txs| pool.recover(txs));
+    // Its threads spin until it's dropped, and would slow down every row after this.
+    drop(pool);
+    println!(
+        "{:<44}{pool_paced:>10.3}",
+        "every sender, SenderPool (7 threads), 20 ms"
     );
 
     // The bare primitive, on the feed signatures' real digests.

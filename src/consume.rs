@@ -38,6 +38,7 @@
 //!   A connection that sends nothing at all for 15 s, not even a ping, is replaced.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -47,7 +48,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
 use log::{info, warn};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinSet;
@@ -56,7 +57,9 @@ use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use yawc::{HttpRequestBuilder, MaybeTlsStream, OpCode, Options, WebSocket};
 
-use crate::codec::{Entry, FeedMessage, Frame, frame_from_slice, l2_msg, parse_entry_with};
+use crate::codec::{
+    Entry, FeedMessage, Frame, SenderPool, frame_from_slice, l2_msg, parse_entry_with,
+};
 use crate::verify::Verifier;
 
 /// Where a local Nitro relay listens by default (see README.md for running one).
@@ -111,7 +114,8 @@ pub struct Timing {
     /// The WebSocket layer returned the whole frame, inflated.
     pub inflated: Instant,
     pub parsed: Instant,
-    /// Signature checked (equal to `parsed` without a verifier).
+    /// Signature checked (equal to `parsed` without a verifier). With
+    /// `FeedBuilder::senders`, also every sender recovered, and `decoded` is the same.
     pub verified: Instant,
     pub decoded: Instant,
     /// Just before the message went into the channel.
@@ -346,6 +350,8 @@ impl State {
 
 struct Shared {
     verify: Option<Verifier>,
+    /// With `FeedBuilder::senders`.
+    senders: Option<Mutex<SenderPool>>,
     reorg_window: i64,
     state: Mutex<State>,
     /// When `warm` last ran, as `to_nanos`.
@@ -353,7 +359,12 @@ struct Shared {
 }
 
 impl Shared {
-    fn new(urls: &[String], verify: Option<Verifier>, reorg_window: i64) -> Self {
+    fn new(
+        urls: &[String],
+        verify: Option<Verifier>,
+        senders: Option<SenderPool>,
+        reorg_window: i64,
+    ) -> Self {
         let sources = urls
             .iter()
             .map(|url| SourceStats {
@@ -363,6 +374,7 @@ impl Shared {
             .collect();
         Self {
             verify,
+            senders: senders.map(Mutex::new),
             reorg_window,
             state: Mutex::new(State {
                 highest_seq: -1,
@@ -414,19 +426,43 @@ impl Shared {
             } else {
                 Ok(None)
             };
-            if let Some(v) = &self.verify {
-                let good = l2
+            let accepted = || match &self.verify {
+                None => true,
+                Some(v) => l2
                     .as_ref()
-                    .is_ok_and(|l2| v.accepts_with(entry, l2.as_deref()));
-                if !good {
-                    self.reject(entry, seq);
-                    continue;
+                    .is_ok_and(|l2| v.accepts_with(entry, l2.as_deref())),
+            };
+            let decodable = if live {
+                l2.as_ref().ok().and_then(Option::as_ref)
+            } else {
+                None
+            };
+            let mut msg = match (&self.senders, live) {
+                // Decode first, so the pool recovers the senders while this thread
+                // checks the signature.
+                (Some(pool), true) => {
+                    let msg = parse_entry_with(entry, decodable);
+                    let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
+                    let good = pool.recover_while(&msg.txs, accepted);
+                    timing.verified = Instant::now();
+                    timing.decoded = timing.verified;
+                    if !good {
+                        self.reject(entry, seq);
+                        continue;
+                    }
+                    msg
                 }
-                timing.verified = Instant::now();
-            }
-            let l2 = if live { l2.ok().flatten() } else { None };
-            let mut msg = parse_entry_with(entry, l2.as_ref());
-            timing.decoded = Instant::now();
+                _ => {
+                    if !accepted() {
+                        self.reject(entry, seq);
+                        continue;
+                    }
+                    timing.verified = Instant::now();
+                    let msg = parse_entry_with(entry, decodable);
+                    timing.decoded = Instant::now();
+                    msg
+                }
+            };
 
             let mut st = self.lock();
             match st.classify(seq, hash) {
@@ -590,6 +626,7 @@ impl Feed {
             reconnect_delay: Duration::from_millis(500),
             capacity: 1024,
             busy_poll: false,
+            senders: 0,
         }
     }
 
@@ -628,17 +665,26 @@ impl Feed {
 }
 
 pub struct FeedBuilder {
-    sources: Vec<String>,
+    sources: Vec<(String, Option<IpAddr>)>,
     verify: Option<Verifier>,
     reconnect_delay: Duration,
     capacity: usize,
     busy_poll: bool,
+    senders: usize,
 }
 
 impl FeedBuilder {
     /// Add a feed URL. Several sources race; each message comes from the fastest.
     pub fn source(mut self, url: impl Into<String>) -> Self {
-        self.sources.push(url.into());
+        self.sources.push((url.into(), None));
+        self
+    }
+
+    /// Add a feed URL, connecting from this local IP address. The public feed allows two
+    /// connections per IP, so a machine with several addresses can race more
+    /// connections by giving each its own.
+    pub fn source_from(mut self, url: impl Into<String>, local: IpAddr) -> Self {
+        self.sources.push((url.into(), Some(local)));
         self
     }
 
@@ -673,16 +719,32 @@ impl FeedBuilder {
         self
     }
 
+    /// Recover every transaction's sender before handing a message over, on a
+    /// `SenderPool` of `threads` spinning threads, while the source checks the feed
+    /// signature. `tx.sender()` is then free. Each thread keeps a core at 100%.
+    pub fn senders(mut self, threads: usize) -> Self {
+        self.senders = threads;
+        self
+    }
+
     /// Start every source on the current tokio runtime, or on a thread of its own with
     /// `busy_poll`. Panics with no sources.
     pub fn spawn(self) -> Feed {
         assert!(!self.sources.is_empty(), "a feed needs at least one source");
-        let shared = Arc::new(Shared::new(&self.sources, self.verify, REORG_WINDOW));
+        let labels: Vec<String> = (self.sources.iter())
+            .map(|(url, local)| match local {
+                Some(ip) => format!("{url} from {ip}"),
+                None => url.clone(),
+            })
+            .collect();
+        let senders = (self.senders > 0).then(|| SenderPool::new(self.senders));
+        let shared = Arc::new(Shared::new(&labels, self.verify, senders, REORG_WINDOW));
         let (tx, rx) = mpsc::channel(self.capacity.max(1));
         let sources: Vec<Source> = (self.sources.into_iter().enumerate())
-            .map(|(index, url)| Source {
+            .map(|(index, (url, local))| Source {
                 index,
                 url,
+                local,
                 shared: shared.clone(),
                 tx: tx.clone(),
                 reconnect_delay: self.reconnect_delay,
@@ -734,6 +796,7 @@ fn busy_poll(sources: Vec<Source>, tx: mpsc::Sender<FeedMessage>) {
 struct Source {
     index: usize,
     url: String,
+    local: Option<IpAddr>,
     shared: Arc<Shared>,
     tx: mpsc::Sender<FeedMessage>,
     reconnect_delay: Duration,
@@ -835,9 +898,25 @@ impl Source {
         }
         let err = |e: std::io::Error| e.to_string();
         // host_str keeps an IPv6 address in brackets, which connect wants and TLS doesn't.
-        let tcp = TcpStream::connect(format!("{host}:{port}"))
-            .await
-            .map_err(err)?;
+        let tcp = match self.local {
+            None => TcpStream::connect(format!("{host}:{port}")).await,
+            Some(local) => {
+                let remote = (tokio::net::lookup_host(format!("{host}:{port}")).await)
+                    .map_err(err)?
+                    .find(|a| a.is_ipv4() == local.is_ipv4())
+                    .ok_or(format!(
+                        "{host} has no address of the same family as {local}"
+                    ))?;
+                let socket = match local {
+                    IpAddr::V4(_) => TcpSocket::new_v4(),
+                    IpAddr::V6(_) => TcpSocket::new_v6(),
+                }
+                .map_err(err)?;
+                socket.bind((local, 0).into()).map_err(err)?;
+                socket.connect(remote).await
+            }
+        }
+        .map_err(err)?;
         tcp.set_nodelay(true).map_err(err)?;
         let times = [Arc::default(), Arc::default()];
         let tcp = Stamped {
@@ -1024,7 +1103,7 @@ mod tests {
 
     fn shared(sources: usize, verify: Option<Verifier>) -> Shared {
         let urls: Vec<String> = (0..sources).map(|i| format!("ws://source{i}")).collect();
-        Shared::new(&urls, verify, 1024)
+        Shared::new(&urls, verify, None, 1024)
     }
 
     fn feed_at(
@@ -1075,7 +1154,7 @@ mod tests {
 
     #[test]
     fn the_window_is_bounded_and_an_unknown_hash_is_not_a_reorg() {
-        let s = Shared::new(&["ws://a".into()], None, 2);
+        let s = Shared::new(&["ws://a".into()], None, None, 2);
         let seqs: Vec<String> = (1..=10).map(|n| entry_json(n, &hash_of(n as u8))).collect();
         feed(&s, 0, &seqs);
         assert!(s.lock().seen.len() <= 5);

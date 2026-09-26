@@ -158,3 +158,27 @@ async fn busy_polling_delivers_through_try_recv() {
     assert_eq!((msg.seq, msg.live), (6, true));
     assert!(msg.timing.is_some());
 }
+
+#[tokio::test]
+async fn a_source_connects_from_the_local_address_it_was_given() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let from: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+    let feed = Feed::builder().source_from(url, from).spawn();
+    let (_, peer) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("no connection within 5 s")
+        .unwrap();
+    assert_eq!(peer.ip(), from);
+    assert!(feed.stats().sources[0].url.ends_with("from 127.0.0.2"));
+}
+
+#[tokio::test]
+async fn a_feed_can_recover_the_senders_itself() {
+    let (url, _) = server(vec![vec![frame(&[entry(8, now())])]]).await;
+    let mut feed = Feed::builder().source(url).senders(2).spawn();
+    let msg = next(&mut feed).await;
+    assert_eq!((msg.seq, msg.txs.len()), (8, 1));
+    // The test transaction is junk, so it has no sender either way.
+    assert_eq!(msg.txs[0].sender_bytes(), None);
+}

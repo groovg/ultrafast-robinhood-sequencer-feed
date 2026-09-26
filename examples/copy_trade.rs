@@ -3,6 +3,12 @@
 //! to you.
 //!
 //!     cargo run --release --example copy_trade -- 0xabc... 0xdef...
+//!     cargo run --release --example copy_trade -- --busy 0xabc...
+//!
+//! `--busy` trades CPU for latency: the feed is read by a thread that never sleeps,
+//! messages are picked up by spinning, and the feed recovers the senders on 7 spinning
+//! threads while it checks the signature (`FeedBuilder::senders`). That's 9 cores at
+//! 100%, and a message's senders are known about 250 µs sooner.
 //!
 //! One JSON line per matching transaction on stdout. The transaction has been ordered
 //! but not executed yet, so it can still revert.
@@ -13,9 +19,12 @@ use rhfeed::{Feed, MAINNET_FEED, MAINNET_VERIFIER, addr, recover_senders, select
 
 #[tokio::main]
 async fn main() {
-    let follow: HashSet<[u8; 20]> = std::env::args()
-        .skip(1)
-        .map(|a| addr(&a).unwrap_or_else(|e| panic!("{e}")))
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let busy = args.iter().any(|a| a == "--busy");
+    let follow: HashSet<[u8; 20]> = args
+        .iter()
+        .filter(|a| *a != "--busy")
+        .map(|a| addr(a).unwrap_or_else(|e| panic!("{e}")))
         .collect();
     if follow.is_empty() {
         eprintln!("usage: copy_trade <wallet> [wallet...]");
@@ -46,6 +55,8 @@ async fn main() {
         .source(MAINNET_FEED)
         .source(MAINNET_FEED)
         .verify(MAINNET_VERIFIER.clone())
+        .busy_poll(busy)
+        .senders(if busy { 7 } else { 0 })
         .spawn();
 
     // Read from a spawned task, not main's own thread: see Feed::recv.
@@ -58,8 +69,11 @@ async fn main() {
                     contracts.is_empty() || t.to_bytes.is_some_and(|to| contracts.contains(&to))
                 })
                 .collect();
-            // Every sender in the message at once, spread over the cores.
-            recover_senders(candidates.iter().copied());
+            // Every sender in the message at once, spread over the cores. With --busy the
+            // feed has done it already.
+            if !busy {
+                recover_senders(candidates.iter().copied());
+            }
             for tx in candidates {
                 let Some(from) = tx.sender_bytes().filter(|s| follow.contains(s)) else {
                     continue;

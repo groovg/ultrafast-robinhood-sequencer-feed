@@ -8,7 +8,9 @@
 //! Nodes reject such transactions, so they never execute either way.
 
 use std::borrow::Cow;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use keccak_asm::Keccak256;
@@ -376,14 +378,140 @@ impl Tx {
 }
 
 /// Recover the sender of every transaction in `txs` at once and cache it, so later
-/// `sender()` calls are free. The transactions are spread over all cores, so a message's
-/// worth of senders takes about as long as the slowest one, not the sum of them.
+/// `sender()` calls are free. The transactions are spread over all cores with rayon.
+///
+/// Between feed messages (~100 ms) rayon's threads fall asleep, and waking them costs
+/// most of the gain: a message's ~7 senders took ~225 µs after a 20 ms pause, against
+/// ~95 µs in a tight loop and ~300 µs one by one. `SenderPool` avoids that.
 pub fn recover_senders<'a>(txs: impl IntoIterator<Item = &'a Tx>) {
     let txs: Vec<&Tx> = txs.into_iter().collect();
     // Each Tx caches its sender in a OnceLock, which is safe to fill from any thread.
     txs.par_iter().for_each(|t| {
         t.sender_bytes();
     });
+}
+
+/// Threads that spin waiting for senders to recover, so they start at once, and keep
+/// their caches warm meanwhile. A message's ~7 senders took 64-68 µs after a 20 ms
+/// pause with 7 threads, against ~225 µs with `recover_senders`. Each thread keeps a
+/// core at 100% while the pool exists.
+pub struct SenderPool {
+    epoch: Arc<AtomicU64>,
+    job: Arc<Mutex<Option<Arc<Job>>>>,
+    stop: Arc<AtomicBool>,
+    sample: Arc<Mutex<Option<Bytes>>>,
+}
+
+/// The transactions of one `SenderPool::recover` call, and who has taken which.
+struct Job {
+    txs: Vec<*const Tx>,
+    next: AtomicUsize,
+    done: AtomicUsize,
+}
+
+// SAFETY: the pointers are only followed while `recover` still borrows the transactions
+// (see `work`), and `Tx` is `Sync`.
+unsafe impl Send for Job {}
+unsafe impl Sync for Job {}
+
+impl Job {
+    fn work(&self) {
+        loop {
+            let i = self.next.fetch_add(1, Ordering::Relaxed);
+            let Some(&tx) = self.txs.get(i) else {
+                return;
+            };
+            // SAFETY: `recover` waits until every index handed out here is done, so the
+            // transaction is still borrowed. An index past the end follows no pointer.
+            unsafe { (*tx).sender_bytes() };
+            self.done.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+impl SenderPool {
+    /// `threads` spinning threads. The calling thread works too, so a message is spread
+    /// over `threads + 1` cores.
+    pub fn new(threads: usize) -> Self {
+        let pool = Self {
+            epoch: Arc::default(),
+            job: Arc::default(),
+            stop: Arc::default(),
+            sample: Arc::default(),
+        };
+        for _ in 0..threads {
+            let (epoch, job, stop) = (pool.epoch.clone(), pool.job.clone(), pool.stop.clone());
+            let sample = pool.sample.clone();
+            let mut next_warm = Instant::now();
+            std::thread::Builder::new()
+                .name("rhfeed-senders".into())
+                .spawn(move || {
+                    let mut seen = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        let now = epoch.load(Ordering::Acquire);
+                        if now == seen {
+                            // Recover a sample every millisecond meanwhile, which keeps
+                            // the code and tables in cache for the next real message.
+                            if Instant::now() >= next_warm {
+                                let raw = sample.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                if let Some(tx) = raw.and_then(decode_transaction) {
+                                    std::hint::black_box(tx.sender_bytes());
+                                }
+                                next_warm = Instant::now() + Duration::from_millis(1);
+                            }
+                            std::hint::spin_loop();
+                            continue;
+                        }
+                        seen = now;
+                        let job = job.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        if let Some(job) = job {
+                            job.work();
+                        }
+                    }
+                })
+                .expect("cannot start a sender thread");
+        }
+        pool
+    }
+
+    /// `recover_senders` on the pool's threads.
+    pub fn recover<'a>(&mut self, txs: impl IntoIterator<Item = &'a Tx>) {
+        self.recover_while(txs, || ());
+    }
+
+    /// `recover`, while this thread runs `f` first. Returns what `f` returns.
+    pub fn recover_while<'a, R>(
+        &mut self,
+        txs: impl IntoIterator<Item = &'a Tx>,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let job = Arc::new(Job {
+            txs: txs.into_iter().map(std::ptr::from_ref).collect(),
+            next: AtomicUsize::new(0),
+            done: AtomicUsize::new(0),
+        });
+        let mut sample = self.sample.lock().unwrap_or_else(|e| e.into_inner());
+        if sample.is_none() {
+            // SAFETY: the transactions are borrowed for this whole call.
+            *sample = job.txs.first().map(|&t| unsafe { (*t).raw.clone() });
+        }
+        drop(sample);
+        *self.job.lock().unwrap_or_else(|e| e.into_inner()) = Some(job.clone());
+        self.epoch.fetch_add(1, Ordering::Release);
+        let out = f();
+        job.work();
+        while job.done.load(Ordering::Acquire) < job.txs.len() {
+            std::hint::spin_loop();
+        }
+        *self.job.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        out
+    }
+}
+
+impl Drop for SenderPool {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Debug for Tx {

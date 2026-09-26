@@ -12,7 +12,7 @@ pub mod secp;
 pub mod verify;
 
 pub use codec::{
-    FeedMessage, Frame, Tx, addr, checksum, decode_l2_message, decode_transaction,
+    FeedMessage, Frame, SenderPool, Tx, addr, checksum, decode_l2_message, decode_transaction,
     frame_from_slice, is_filtered_call, keccak, parse_frame, recover_senders, sel, selector_of,
 };
 pub use consume::{

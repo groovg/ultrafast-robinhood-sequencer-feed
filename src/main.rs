@@ -3,6 +3,7 @@
 //! the two.
 
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::process::exit;
 use std::time::{Duration, Instant};
 
@@ -26,7 +27,8 @@ const ADDR_WIDTH: usize = 10;
 #[command(name = "rhfeed", version)]
 struct Args {
     /// 'mainnet', 'testnet', 'relay' (ws://127.0.0.1:9642), or any feed URL. Repeat it
-    /// to race several sources; each message is taken from whichever has it first
+    /// to race several sources; each message is taken from whichever has it first. Add
+    /// '@' and a local IP address to connect from that address (mainnet@10.0.0.5)
     #[arg(long, default_value = "mainnet")]
     feed: Vec<String>,
     /// Stop after this long, whether or not anything arrives
@@ -55,7 +57,7 @@ struct Args {
     #[arg(long)]
     timing: bool,
     /// Read the feed on a thread that never sleeps, and spin waiting for its messages.
-    /// Lower latency, at the cost of two cores at 100%
+    /// Lower latency, at the cost of two cores at 100%, plus up to 7 more for --sender
     #[arg(long)]
     busy_poll: bool,
 }
@@ -202,18 +204,25 @@ async fn run() {
         .map(|()| log::set_max_level(log::LevelFilter::Info))
         .unwrap();
 
-    let urls: Vec<&str> = args
+    let sources: Vec<(&str, Option<IpAddr>)> = args
         .feed
         .iter()
-        .map(|f| match f.as_str() {
-            "mainnet" => MAINNET_FEED,
-            "testnet" => TESTNET_FEED,
-            "relay" => LOCAL_RELAY,
-            other => other,
+        .map(|f| {
+            let (feed, local) = match f.rsplit_once('@') {
+                Some((feed, ip)) if ip.parse::<IpAddr>().is_ok() => (feed, ip.parse().ok()),
+                _ => (f.as_str(), None),
+            };
+            let url = match feed {
+                "mainnet" => MAINNET_FEED,
+                "testnet" => TESTNET_FEED,
+                "relay" => LOCAL_RELAY,
+                other => other,
+            };
+            (url, local)
         })
         .collect();
     let verify = !args.no_verify;
-    if verify && urls.contains(&TESTNET_FEED) {
+    if verify && sources.iter().any(|(url, _)| *url == TESTNET_FEED) {
         // The chain id is part of the signed data, so every testnet message would fail
         // and it would look like the feed is dead.
         eprintln!(
@@ -228,19 +237,31 @@ async fn run() {
         exit(1);
     });
 
-    let mut builder = urls
+    let mut builder = sources
         .iter()
-        .fold(Feed::builder(), |b, url| b.source(*url))
+        .fold(Feed::builder(), |b, &(url, local)| match local {
+            Some(ip) => b.source_from(url, ip),
+            None => b.source(url),
+        })
         .busy_poll(args.busy_poll);
     if verify {
         builder = builder.verify(MAINNET_VERIFIER.clone());
     }
-    let mut feed = builder.spawn();
     // Recovering a sender costs about 15 times more than all other fields together, so
     // we only show senders when --sender already made us recover them.
     let show_sender = keep.sender.is_some();
+    // With --busy-poll, the feed recovers the senders itself while it checks the
+    // signature, on spinning threads: as many as a typical message has transactions
+    // (7), leaving cores for the rest.
+    let pooled = args.busy_poll && show_sender;
+    if pooled {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        builder = builder.senders(cores.saturating_sub(3).clamp(1, 7));
+    }
+    let mut feed = builder.spawn();
     let mut shown = 0usize;
     let mut stages: Vec<[Duration; STAGES.len()]> = Vec::new();
+    let mut senders: Vec<Duration> = Vec::new();
 
     let stream = async {
         while let Some(msg) = feed.recv().await {
@@ -266,8 +287,12 @@ async fn run() {
             }
             let mut txs: Vec<&Tx> = msg.txs.iter().filter(|t| keep.cheap(t)).collect();
             if show_sender {
-                // All of this message's senders at once, spread over the cores.
-                rhfeed::recover_senders(txs.iter().copied());
+                if !pooled {
+                    // All of this message's senders at once, spread over the cores.
+                    let started = Instant::now();
+                    rhfeed::recover_senders(txs.iter().copied());
+                    senders.push(started.elapsed());
+                }
                 txs.retain(|t| keep.sender(t));
             }
             if txs.is_empty() && keep.active() {
@@ -316,6 +341,17 @@ async fn run() {
 
     if args.timing && !stages.is_empty() {
         print_timing(&mut stages);
+        if !senders.is_empty() {
+            senders.sort_unstable();
+            let at = |q: f64| senders[((senders.len() - 1) as f64 * q).round() as usize];
+            eprintln!(
+                "#   {:<28}{:>9.1}{:>9.1}{:>9.1}  (after recv)",
+                "senders (--sender)",
+                us(at(0.5)),
+                us(at(0.99)),
+                us(at(1.0))
+            );
+        }
     }
     let s = feed.stats();
     let counted = if keep.active() { "matched" } else { "seen" };
@@ -379,6 +415,10 @@ fn print_timing(stages: &mut [[Duration; STAGES.len()]]) {
             at(1.0)
         );
     }
+}
+
+fn us(d: Duration) -> f64 {
+    d.as_secs_f64() * 1e6
 }
 
 fn ms(d: Duration) -> f64 {

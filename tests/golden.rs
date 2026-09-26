@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use rhfeed::codec::{Entry, L2_BATCH, L2_SIGNED_TX, MAX_BATCH_DEPTH, decode_l2_message};
 use rhfeed::{
-    FEED_PREFIX, MAINNET_CHAIN_ID, MAINNET_SIGNER, MAINNET_VERIFIER, Tx, Verifier,
+    FEED_PREFIX, MAINNET_CHAIN_ID, MAINNET_SIGNER, MAINNET_VERIFIER, SenderPool, Tx, Verifier,
     decode_transaction, frame_from_slice, parse_frame, recover_senders, recover_signer,
     signature_payload,
 };
@@ -106,7 +106,8 @@ fn every_captured_frame_decodes_exactly_as_python_does() {
 #[test]
 fn recovering_senders_in_bulk_matches_python() {
     let frames = frames();
-    let mut checked = 0;
+    let mut pool = SenderPool::new(3);
+    let (mut checked, mut pooled) = (0, 0);
     for line in golden().iter().filter(|g| g.get("line").is_some()) {
         let i = line["line"].as_u64().unwrap() as usize;
         let frame = frame_from_slice(frames[i].as_bytes()).unwrap();
@@ -114,7 +115,13 @@ fn recovering_senders_in_bulk_matches_python() {
             .iter()
             .zip(line["messages"].as_array().unwrap())
         {
-            recover_senders(&m.txs);
+            // Both ways of recovering them in bulk, taking turns.
+            if m.seq % 2 == 0 {
+                recover_senders(&m.txs);
+            } else {
+                pool.recover(&m.txs);
+                pooled += m.txs.len();
+            }
             for (t, wt) in m.txs.iter().zip(w["txs"].as_array().unwrap()) {
                 let got = t.sender().map_or(Value::Null, Value::String);
                 assert_eq!(got, wt["sender"], "seq {}", m.seq);
@@ -122,7 +129,7 @@ fn recovering_senders_in_bulk_matches_python() {
             }
         }
     }
-    assert!(checked > 100);
+    assert!(checked > 100 && pooled > 50, "{checked} {pooled}");
 }
 
 #[test]
