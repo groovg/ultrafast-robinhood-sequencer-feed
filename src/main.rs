@@ -187,6 +187,12 @@ impl log::Log for StderrLog {
 
 #[tokio::main]
 async fn main() {
+    // Consume in a task rather than on main's own thread. A message then wakes it on the
+    // worker that received the message, ~4 us, instead of waking another thread, ~14 us.
+    tokio::spawn(run()).await.unwrap();
+}
+
+async fn run() {
     let args = Args::parse();
     log::set_logger(&StderrLog)
         .map(|()| log::set_max_level(log::LevelFilter::Info))

@@ -516,6 +516,11 @@ impl Feed {
 
     /// The next live message, from whichever source had it first. `None` only if every
     /// source task has stopped, which they do not do on their own.
+    ///
+    /// Call this from a task you `tokio::spawn`, not straight from `#[tokio::main]`'s
+    /// body. The body runs on its own thread, so every message has to wake that thread
+    /// (~14 us on our machine). A spawned task is woken on the worker that just received
+    /// the message (~4 us).
     pub async fn recv(&mut self) -> Option<FeedMessage> {
         self.rx.recv().await
     }

@@ -43,11 +43,14 @@ let mut feed = rhfeed::Feed::builder()
     .verify(rhfeed::MAINNET_VERIFIER.clone())
     .spawn();
 
-while let Some(msg) = feed.recv().await {
-    for tx in &msg.txs {
-        // tx.to_bytes and tx.selector are free, tx.hash() and tx.sender() cost a hash / an ECDSA recovery
+// Read in a spawned task: see below.
+tokio::spawn(async move {
+    while let Some(msg) = feed.recv().await {
+        for tx in &msg.txs {
+            // tx.to_bytes and tx.selector are free, tx.hash() and tx.sender() cost a hash / an ECDSA recovery
+        }
     }
-}
+});
 ```
 
 ## Plugging it into a bot
@@ -79,6 +82,10 @@ A few things to keep in mind:
 - `Feed::recv()` hands you messages through a buffer of 1024. If your bot takes longer
   per message than the feed produces them, the buffer fills up and you get a warning.
   Do slow work on another task.
+- Call `recv()` from a task you `tokio::spawn`, not directly in `#[tokio::main]`'s
+  body. That body runs on its own thread, and waking it for each message took ~14 µs
+  on our machine. A spawned task gets woken on the worker thread that just received the
+  message, which took ~4 µs.
 - `msg.timing` says when each stage finished with the message: socket read, TLS,
   WebSocket and inflate, JSON, signature, decoding, hand-off. `rhfeed --timing` prints
   percentiles of each stage when it exits, so you can see where the time goes on your
