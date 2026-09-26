@@ -43,11 +43,14 @@ let mut feed = rhfeed::Feed::builder()
     .verify(rhfeed::MAINNET_VERIFIER.clone())
     .spawn();
 
-while let Some(msg) = feed.recv().await {
-    for tx in &msg.txs {
-        // tx.to_bytes and tx.selector are free, tx.hash() and tx.sender() cost a hash / an ECDSA recovery
+// Read in a spawned task: see below.
+tokio::spawn(async move {
+    while let Some(msg) = feed.recv().await {
+        for tx in &msg.txs {
+            // tx.to_bytes and tx.selector are free, tx.hash() and tx.sender() cost a hash / an ECDSA recovery
+        }
     }
-}
+});
 ```
 
 ## Plugging it into a bot
@@ -80,6 +83,33 @@ A few things to keep in mind:
   per message than the feed produces them, the buffer fills up and you get a warning.
   Do slow work on another task.
 
+### Lowest latency
+
+If you can spare the cores:
+
+```rust
+let mut feed = rhfeed::Feed::builder()
+    .source(rhfeed::MAINNET_FEED)
+    .source(rhfeed::MAINNET_FEED)
+    .verify(rhfeed::MAINNET_VERIFIER.clone())
+    .busy_poll(true) // one core at 100%, plus one for recv()
+    .senders(7)      // seven more
+    .spawn();
+```
+
+- `busy_poll` reads the feed on a thread that never sleeps and keeps its caches warm.
+  On our machine the time from the socket read to `recv()` went from 95 to 61 µs at the
+  median.
+- `senders(7)` recovers every sender on 7 spinning threads while the signature is being
+  checked, so `tx.sender()` is free when the message arrives. Calling `recover_senders`
+  after `recv()` took 273 µs per message instead, mostly waking rayon's threads.
+- Read `recv()` from a task you `tokio::spawn`. Waking `#[tokio::main]`'s own thread
+  took ~14 µs per message, waking a spawned task ~4 µs.
+- `rhfeed --timing` shows where the time goes on your machine, stage by stage. Every
+  message carries the same timestamps in `msg.timing`.
+
+`rhfeed --busy-poll` and `copy_trade --busy` use these settings.
+
 ## Two connections are faster than one
 
 We opened two connections to the same public endpoint and compared arrival times. Each
@@ -89,7 +119,9 @@ drops the other, so you get the better of the two on every message. That's worth
 more than all the decoding work in this crate.
 
 The public feed allows two connections per IP. A third one gets HTTP 429. To race more
-than two you need more IPs, or relays on other machines.
+than two you need more IPs, or relays on other machines. On a machine with several
+addresses, `source_from(url, ip)` (or `--feed mainnet@10.0.0.5` in the CLI) connects
+from a given one, so each address can carry two connections.
 
 Usually the two connections split the wins about evenly. Now and then one of them lands
 on a path that's about 9 ms slower and stays there. If a connection is first on fewer
@@ -104,11 +136,15 @@ behind it was the rest of the time.
   mostly because the public feed requires permessage-deflate. This client handles that
   itself.
 - It checks the sequencer's signature on every message by default. That costs about
-  40 µs per message. Use `--no-verify` to skip it (you'll need that for testnet).
+  27 µs per message, since we check against the known key instead of recovering the
+  signer. Use `--no-verify` to skip it (you'll need that for testnet).
 - It can read from several sources at once and deliver each message once.
 - If a transaction has a field that can't be valid (a 30-byte `to` address, a nonce
   over 64 bits) we keep only its hash and raw bytes. Python passes the odd value
   through. No node would accept such a transaction anyway.
+- It decodes transactions only from L2Message entries (kind 3), like arbos does. Python
+  decodes l2Msg for every kind, so an EthDeposit whose address happens to start with
+  byte 4 comes out as a bogus transaction there.
 - The WebSocket client is [yawc](https://crates.io/crates/yawc). tokio-tungstenite
   doesn't support permessage-deflate.
 
