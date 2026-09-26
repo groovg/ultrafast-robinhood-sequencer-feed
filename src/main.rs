@@ -54,6 +54,10 @@ struct Args {
     /// the socket read to this program receiving the message
     #[arg(long)]
     timing: bool,
+    /// Read the feed on a thread that never sleeps, and spin waiting for its messages.
+    /// Lower latency, at the cost of two cores at 100%
+    #[arg(long)]
+    busy_poll: bool,
 }
 
 /// The filters, cheapest first. `to` and `selector` are just set lookups. `sender` needs
@@ -187,6 +191,12 @@ impl log::Log for StderrLog {
 
 #[tokio::main]
 async fn main() {
+    // Consume in a task rather than on main's own thread. A message then wakes it on the
+    // worker that received the message, ~4 us, instead of waking another thread, ~14 us.
+    tokio::spawn(run()).await.unwrap();
+}
+
+async fn run() {
     let args = Args::parse();
     log::set_logger(&StderrLog)
         .map(|()| log::set_max_level(log::LevelFilter::Info))
@@ -218,7 +228,10 @@ async fn main() {
         exit(1);
     });
 
-    let mut builder = urls.iter().fold(Feed::builder(), |b, url| b.source(*url));
+    let mut builder = urls
+        .iter()
+        .fold(Feed::builder(), |b, url| b.source(*url))
+        .busy_poll(args.busy_poll);
     if verify {
         builder = builder.verify(MAINNET_VERIFIER.clone());
     }

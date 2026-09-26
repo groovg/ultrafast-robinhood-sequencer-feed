@@ -48,37 +48,42 @@ async fn main() {
         .verify(MAINNET_VERIFIER.clone())
         .spawn();
 
-    while let Some(msg) = feed.recv().await {
-        let candidates: Vec<_> = msg
-            .txs
-            .iter()
-            .filter(|t| {
-                contracts.is_empty() || t.to_bytes.is_some_and(|to| contracts.contains(&to))
-            })
-            .collect();
-        // Every sender in the message at once, spread over the cores.
-        recover_senders(candidates.iter().copied());
-        for tx in candidates {
-            let Some(from) = tx.sender_bytes().filter(|s| follow.contains(s)) else {
-                continue;
-            };
-            let action = tx
-                .selector
-                .and_then(|s| names.iter().find(|(sel, _)| *sel == s))
-                .map_or(tx.kind(), |(_, name)| *name);
-            println!(
-                "{}",
-                serde_json::json!({
-                    "block": msg.seq,
-                    "seen_at": msg.received_at,
-                    "hash": tx.hash_hex(),
-                    "from": rhfeed::checksum(&from),
-                    "to": tx.to(),
-                    "action": action,
-                    "selector": tx.selector_hex(),
-                    "value_wei": tx.value_dec(),
+    // Read from a spawned task, not main's own thread: see Feed::recv.
+    tokio::spawn(async move {
+        while let Some(msg) = feed.recv().await {
+            let candidates: Vec<_> = msg
+                .txs
+                .iter()
+                .filter(|t| {
+                    contracts.is_empty() || t.to_bytes.is_some_and(|to| contracts.contains(&to))
                 })
-            );
+                .collect();
+            // Every sender in the message at once, spread over the cores.
+            recover_senders(candidates.iter().copied());
+            for tx in candidates {
+                let Some(from) = tx.sender_bytes().filter(|s| follow.contains(s)) else {
+                    continue;
+                };
+                let action = tx
+                    .selector
+                    .and_then(|s| names.iter().find(|(sel, _)| *sel == s))
+                    .map_or(tx.kind(), |(_, name)| *name);
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "block": msg.seq,
+                        "seen_at": msg.received_at,
+                        "hash": tx.hash_hex(),
+                        "from": rhfeed::checksum(&from),
+                        "to": tx.to(),
+                        "action": action,
+                        "selector": tx.selector_hex(),
+                        "value_wei": tx.value_dec(),
+                    })
+                );
+            }
         }
-    }
+    })
+    .await
+    .unwrap();
 }

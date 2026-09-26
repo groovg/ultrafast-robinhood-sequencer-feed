@@ -44,6 +44,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
 use log::{info, warn};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -87,6 +88,9 @@ const SILENCE_LIMIT: Duration = Duration::from_secs(15);
 /// How often a waiting source checks for a stall or silence, so either is caught soon
 /// after it crosses its threshold.
 const POLL_INTERVAL: Duration = Duration::from_millis(2500);
+/// With `busy_poll`, how long a source waits for a frame before running the last one
+/// through the path again to keep it in cache.
+const WARM_INTERVAL: Duration = Duration::from_millis(1);
 /// How many recent block hashes to keep for reorg and duplicate detection (~2 minutes).
 const REORG_WINDOW: i64 = 1024;
 
@@ -344,6 +348,8 @@ struct Shared {
     verify: Option<Verifier>,
     reorg_window: i64,
     state: Mutex<State>,
+    /// When `warm` last ran, as `to_nanos`.
+    warmed: AtomicU64,
 }
 
 impl Shared {
@@ -369,6 +375,7 @@ impl Shared {
                 recent: vec![(0, 0); urls.len()],
                 replace: vec![false; urls.len()],
             }),
+            warmed: AtomicU64::new(0),
         }
     }
 
@@ -462,6 +469,32 @@ impl Shared {
         out
     }
 
+    /// Whether it's time for another warm-up. Once per interval between all sources,
+    /// since a frame that arrives during one waits for it.
+    fn may_warm(&self) -> bool {
+        let now = to_nanos(Instant::now());
+        if now - self.warmed.load(Relaxed) < WARM_INTERVAL.as_nanos() as u64 {
+            return false;
+        }
+        self.warmed.store(now, Relaxed);
+        true
+    }
+
+    /// Run a frame through parsing, the signature check and decoding, and throw the
+    /// result away. Keeps that code and its tables in cache for the next real frame.
+    fn warm(&self, payload: &[u8]) {
+        let Ok(frame) = frame_from_slice(payload) else {
+            return;
+        };
+        for entry in frame.entries() {
+            let l2 = l2_msg(entry).ok().flatten();
+            if let Some(v) = &self.verify {
+                std::hint::black_box(v.accepts_with(entry, l2.as_deref()));
+            }
+            std::hint::black_box(parse_entry_with(entry, l2.as_ref()));
+        }
+    }
+
     /// Drop an unverified message without moving the watermark. Otherwise one
     /// injected frame could make the next reconnect skip the real messages behind it.
     fn reject(&self, entry: &Entry, seq: i64) {
@@ -496,6 +529,46 @@ impl Shared {
     }
 }
 
+/// A recent frame for `busy_poll` to rerun while it waits, as JSON and deflated.
+#[derive(Default)]
+struct Warm {
+    json: Vec<u8>,
+    deflated: Vec<u8>,
+    inflater: Option<Decompress>,
+    out: Vec<u8>,
+}
+
+impl Warm {
+    /// Keep `payload` for the next warm-ups. Call it after delivering the message.
+    fn keep(&mut self, payload: &[u8]) {
+        self.json.clear();
+        self.json.extend_from_slice(payload);
+        if self.deflated.is_empty() {
+            // Only once: deflating takes ~0.1 ms, and any frame warms the inflater.
+            let mut deflate = Compress::new(Compression::default(), false);
+            self.deflated.reserve(payload.len() + 1024);
+            if deflate
+                .compress_vec(payload, &mut self.deflated, FlushCompress::Sync)
+                .is_err()
+            {
+                self.deflated.clear();
+            }
+            self.out = vec![0; payload.len() + 1024];
+        }
+    }
+
+    /// Inflate, parse, check and decode the kept frame, and throw the results away.
+    fn run(&mut self, shared: &Shared) {
+        if self.json.is_empty() || !shared.may_warm() {
+            return;
+        }
+        let inflater = self.inflater.get_or_insert_with(|| Decompress::new(false));
+        inflater.reset(false);
+        let _ = inflater.decompress(&self.deflated, &mut self.out, FlushDecompress::Sync);
+        shared.warm(&self.json);
+    }
+}
+
 // --------------------------------------------------------------------------- //
 // the public handle
 // --------------------------------------------------------------------------- //
@@ -506,6 +579,7 @@ pub struct Feed {
     rx: mpsc::Receiver<FeedMessage>,
     shared: Arc<Shared>,
     _tasks: JoinSet<()>,
+    busy: bool,
 }
 
 impl Feed {
@@ -515,13 +589,37 @@ impl Feed {
             verify: None,
             reconnect_delay: Duration::from_millis(500),
             capacity: 1024,
+            busy_poll: false,
         }
     }
 
     /// The next live message, from whichever source had it first. `None` only if every
     /// source task has stopped, which they do not do on their own.
+    ///
+    /// Call this from a task you `tokio::spawn`, not straight from `#[tokio::main]`'s
+    /// body. The body runs on its own thread, so every message has to wake that thread
+    /// (~14 us on our machine). A spawned task is woken on the worker that just received
+    /// the message (~4 us).
+    ///
+    /// With `busy_poll` this spins instead of waiting to be woken, yielding to other
+    /// tasks between tries, so the thread it runs on stays busy too.
     pub async fn recv(&mut self) -> Option<FeedMessage> {
-        self.rx.recv().await
+        if !self.busy {
+            return self.rx.recv().await;
+        }
+        loop {
+            match self.rx.try_recv() {
+                Ok(msg) => return Some(msg),
+                Err(mpsc::error::TryRecvError::Empty) => tokio::task::yield_now().await,
+                Err(mpsc::error::TryRecvError::Disconnected) => return None,
+            }
+        }
+    }
+
+    /// The next live message if one is waiting, without waiting for one. For a
+    /// consumer that spins on a thread of its own (see `FeedBuilder::busy_poll`).
+    pub fn try_recv(&mut self) -> Option<FeedMessage> {
+        self.rx.try_recv().ok()
     }
 
     pub fn stats(&self) -> Stats {
@@ -534,6 +632,7 @@ pub struct FeedBuilder {
     verify: Option<Verifier>,
     reconnect_delay: Duration,
     capacity: usize,
+    busy_poll: bool,
 }
 
 impl FeedBuilder {
@@ -563,30 +662,69 @@ impl FeedBuilder {
         self
     }
 
-    /// Start every source on the current tokio runtime. Panics with no sources.
+    /// Run the sources on a thread of their own that never sleeps: it keeps polling the
+    /// sockets instead of waiting for the OS to wake it. A frame is then picked up as
+    /// soon as it arrives, and the caches stay warm between frames. It costs one core
+    /// at 100%.
+    ///
+    /// `recv()` then spins as well, so the task that calls it keeps its thread busy.
+    pub fn busy_poll(mut self, on: bool) -> Self {
+        self.busy_poll = on;
+        self
+    }
+
+    /// Start every source on the current tokio runtime, or on a thread of its own with
+    /// `busy_poll`. Panics with no sources.
     pub fn spawn(self) -> Feed {
         assert!(!self.sources.is_empty(), "a feed needs at least one source");
         let shared = Arc::new(Shared::new(&self.sources, self.verify, REORG_WINDOW));
         let (tx, rx) = mpsc::channel(self.capacity.max(1));
+        let sources: Vec<Source> = (self.sources.into_iter().enumerate())
+            .map(|(index, url)| Source {
+                index,
+                url,
+                shared: shared.clone(),
+                tx: tx.clone(),
+                reconnect_delay: self.reconnect_delay,
+                warm: self.busy_poll,
+            })
+            .collect();
         let mut tasks = JoinSet::new();
-        for (index, url) in self.sources.into_iter().enumerate() {
-            tasks.spawn(
-                Source {
-                    index,
-                    url,
-                    shared: shared.clone(),
-                    tx: tx.clone(),
-                    reconnect_delay: self.reconnect_delay,
-                }
-                .run(),
-            );
+        if self.busy_poll {
+            std::thread::Builder::new()
+                .name("rhfeed".into())
+                .spawn(move || busy_poll(sources, tx))
+                .expect("cannot start the rhfeed thread");
+        } else {
+            for source in sources {
+                tasks.spawn(source.run());
+            }
         }
         Feed {
             rx,
             shared,
             _tasks: tasks,
+            busy: self.busy_poll,
         }
     }
+}
+
+/// Run `sources` on this thread until the `Feed` is dropped, without ever parking it.
+fn busy_poll(sources: Vec<Source>, tx: mpsc::Sender<FeedMessage>) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("cannot build a tokio runtime");
+    runtime.block_on(async move {
+        for source in sources {
+            tokio::spawn(source.run());
+        }
+        // While a task has yielded, the scheduler checks the sockets with a zero timeout
+        // instead of parking the thread until one is ready.
+        while !tx.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    });
 }
 
 // --------------------------------------------------------------------------- //
@@ -599,6 +737,8 @@ struct Source {
     shared: Arc<Shared>,
     tx: mpsc::Sender<FeedMessage>,
     reconnect_delay: Duration,
+    /// Rerun the last frame whenever idle for `WARM_INTERVAL` (with `busy_poll`).
+    warm: bool,
 }
 
 /// Why a connection ended.
@@ -739,9 +879,16 @@ impl Source {
         let mut last_narrated = started;
         let mut stall_warned = false;
         let mut warned_full = false;
+        let mut warm = Warm::default();
+        let poll = if self.warm {
+            WARM_INTERVAL
+        } else {
+            POLL_INTERVAL
+        };
         loop {
-            let frame = match tokio::time::timeout(POLL_INTERVAL, ws.next_frame()).await {
+            let frame = match tokio::time::timeout(poll, ws.next_frame()).await {
                 Err(_) => {
+                    warm.run(&self.shared);
                     if last_heard.elapsed() >= SILENCE_LIMIT {
                         return End::Failed(format!(
                             "nothing received for {}s, not even a ping",
@@ -837,6 +984,9 @@ impl Source {
                         }
                     }
                 }
+            }
+            if self.warm && live {
+                warm.keep(frame.payload());
             }
             if slow {
                 return End::Slow;
