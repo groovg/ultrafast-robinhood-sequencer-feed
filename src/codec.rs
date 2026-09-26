@@ -453,6 +453,16 @@ fn walk(payload: &Bytes, depth: usize, out: &mut Vec<Tx>) {
 // frames
 // --------------------------------------------------------------------------- //
 
+/// serde borrows a bare `Cow<str>` field but copies one inside an `Option`, which for
+/// l2Msg meant copying ~10 KB per frame. This borrows unless the string has escapes.
+fn borrowed<'de: 'a, 'a, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Cow<'a, str>>, D::Error> {
+    #[derive(Deserialize)]
+    struct Borrowed<'a>(#[serde(borrow)] Cow<'a, str>);
+    Ok(Option::<Borrowed>::deserialize(d)?.map(|b| b.0))
+}
+
 /// A relay frame, `{"version":1,"messages":[...]}`, borrowing its strings from the
 /// buffer it was parsed from. Every field is optional, like the Python version's `.get()` calls.
 #[derive(Deserialize)]
@@ -467,11 +477,11 @@ pub struct Entry<'a> {
     pub sequence_number: Option<i64>,
     #[serde(borrow)]
     pub message: Option<Wrapper<'a>>,
-    #[serde(borrow)]
+    #[serde(borrow, default, deserialize_with = "borrowed")]
     pub block_hash: Option<Cow<'a, str>>,
-    #[serde(borrow)]
+    #[serde(borrow, default, deserialize_with = "borrowed")]
     pub block_metadata: Option<Cow<'a, str>>,
-    #[serde(borrow, rename = "signatureV2")]
+    #[serde(borrow, default, deserialize_with = "borrowed", rename = "signatureV2")]
     pub signature_v2: Option<Cow<'a, str>>,
 }
 
@@ -488,7 +498,7 @@ pub struct Wrapper<'a> {
 pub struct Incoming<'a> {
     #[serde(borrow)]
     pub header: Option<Header<'a>>,
-    #[serde(borrow)]
+    #[serde(borrow, default, deserialize_with = "borrowed")]
     pub l2_msg: Option<Cow<'a, str>>,
 }
 
@@ -496,11 +506,11 @@ pub struct Incoming<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct Header<'a> {
     pub kind: Option<i64>,
-    #[serde(borrow)]
+    #[serde(borrow, default, deserialize_with = "borrowed")]
     pub sender: Option<Cow<'a, str>>,
     pub block_number: Option<u64>,
     pub timestamp: Option<u64>,
-    #[serde(borrow)]
+    #[serde(borrow, default, deserialize_with = "borrowed")]
     pub request_id: Option<Cow<'a, str>>,
     #[serde(rename = "baseFeeL1")]
     pub base_fee_l1: Option<u128>,
@@ -767,6 +777,20 @@ mod tests {
             assert_eq!(tx.to_bytes, None);
             assert_eq!(tx.sender_bytes(), None);
         }
+    }
+
+    #[test]
+    fn strings_are_borrowed_from_the_frame() {
+        let json = br#"{"messages":[{"sequenceNumber":1,"blockHash":null,
+            "signatureV2":"a\/b","message":{"message":{"l2Msg":"BAAA"}}}]}"#;
+        let frame = frame_from_slice(json).unwrap();
+        let e = &frame.entries()[0];
+        assert!(matches!(
+            e.incoming().unwrap().l2_msg,
+            Some(Cow::Borrowed("BAAA"))
+        ));
+        assert!(matches!(e.signature_v2.as_deref(), Some("a/b")));
+        assert!(e.block_hash.is_none() && e.block_metadata.is_none());
     }
 
     #[test]
