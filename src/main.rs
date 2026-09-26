@@ -3,7 +3,6 @@
 //! the two.
 
 use std::collections::HashSet;
-use std::net::IpAddr;
 use std::process::exit;
 use std::time::{Duration, Instant};
 
@@ -27,8 +26,7 @@ const ADDR_WIDTH: usize = 10;
 #[command(name = "rhfeed", version)]
 struct Args {
     /// 'mainnet', 'testnet', 'relay' (ws://127.0.0.1:9642), or any feed URL. Repeat it
-    /// to race several sources; each message is taken from whichever has it first. Add
-    /// '@' and a local IP address to connect from that address (mainnet@10.0.0.5)
+    /// to race several sources; each message is taken from whichever has it first
     #[arg(long, default_value = "mainnet")]
     feed: Vec<String>,
     /// Stop after this long, whether or not anything arrives
@@ -204,25 +202,18 @@ async fn run() {
         .map(|()| log::set_max_level(log::LevelFilter::Info))
         .unwrap();
 
-    let sources: Vec<(&str, Option<IpAddr>)> = args
+    let urls: Vec<&str> = args
         .feed
         .iter()
-        .map(|f| {
-            let (feed, local) = match f.rsplit_once('@') {
-                Some((feed, ip)) if ip.parse::<IpAddr>().is_ok() => (feed, ip.parse().ok()),
-                _ => (f.as_str(), None),
-            };
-            let url = match feed {
-                "mainnet" => MAINNET_FEED,
-                "testnet" => TESTNET_FEED,
-                "relay" => LOCAL_RELAY,
-                other => other,
-            };
-            (url, local)
+        .map(|f| match f.as_str() {
+            "mainnet" => MAINNET_FEED,
+            "testnet" => TESTNET_FEED,
+            "relay" => LOCAL_RELAY,
+            other => other,
         })
         .collect();
     let verify = !args.no_verify;
-    if verify && sources.iter().any(|(url, _)| *url == TESTNET_FEED) {
+    if verify && urls.contains(&TESTNET_FEED) {
         // The chain id is part of the signed data, so every testnet message would fail
         // and it would look like the feed is dead.
         eprintln!(
@@ -237,12 +228,9 @@ async fn run() {
         exit(1);
     });
 
-    let mut builder = sources
+    let mut builder = urls
         .iter()
-        .fold(Feed::builder(), |b, &(url, local)| match local {
-            Some(ip) => b.source_from(url, ip),
-            None => b.source(url),
-        })
+        .fold(Feed::builder(), |b, url| b.source(*url))
         .busy_poll(args.busy_poll);
     if verify {
         builder = builder.verify(MAINNET_VERIFIER.clone());

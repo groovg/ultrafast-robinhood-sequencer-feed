@@ -38,7 +38,6 @@
 //!   A connection that sends nothing at all for 15 s, not even a ping, is replaced.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -48,7 +47,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
 use log::{info, warn};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinSet;
@@ -665,7 +664,7 @@ impl Feed {
 }
 
 pub struct FeedBuilder {
-    sources: Vec<(String, Option<IpAddr>)>,
+    sources: Vec<String>,
     verify: Option<Verifier>,
     reconnect_delay: Duration,
     capacity: usize,
@@ -676,15 +675,7 @@ pub struct FeedBuilder {
 impl FeedBuilder {
     /// Add a feed URL. Several sources race; each message comes from the fastest.
     pub fn source(mut self, url: impl Into<String>) -> Self {
-        self.sources.push((url.into(), None));
-        self
-    }
-
-    /// Add a feed URL, connecting from this local IP address. The public feed allows two
-    /// connections per IP, so a machine with several addresses can race more
-    /// connections by giving each its own.
-    pub fn source_from(mut self, url: impl Into<String>, local: IpAddr) -> Self {
-        self.sources.push((url.into(), Some(local)));
+        self.sources.push(url.into());
         self
     }
 
@@ -731,20 +722,18 @@ impl FeedBuilder {
     /// `busy_poll`. Panics with no sources.
     pub fn spawn(self) -> Feed {
         assert!(!self.sources.is_empty(), "a feed needs at least one source");
-        let labels: Vec<String> = (self.sources.iter())
-            .map(|(url, local)| match local {
-                Some(ip) => format!("{url} from {ip}"),
-                None => url.clone(),
-            })
-            .collect();
         let senders = (self.senders > 0).then(|| SenderPool::new(self.senders));
-        let shared = Arc::new(Shared::new(&labels, self.verify, senders, REORG_WINDOW));
+        let shared = Arc::new(Shared::new(
+            &self.sources,
+            self.verify,
+            senders,
+            REORG_WINDOW,
+        ));
         let (tx, rx) = mpsc::channel(self.capacity.max(1));
         let sources: Vec<Source> = (self.sources.into_iter().enumerate())
-            .map(|(index, (url, local))| Source {
+            .map(|(index, url)| Source {
                 index,
                 url,
-                local,
                 shared: shared.clone(),
                 tx: tx.clone(),
                 reconnect_delay: self.reconnect_delay,
@@ -796,7 +785,6 @@ fn busy_poll(sources: Vec<Source>, tx: mpsc::Sender<FeedMessage>) {
 struct Source {
     index: usize,
     url: String,
-    local: Option<IpAddr>,
     shared: Arc<Shared>,
     tx: mpsc::Sender<FeedMessage>,
     reconnect_delay: Duration,
@@ -898,25 +886,9 @@ impl Source {
         }
         let err = |e: std::io::Error| e.to_string();
         // host_str keeps an IPv6 address in brackets, which connect wants and TLS doesn't.
-        let tcp = match self.local {
-            None => TcpStream::connect(format!("{host}:{port}")).await,
-            Some(local) => {
-                let remote = (tokio::net::lookup_host(format!("{host}:{port}")).await)
-                    .map_err(err)?
-                    .find(|a| a.is_ipv4() == local.is_ipv4())
-                    .ok_or(format!(
-                        "{host} has no address of the same family as {local}"
-                    ))?;
-                let socket = match local {
-                    IpAddr::V4(_) => TcpSocket::new_v4(),
-                    IpAddr::V6(_) => TcpSocket::new_v6(),
-                }
-                .map_err(err)?;
-                socket.bind((local, 0).into()).map_err(err)?;
-                socket.connect(remote).await
-            }
-        }
-        .map_err(err)?;
+        let tcp = TcpStream::connect(format!("{host}:{port}"))
+            .await
+            .map_err(err)?;
         tcp.set_nodelay(true).map_err(err)?;
         let times = [Arc::default(), Arc::default()];
         let tcp = Stamped {

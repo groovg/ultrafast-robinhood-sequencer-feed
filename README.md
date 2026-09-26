@@ -118,10 +118,9 @@ later on average, sometimes 100 ms later. `Feed` keeps whichever copy arrives fi
 drops the other, so you get the better of the two on every message. That's worth far
 more than all the decoding work in this crate.
 
-The public feed allows two connections per IP. A third one gets HTTP 429. To race more
-than two you need more IPs, or relays on other machines. On a machine with several
-addresses, `source_from(url, ip)` (or `--feed mainnet@10.0.0.5` in the CLI) connects
-from a given one, so each address can carry two connections.
+The public feed allows two connections per IP. A third one gets HTTP 429. Don't try to
+get around the limit with extra addresses: the feed blocks whole address ranges for
+that, and says so in its 403 response.
 
 Usually the two connections split the wins about evenly. Now and then one of them lands
 on a path that's about 9 ms slower and stays there. If a connection is first on fewer
