@@ -212,6 +212,22 @@ fn a_real_message_recovers_the_batch_poster() {
 }
 
 #[test]
+fn a_verifier_learns_a_signer_key_and_forgets_it_with_the_signer() {
+    let json = verified_message();
+    let e = entry(&json);
+    let forged = with("timestamp", 1785166091.into());
+    let v = Verifier::new(MAINNET_CHAIN_ID, [MAINNET_SIGNER]);
+    // First by recovering the signer, then against the key it learned.
+    assert!(v.accepts(&e) && v.accepts(&e));
+    assert!(!v.accepts(&entry(&forged)));
+    // A clone shares what was learned, and removing the signer stops the key working.
+    let mut clone = v.clone();
+    clone.signers.clear();
+    assert!(!clone.accepts(&e));
+    assert!(v.accepts(&e));
+}
+
+#[test]
 fn the_preimage_traps_are_handled() {
     let base = signature_payload(&entry(&verified_message()), MAINNET_CHAIN_ID)
         .unwrap()

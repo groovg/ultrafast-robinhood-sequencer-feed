@@ -17,6 +17,9 @@ secp256k1 = { version = "0.31", features = ["recovery", "global-context"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 keccak-asm = "0.1"
+# Only for secp::FixedKey: point arithmetic to check feed signatures against the known
+# key with precomputed tables. libsecp256k1 doesn't expose its point arithmetic.
+k256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 # yawc's own TLS stack, set up here so the socket under it can be timed (consume.rs).
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }

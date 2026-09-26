@@ -115,7 +115,8 @@ behind it was the rest of the time.
   mostly because the public feed requires permessage-deflate. This client handles that
   itself.
 - It checks the sequencer's signature on every message by default. That costs about
-  40 µs per message. Use `--no-verify` to skip it (you'll need that for testnet).
+  27 µs per message, since we check against the known key instead of recovering the
+  signer. Use `--no-verify` to skip it (you'll need that for testnet).
 - It can read from several sources at once and deliver each message once.
 - If a transaction has a field that can't be valid (a 30-byte `to` address, a nonce
   over 64 bits) we keep only its hash and raw bytes. Python passes the odd value

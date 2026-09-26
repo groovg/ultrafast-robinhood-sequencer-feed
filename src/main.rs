@@ -36,7 +36,7 @@ struct Args {
     #[arg(long)]
     json: bool,
     /// Accept messages without checking they are signed by Robinhood Chain mainnet's
-    /// sequencer key. Checking is the default; it costs one signature recovery per
+    /// sequencer key. Checking is the default; it costs one signature check per
     /// message and only knows mainnet, so testnet needs this flag
     #[arg(long)]
     no_verify: bool,

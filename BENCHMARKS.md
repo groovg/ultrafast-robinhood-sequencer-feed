@@ -3,7 +3,7 @@
 Recorded on 2026-09-23 from 60 seconds of Robinhood Chain mainnet: 596 frames, 594
 messages, 4,075 transactions. AMD Ryzen 9 9950X3D, Windows 11, single core. Each number
 is the best of several rounds after a warm-up. Repeated runs came within 2% of each
-other.
+other. The Rust columns were last updated on 2026-09-26.
 
 ## Time per message
 
@@ -11,38 +11,52 @@ other.
 JSON frame, check the sequencer's signature, decode the transactions. This is the delay
 our code adds on top of the network.
 
-| | Python | Rust + libsecp256k1 | Rust + ufsecp (MSVC) | Rust + ufsecp (clang-cl) |
-|---|---:|---:|---:|---:|
-| **feed path, µs per message** | 111.6 | 52.4 | 49.8 | **38.4** |
-| **per message, µs** | | | | |
-| frame JSON to decoded txs | 33.0 | 3.5 | 3.7 | 3.5 |
-| signature check | 73.8 | 49.5 | 47.2 | **35.7** |
-| frame + signature + every sender | 543 | 326 | 306 | **217** |
-| **per transaction, µs** | | | | |
-| to_bytes, selector, value, nonce, gas | 1.84 | 0.065 | 0.062 | 0.063 |
-| + hash | 7.11 | 2.02 | 2.01 | 2.01 |
-| + to (checksummed) | 12.3 | 2.33 | 2.32 | 2.33 |
-| + sender | 63.9 | 39.7 | 37.2 | **26.0** |
-| **ECDSA recover to address, µs** | 39.3 | 34.8 | 32.3 | **21.1** |
-| transactions/s on one core, sender included | 18.7k | 26.6k | 28.7k | **42.2k** |
+| | Python | Rust + libsecp256k1 | Rust + ufsecp (clang-cl) |
+|---|---:|---:|---:|
+| **feed path, µs per message** | 111.6 | **28.8** | 30.3 |
+| **per message, µs** | | | |
+| frame JSON to decoded txs | 33.0 | 2.6 | 2.7 |
+| signature check | 73.8 | **26.9** | 28.0 |
+| signature check by recovering the signer | 73.8 | 49.6 | 37.4 |
+| frame + signature + every sender | 543 | 326 | **225** |
+| **per transaction, µs** | | | |
+| to_bytes, selector, value, nonce, gas | 1.84 | 0.063 | 0.062 |
+| + hash | 7.11 | 2.01 | 2.02 |
+| + to (checksummed) | 12.3 | 2.32 | 2.33 |
+| + sender | 63.9 | 40.3 | **27.0** |
+| **ECDSA, µs** | | | |
+| recover to address | 39.3 | 34.9 | **21.7** |
+| verify against the known key (`FixedKey`) | | **12.2** | 12.7 |
+| transactions/s on one core, sender included | 18.7k | 26.5k | **40.9k** |
 
 Notes:
 
-- The feed path is 2.1x faster than Python with the same ECDSA library and 2.9x faster
-  with UltrafastSecp256k1. Almost everything left is cryptography: about 35 µs of ECDSA
-  (21 µs with ufsecp) and about 12 µs of keccak over the ~14 KB signed message.
-- The parts that aren't cryptography got 10 to 30 times faster. Going from a frame to
-  decoded transactions is 9.4x faster, reading transaction fields 29x. Some of that is
-  just Rust vs Python. The rest is SIMD base64 (3.3x faster than the `base64` crate) and
-  assembly keccak (1.2x faster than tiny-keccak).
-- Python already used libsecp256k1 (through coincurve), so on ECDSA alone Rust with the
-  same library is only about 12% faster.
-- The ufsecp (clang-cl) column looks much faster, but that's mostly the compiler. In the
-  Rust + libsecp256k1 column, libsecp256k1 was compiled by MSVC. See the next section.
+- The feed path is 3.9x faster than Python. What's left is mostly cryptography: about
+  13 µs of keccak over the signed data (~10 KB on average) and about 12 µs for the
+  ECDSA check.
+- Every feed message is signed by the same key, so we check each signature against
+  that key instead of recovering the signer from it. `FixedKey` keeps precomputed
+  tables for the key (8-bit windows of the key and of the generator, ~370 KB each), so
+  the check is 33 additions per point and no doublings. That's 12.2 µs against 34.9 µs
+  for libsecp256k1's recovery. Neither libsecp256k1 nor UltrafastSecp256k1 can
+  precompute for a key other than the generator, so it's written on k256's point
+  arithmetic. A test checks it against libsecp256k1's verify on valid, high-s,
+  corrupted and out-of-range signatures.
+- A verifier learns keys as it goes: the first message from a signer is checked by
+  recovering it, and later ones against its key. The mainnet key is built in, so no
+  message waits for its tables.
+- Transaction senders still need recovery, since every sender is a different key. For
+  those, UltrafastSecp256k1 built with clang is the fastest option here (27.0 vs 40.3 µs
+  per transaction), and `recover_senders` spreads them over the cores.
+- The parts that aren't cryptography got 10 to 30 times faster than Python. Some of that
+  is just Rust vs Python. The rest is SIMD base64 (3.3x faster than the `base64` crate)
+  and assembly keccak (1.2x faster than tiny-keccak).
 - In absolute terms none of this is much. The feed sends about 10 messages and 70
-  transactions per second, so even the Python version uses a fraction of a percent of
-  one core. Network delays are measured in milliseconds, which is why racing
-  connections (below) helps more than anything in this table.
+  transactions per second. Network delays are measured in milliseconds, which is why
+  racing connections (below) helps more than anything in this table.
+- These numbers come from a tight loop, where everything stays in the CPU caches. In a
+  live run messages are ~100 ms apart and every stage is slower. See "Live, stage by
+  stage" below.
 
 The feed path starts after the WebSocket library has inflated the frame. The public feed
 compresses every frame (permessage-deflate), and inflating one takes 8.9 µs with
@@ -52,7 +66,7 @@ compressed bytes aren't recorded. Tiny-message WebSocket benchmarks don't show t
 cost, and at ~10 frames a second it's the only part of the WebSocket layer that
 matters.
 
-How the Rust feed path went from 61.0 µs to 52.4 µs (libsecp256k1, same recording):
+How the Rust feed path went from 61.0 µs to 28.8 µs (libsecp256k1, same recording):
 
 | Change | Feed path |
 |---|---:|
@@ -60,7 +74,12 @@ How the Rust feed path went from 61.0 µs to 52.4 µs (libsecp256k1, same record
 | SIMD base64 (`base64-simd`) | 57.8 µs |
 | assembly keccak (`keccak-asm`) | 55.4 µs |
 | decode l2Msg once, hash the signed data as it's built | 54.3 µs |
-| final run for the table above | 52.4 µs |
+| final run on 2026-09-23 | 52.4 µs |
+| check the signature against the known key | 28.8 µs |
+
+Borrowing the frame's strings instead of copying them (serde copies a `Cow<str>` inside
+an `Option`) took the JSON parse from 1.3 to 1.0 µs, which is within the noise of the
+whole path.
 
 On this machine, differences smaller than about 0.3 µs are noise.
 

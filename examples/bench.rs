@@ -165,10 +165,22 @@ fn main() {
     );
     let verify_us = best_of(20, entries.len(), || {
         for e in &entries {
+            black_box(MAINNET_VERIFIER.accepts(e));
+        }
+    });
+    println!(
+        "{:<44}{verify_us:>10.3}",
+        "feed signature check (known key, used)"
+    );
+    let recover_us = best_of(20, entries.len(), || {
+        for e in &entries {
             black_box(recover_signer(e, MAINNET_CHAIN_ID));
         }
     });
-    println!("{:<44}{verify_us:>10.3}", "feed signature check");
+    println!(
+        "{:<44}{recover_us:>10.3}",
+        "  recovering the signer instead"
+    );
     // What Feed does to every new live message before handing it over: the latency
     // this crate adds on top of the network.
     let path_us = best_of(20, messages, || {
@@ -267,6 +279,19 @@ fn main() {
     prim("libsecp256k1", rhfeed::secp::libsecp::recover);
     #[cfg(feature = "ufsecp")]
     prim("ufsecp", rhfeed::secp::ufsecp::recover);
+    let key = rhfeed::secp::libsecp::recover_key(&sigs[0].0, &sigs[0].1, &sigs[0].2, sigs[0].3)
+        .unwrap()
+        .serialize();
+    let key = rhfeed::secp::FixedKey::new(&key).unwrap();
+    let us = best_of(50, sigs.len(), || {
+        for (d, r, s, _) in &sigs {
+            assert!(key.verify(d, r, s));
+        }
+    });
+    println!(
+        "{:<44}{us:>10.3}",
+        "verify against the known key (FixedKey)"
+    );
 
     println!("\none core, full decode incl. sender: ~{:.0} tx/s", {
         let us = best_of(20, raws.len(), || {

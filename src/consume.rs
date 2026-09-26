@@ -545,7 +545,7 @@ impl FeedBuilder {
     }
 
     /// Drop messages without a good signature from an allowed signer. Costs one ECDSA
-    /// recovery per new message; late copies are not re-checked.
+    /// check per new message (see `Verifier`); late copies are not re-checked.
     pub fn verify(mut self, verifier: Verifier) -> Self {
         self.verify = Some(verifier);
         self
