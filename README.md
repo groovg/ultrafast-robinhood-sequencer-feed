@@ -13,17 +13,6 @@ the feed works and what you can and can't learn from it, their
 [README](https://github.com/chainstacklabs/robinhood-chain-sequencer-feed#readme) is
 the place to start.
 
-- [Quick start](#quick-start)
-- [Using it as a library](#using-it-as-a-library)
-- [Plugging it into a bot](#plugging-it-into-a-bot)
-  - [Lowest latency](#lowest-latency)
-- [Two connections are faster than one](#two-connections-are-faster-than-one)
-- [How it differs from the Python version](#how-it-differs-from-the-python-version)
-- [Faster sender recovery with UltrafastSecp256k1](#faster-sender-recovery-with-ultrafastsecp256k1)
-- [Running a relay](#running-a-relay)
-- [Repository layout](#repository-layout)
-- [Benchmarks](BENCHMARKS.md)
-
 ## Quick start
 
 ```bash

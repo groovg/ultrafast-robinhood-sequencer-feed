@@ -9,19 +9,6 @@ Windows 11, and the recording is 60 seconds of Robinhood Chain mainnet from 2026
 (596 frames, 594 messages, 4,075 transactions). Each number is the best of several
 rounds after a warm-up, and differences under about 0.3 µs are noise.
 
-- [At a glance](#at-a-glance)
-- [Time per message](#time-per-message)
-- [Live, stage by stage](#live-stage-by-stage)
-- [On Linux](#on-linux)
-- [Senders for copy trading](#senders-for-copy-trading)
-- [Inflating frames](#inflating-frames)
-- [How the feed path got faster](#how-the-feed-path-got-faster)
-- [Which ECDSA library](#which-ecdsa-library)
-- [Zen 4 in AWS, and what AVX-512 buys](#zen-4-in-aws-and-what-avx-512-buys)
-- [Two connections to the same feed](#two-connections-to-the-same-feed)
-- [Where to run it](#where-to-run-it)
-- [Running the benchmarks yourself](#running-the-benchmarks-yourself)
-
 ## At a glance
 
 - Feed path in a tight loop: 28.8 µs, against 111.6 µs for the Python version.
