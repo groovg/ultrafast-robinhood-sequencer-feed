@@ -79,6 +79,10 @@ A few things to keep in mind:
 - `Feed::recv()` hands you messages through a buffer of 1024. If your bot takes longer
   per message than the feed produces them, the buffer fills up and you get a warning.
   Do slow work on another task.
+- `msg.timing` says when each stage finished with the message: socket read, TLS,
+  WebSocket and inflate, JSON, signature, decoding, hand-off. `rhfeed --timing` prints
+  percentiles of each stage when it exits, so you can see where the time goes on your
+  machine.
 
 ## Two connections are faster than one
 

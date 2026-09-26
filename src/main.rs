@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 use std::process::exit;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use serde::Serialize;
@@ -50,6 +50,10 @@ struct Args {
     /// signature recovery per transaction
     #[arg(long)]
     sender: Vec<String>,
+    /// At the end, print how long each stage took per message (p50, p99, max), from
+    /// the socket read to this program receiving the message
+    #[arg(long)]
+    timing: bool,
 }
 
 /// The filters, cheapest first. `to` and `selector` are just set lookups. `sender` needs
@@ -223,9 +227,30 @@ async fn main() {
     // we only show senders when --sender already made us recover them.
     let show_sender = keep.sender.is_some();
     let mut shown = 0usize;
+    let mut stages: Vec<[Duration; STAGES.len()]> = Vec::new();
 
     let stream = async {
         while let Some(msg) = feed.recv().await {
+            if let (true, Some(t)) = (args.timing, msg.timing) {
+                let received = Instant::now();
+                let at = [
+                    t.first_read,
+                    t.last_read,
+                    t.decrypted,
+                    t.inflated,
+                    t.parsed,
+                    t.verified,
+                    t.decoded,
+                    t.sent,
+                    received,
+                ];
+                let mut row = [Duration::ZERO; STAGES.len()];
+                for (i, d) in row.iter_mut().enumerate().take(at.len() - 1) {
+                    *d = at[i + 1].saturating_duration_since(at[i]);
+                }
+                row[STAGES.len() - 1] = received.saturating_duration_since(t.last_read);
+                stages.push(row);
+            }
             let mut txs: Vec<&Tx> = msg.txs.iter().filter(|t| keep.cheap(t)).collect();
             if show_sender {
                 // All of this message's senders at once, spread over the cores.
@@ -276,6 +301,9 @@ async fn main() {
         _ = tokio::signal::ctrl_c() => {}
     }
 
+    if args.timing && !stages.is_empty() {
+        print_timing(&mut stages);
+    }
     let s = feed.stats();
     let counted = if keep.active() { "matched" } else { "seen" };
     // Print the count even when it's zero, so you can see the check ran.
@@ -306,6 +334,37 @@ async fn main() {
                 }
             );
         }
+    }
+}
+
+/// What `--timing` reports, one row per stage of `rhfeed::consume::Timing`.
+const STAGES: [&str; 9] = [
+    "rest of the frame arriving",
+    "TLS decrypt",
+    "WebSocket + inflate",
+    "JSON parse",
+    "signature check",
+    "decode transactions",
+    "dedup, queue",
+    "channel to recv()",
+    "total: last read to recv()",
+];
+
+fn print_timing(stages: &mut [[Duration; STAGES.len()]]) {
+    eprintln!("# per message, µs ({} live messages):", stages.len());
+    eprintln!("#   {:<28}{:>9}{:>9}{:>9}", "stage", "p50", "p99", "max");
+    for (i, name) in STAGES.iter().enumerate() {
+        stages.sort_unstable_by_key(|row| row[i]);
+        let at = |q: f64| {
+            let row = &stages[((stages.len() - 1) as f64 * q).round() as usize];
+            row[i].as_secs_f64() * 1e6
+        };
+        eprintln!(
+            "#   {name:<28}{:>9.1}{:>9.1}{:>9.1}",
+            at(0.5),
+            at(0.99),
+            at(1.0)
+        );
     }
 }
 

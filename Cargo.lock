@@ -1154,7 +1154,10 @@ dependencies = [
  "serde_json",
  "sonic-rs",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
+ "url",
+ "webpki-roots",
  "yawc",
 ]
 

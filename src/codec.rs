@@ -549,6 +549,8 @@ pub struct FeedMessage {
     pub reorg: bool,
     /// Index into `Feed`'s sources of the one that delivered this message first.
     pub source: usize,
+    /// When each stage of `Feed` finished with this message. None off disk.
+    pub timing: Option<crate::consume::Timing>,
 }
 
 impl FeedMessage {
@@ -616,6 +618,7 @@ pub fn parse_entry_with(entry: &Entry, l2: Option<&Bytes>) -> FeedMessage {
         received_at: 0.0,
         reorg: false,
         source: 0,
+        timing: None,
     }
 }
 
