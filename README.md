@@ -1,7 +1,9 @@
 # ultrafast-robinhood-sequencer-feed
 
-A Rust client for Robinhood Chain's sequencer feed. It shows you transactions in the
-order the sequencer picked, before they reach any RPC node.
+A Rust client for [Robinhood Chain](https://docs.robinhood.com/chain/)'s sequencer
+feed. It shows you transactions in the order the sequencer picked, before they reach
+any RPC node. Robinhood Chain runs on [Arbitrum Nitro](https://github.com/OffchainLabs/nitro),
+so this is a Nitro feed client with Robinhood's defaults.
 
 It started as a port of Chainstack's
 [robinhood-chain-sequencer-feed](https://github.com/chainstacklabs/robinhood-chain-sequencer-feed)
@@ -11,12 +13,24 @@ the feed works and what you can and can't learn from it, their
 [README](https://github.com/chainstacklabs/robinhood-chain-sequencer-feed#readme) is
 the place to start.
 
+- [Quick start](#quick-start)
+- [Using it as a library](#using-it-as-a-library)
+- [Plugging it into a bot](#plugging-it-into-a-bot)
+  - [Lowest latency](#lowest-latency)
+- [Two connections are faster than one](#two-connections-are-faster-than-one)
+- [How it differs from the Python version](#how-it-differs-from-the-python-version)
+- [Faster sender recovery with UltrafastSecp256k1](#faster-sender-recovery-with-ultrafastsecp256k1)
+- [Running a relay](#running-a-relay)
+- [Repository layout](#repository-layout)
+- [Benchmarks](BENCHMARKS.md)
+
 ## Quick start
 
 ```bash
 cargo run --release                                    # mainnet, signatures checked
 cargo run --release -- --feed mainnet --feed mainnet   # two connections, first copy wins
 cargo run --release -- --json --to 0xabc...            # JSON lines, one contract
+cargo run --release -- --timing --seconds 60           # where the time goes, per stage
 cargo test
 ```
 
@@ -31,8 +45,8 @@ For the machine you'll run it on, build with `RUSTFLAGS="-C target-cpu=native"`.
 makes JSON parsing about 30% faster and lets keccak use AVX-512 where the CPU has it.
 
 Speed numbers are in [BENCHMARKS.md](BENCHMARKS.md), along with measurements of where
-the feed arrives first. In short: the network costs milliseconds and all our decoding
-costs microseconds, so where you run it matters far more than anything else here.
+the feed arrives first. In short: the network costs milliseconds and our decoding costs
+microseconds, so where you run it matters far more than anything else here.
 
 ## Using it as a library
 
@@ -43,7 +57,7 @@ let mut feed = rhfeed::Feed::builder()
     .verify(rhfeed::MAINNET_VERIFIER.clone())
     .spawn();
 
-// Read in a spawned task: see below.
+// Read in a spawned task, see "Lowest latency" below.
 tokio::spawn(async move {
     while let Some(msg) = feed.recv().await {
         for tx in &msg.txs {
@@ -52,6 +66,9 @@ tokio::spawn(async move {
     }
 });
 ```
+
+It runs on [tokio](https://tokio.rs). Each source gets its own connection and task,
+and each message is delivered once, from whichever source had it first.
 
 ## Plugging it into a bot
 
@@ -74,8 +91,7 @@ cargo run --release --example copy_trade -- 0xWALLET_1 0xWALLET_2
 A few things to keep in mind:
 
 - Filter on `to_bytes` and `selector` first. They're already sliced out and cost
-  nothing. Senders need ECDSA, so run `recover_senders` on what's left. It does the
-  whole message in parallel.
+  nothing. Senders need ECDSA, so recover them only for what's left.
 - A transaction in the feed has been ordered, not executed. It can still revert.
 - This crate only reads. Signing and sending your own transactions is up to you, for
   example with [alloy](https://github.com/alloy-rs/alloy).
@@ -98,11 +114,13 @@ let mut feed = rhfeed::Feed::builder()
 ```
 
 - `busy_poll` reads the feed on a thread that never sleeps and keeps its caches warm.
-  On our machine the time from the socket read to `recv()` went from 95 to 61 µs at the
-  median.
+  On our desktop the time from the socket read to `recv()` went from 95 to 61 µs at the
+  median. On a Linux VM it also cut the wait between a packet reaching the kernel and
+  our first read from 153 to 46 µs.
 - `senders(7)` recovers every sender on 7 spinning threads while the signature is being
-  checked, so `tx.sender()` is free when the message arrives. Calling `recover_senders`
-  after `recv()` took 273 µs per message instead, mostly waking rayon's threads.
+  checked, so `tx.sender()` is free when the message arrives. Recovering them after
+  `recv()` with `recover_senders` took 273 µs per message, mostly spent waking
+  [rayon](https://crates.io/crates/rayon)'s threads.
 - Read `recv()` from a task you `tokio::spawn`. Waking `#[tokio::main]`'s own thread
   took ~14 µs per message, waking a spawned task ~4 µs.
 - `rhfeed --timing` shows where the time goes on your machine, stage by stage. Every
@@ -112,31 +130,29 @@ let mut feed = rhfeed::Feed::builder()
 
 ## Two connections are faster than one
 
-We opened two connections to the same public endpoint and compared arrival times. Each
-connection got about half the messages first. The other copy showed up about 30 ms
-later on average, sometimes 100 ms later. `Feed` keeps whichever copy arrives first and
-drops the other, so you get the better of the two on every message. That's worth far
-more than all the decoding work in this crate.
-
-The public feed allows two connections per IP. A third one gets HTTP 429. Don't try to
-get around the limit with extra addresses: the feed blocks whole address ranges for
-that, and says so in its 403 response.
-
-Usually the two connections split the wins about evenly. Now and then one of them lands
-on a path that's about 9 ms slower and stays there. If a connection is first on fewer
-than 1 in 10 of its last 500 messages, `Feed` drops it and opens a new one.
-
-When the program exits it prints, for each source, how often it was first and how far
-behind it was the rest of the time.
+- We opened two connections to the same public endpoint and compared arrival times.
+  Each got about half the messages first. The other copy showed up about 30 ms later on
+  average, sometimes 100 ms later. `Feed` keeps whichever copy arrives first, so you get
+  the better of the two on every message. That's worth far more than all the decoding
+  work in this crate.
+- The public feed allows two connections per IP, and a third gets HTTP 429. Don't try to
+  get around the limit with extra addresses: the feed blocks whole address ranges for
+  that, and says so in its 403 response.
+- Usually the two connections split the wins about evenly. Now and then one lands on a
+  path that's about 9 ms slower and stays there. If a connection is first on fewer than
+  1 in 10 of its last 500 messages, `Feed` replaces it.
+- A connection that sends nothing at all for 15 s, not even a ping, is replaced too.
+- When the program exits it prints, for each source, how often it was first and how far
+  behind it was the rest of the time.
 
 ## How it differs from the Python version
 
 - It connects to the public feed by default. The Python version expects a local relay,
   mostly because the public feed requires permessage-deflate. This client handles that
   itself.
-- It checks the sequencer's signature on every message by default. That costs about
-  27 µs per message, since we check against the known key instead of recovering the
-  signer. Use `--no-verify` to skip it (you'll need that for testnet).
+- It checks the sequencer's signature on every message by default, against the known
+  key, which costs about 27 µs. Use `--no-verify` to skip it (you'll need that for
+  testnet).
 - It can read from several sources at once and deliver each message once.
 - If a transaction has a field that can't be valid (a 30-byte `to` address, a nonce
   over 64 bits) we keep only its hash and raw bytes. Python passes the odd value
@@ -144,16 +160,21 @@ behind it was the rest of the time.
 - It decodes transactions only from L2Message entries (kind 3), like arbos does. Python
   decodes l2Msg for every kind, so an EthDeposit whose address happens to start with
   byte 4 comes out as a bogus transaction there.
-- The WebSocket client is [yawc](https://crates.io/crates/yawc). tokio-tungstenite
-  doesn't support permessage-deflate.
+- The WebSocket client is [yawc](https://github.com/infinitefield/yawc).
+  [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite) doesn't support
+  permessage-deflate.
 
-## Faster ECDSA with UltrafastSecp256k1
+## Faster sender recovery with UltrafastSecp256k1
 
-Most of the time spent on a message goes to ECDSA. By default we use libsecp256k1, the
-same C library the Python version calls through coincurve.
+Feed signatures are checked against the known key with precomputed tables, built on
+[k256](https://crates.io/crates/k256). Transaction senders still need an ECDSA
+recovery each. By default that's [libsecp256k1](https://github.com/bitcoin-core/secp256k1)
+through the [`secp256k1`](https://crates.io/crates/secp256k1) crate, the same C library
+the Python version calls through [coincurve](https://github.com/ofek/coincurve).
+
 [UltrafastSecp256k1](https://github.com/shrec/UltrafastSecp256k1) is an alternative you
-can turn on with `--features ufsecp`. On Linux it's about 5% faster. On Windows it
-looked 1.65x faster at first, but that was because the `secp256k1` crate builds
+turn on with `--features ufsecp`. On Linux it's about 5% faster. On Windows it's about
+1.5x faster than the default build, but only because the `secp256k1` crate builds
 libsecp256k1 with MSVC there. Built with clang, the two are equally fast. Details in
 [BENCHMARKS.md](BENCHMARKS.md#which-ecdsa-library).
 
@@ -182,7 +203,7 @@ export CLANG_RT_DIR="C:/Program Files/LLVM/lib/clang/22/lib/windows"   # clang-c
 cargo test --features ufsecp   # also checks that both libraries give the same answers
 ```
 
-A few notes on the build:
+Notes on the build:
 
 - We link the static library because the clang-cl build of the DLL fails to compile
   (a `thread_local` inside a `dllexport` function).
@@ -196,8 +217,8 @@ A few notes on the build:
 ## Running a relay
 
 The public feed limits connections per client. If several programs on one machine
-need the feed, run Offchain Labs' relay once and point them all at it with
-`--feed relay`:
+need the feed, run Offchain Labs' [feed relay](https://docs.arbitrum.io/run-arbitrum-node/run-feed-relay)
+once and point them all at it with `--feed relay`:
 
 ```bash
 docker run -d --name relay -p 127.0.0.1:9642:9642 --entrypoint relay \
@@ -206,6 +227,7 @@ docker run -d --name relay -p 127.0.0.1:9642:9642 --entrypoint relay \
   --node.feed.input.url=wss://feed.mainnet.chain.robinhood.com
 ```
 
+The image is [offchainlabs/nitro-node](https://hub.docker.com/r/offchainlabs/nitro-node).
 Keep in mind that the relay doesn't check signatures, and it hides reorgs because it
 drops any message whose sequence number it has already sent. Leave signature checking
 on, and connect to the feed directly if you care about reorgs.
@@ -214,10 +236,10 @@ on, and connect to the feed directly if you care about reorgs.
 
 | Path | What's there |
 |---|---|
-| `src/codec.rs` | decoding frames and transactions |
+| `src/codec.rs` | decoding frames and transactions, `recover_senders`, `SenderPool` |
 | `src/verify.rs` | checking the sequencer's signature |
-| `src/secp.rs` | ECDSA recovery, libsecp256k1 or UltrafastSecp256k1 |
-| `src/consume.rs` | `Feed`: connections, reconnects, dedup, reorgs |
+| `src/secp.rs` | ECDSA: recovery (libsecp256k1 or UltrafastSecp256k1) and the known-key check |
+| `src/consume.rs` | `Feed`: connections, reconnects, dedup, reorgs, timing, busy polling |
 | `src/main.rs` | the `rhfeed` command |
 | `tests/golden.rs` | checks the decoder against the Python version's output in `tests/golden.jsonl` |
 | `tests/robustness.rs` | feeds the decoder broken input and makes sure it doesn't crash |
@@ -226,7 +248,8 @@ on, and connect to the feed directly if you care about reorgs.
 | `examples/copy_trade.rs` | following wallets, the reading half of a copy-trading bot |
 | `examples/bench.rs`, `bench/` | the Rust and Python benchmarks, a script to record the feed, and one to compare recordings from different places |
 
-The Python scripts need the Python repo checked out next to this one:
+The Python scripts need the Python repo checked out next to this one, and
+[uv](https://docs.astral.sh/uv/):
 
 ```bash
 git clone https://github.com/chainstacklabs/robinhood-chain-sequencer-feed ../robinhood-chain-sequencer-feed
