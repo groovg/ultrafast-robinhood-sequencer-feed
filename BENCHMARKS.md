@@ -17,17 +17,17 @@ our code adds on top of the network.
 | **per message, µs** | | | |
 | frame JSON to decoded txs | 33.0 | 2.6 | 2.7 |
 | signature check | 73.8 | **26.9** | 28.0 |
-| signature check by recovering the signer | 73.8 | 49.6 | 37.4 |
-| frame + signature + every sender | 543 | 326 | **225** |
+| signature check by recovering the signer | 73.8 | 47.8 | 37.4 |
+| frame + signature + every sender | 543 | 301 | **225** |
 | **per transaction, µs** | | | |
 | to_bytes, selector, value, nonce, gas | 1.84 | 0.063 | 0.062 |
 | + hash | 7.11 | 2.01 | 2.02 |
 | + to (checksummed) | 12.3 | 2.32 | 2.33 |
-| + sender | 63.9 | 40.3 | **27.0** |
+| + sender | 63.9 | 37.2 | **27.0** |
 | **ECDSA, µs** | | | |
-| recover to address | 39.3 | 34.9 | **21.7** |
+| recover to address | 39.3 | 32.0 | **21.7** |
 | verify against the known key (`FixedKey`) | | **12.2** | 12.7 |
-| transactions/s on one core, sender included | 18.7k | 26.5k | **40.9k** |
+| transactions/s on one core, sender included | 18.7k | 28.9k | **40.9k** |
 
 Notes:
 
@@ -37,7 +37,7 @@ Notes:
 - Every feed message is signed by the same key, so we check each signature against
   that key instead of recovering the signer from it. `FixedKey` keeps precomputed
   tables for the key (8-bit windows of the key and of the generator, ~370 KB each), so
-  the check is 33 additions per point and no doublings. That's 12.2 µs against 34.9 µs
+  the check is 33 additions per point and no doublings. That's 12.2 µs against 32.0 µs
   for libsecp256k1's recovery. Neither libsecp256k1 nor UltrafastSecp256k1 can
   precompute for a key other than the generator, so it's written on k256's point
   arithmetic. A test checks it against libsecp256k1's verify on valid, high-s,
@@ -46,8 +46,10 @@ Notes:
   recovering it, and later ones against its key. The mainnet key is built in, so no
   message waits for its tables.
 - Transaction senders still need recovery, since every sender is a different key. For
-  those, UltrafastSecp256k1 built with clang is the fastest option here (27.0 vs 40.3 µs
-  per transaction), and `recover_senders` spreads them over the cores.
+  those, UltrafastSecp256k1 built with clang is the fastest option here (27.0 vs 37.2 µs
+  per transaction), and `recover_senders` spreads them over the cores. Moving from the
+  `secp256k1` crate 0.31 to 0.33 (libsecp256k1 0.6 to 0.8) took recovery from 34.9 to
+  32.0 µs with MSVC.
 - The parts that aren't cryptography got 10 to 30 times faster than Python. Some of that
   is just Rust vs Python. The rest is SIMD base64 (3.3x faster than the `base64` crate)
   and assembly keccak (1.2x faster than tiny-keccak).

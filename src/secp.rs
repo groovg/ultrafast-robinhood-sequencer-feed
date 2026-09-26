@@ -41,7 +41,6 @@ pub(crate) fn address(pubkey64: &[u8]) -> [u8; 20] {
 
 pub mod libsecp {
     use secp256k1::Message;
-    use secp256k1::SECP256K1;
     use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
 
     pub fn recover(digest: &[u8; 32], r: &[u8; 32], s: &[u8; 32], recid: u8) -> Option<[u8; 20]> {
@@ -60,9 +59,7 @@ pub mod libsecp {
         rs[32..].copy_from_slice(s);
         let id = RecoveryId::try_from(i32::from(recid)).ok()?;
         let sig = RecoverableSignature::from_compact(&rs, id).ok()?;
-        SECP256K1
-            .recover_ecdsa(Message::from_digest(*digest), &sig)
-            .ok()
+        sig.recover_ecdsa(Message::from_digest(*digest)).ok()
     }
 }
 
@@ -259,8 +256,8 @@ impl FixedKey {
 
 #[cfg(test)]
 mod tests {
-    use secp256k1::ecdsa::Signature;
-    use secp256k1::{Message, PublicKey, SECP256K1, SecretKey};
+    use secp256k1::ecdsa::{self, Signature};
+    use secp256k1::{Message, PublicKey, SecretKey};
 
     use super::*;
 
@@ -279,9 +276,7 @@ mod tests {
             return false;
         };
         sig.normalize_s();
-        SECP256K1
-            .verify_ecdsa(Message::from_digest(*digest), &sig, key)
-            .is_ok()
+        ecdsa::verify(&sig, Message::from_digest(*digest), key).is_ok()
     }
 
     /// n - s, big-endian.
@@ -299,21 +294,19 @@ mod tests {
     #[test]
     fn fixed_key_agrees_with_libsecp256k1() {
         let keys: Vec<SecretKey> = (0..3u8)
-            .map(|i| SecretKey::from_byte_array(keccak(&[i])).unwrap())
+            .map(|i| SecretKey::from_secret_bytes(keccak(&[i])).unwrap())
             .collect();
         let fixed: Vec<FixedKey> = keys
             .iter()
-            .map(|k| FixedKey::new(&PublicKey::from_secret_key(SECP256K1, k).serialize()).unwrap())
+            .map(|k| FixedKey::new(&PublicKey::from_secret_key(k).serialize()).unwrap())
             .collect();
         let mut checked = 0;
         for (i, sk) in keys.iter().enumerate() {
-            let pk = PublicKey::from_secret_key(SECP256K1, sk);
+            let pk = PublicKey::from_secret_key(sk);
             assert_eq!(fixed[i].address, address(&pk.serialize_uncompressed()[1..]));
             for n in 0..40u32 {
                 let digest = keccak(&n.to_be_bytes());
-                let sig = SECP256K1
-                    .sign_ecdsa(Message::from_digest(digest), sk)
-                    .serialize_compact();
+                let sig = ecdsa::sign(Message::from_digest(digest), sk).serialize_compact();
                 let r: [u8; 32] = sig[..32].try_into().unwrap();
                 let s: [u8; 32] = sig[32..].try_into().unwrap();
                 let mut cases = vec![(digest, r, s, true), (digest, r, negate(&s), true)];

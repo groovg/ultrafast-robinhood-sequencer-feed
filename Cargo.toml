@@ -13,7 +13,7 @@ hex = "0.4"
 log = "0.4"
 # libsecp256k1, the same C library coincurve wraps, so the Python baseline and this
 # port recover senders with the same code and differ only in what surrounds it.
-secp256k1 = { version = "0.31", features = ["recovery", "global-context"] }
+secp256k1 = { version = "0.33", features = ["recovery"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 keccak-asm = "0.1"
