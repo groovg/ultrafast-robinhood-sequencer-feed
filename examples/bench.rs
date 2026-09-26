@@ -133,6 +133,36 @@ fn main() {
         }
     });
     println!("{:<44}{b64_us:>10.3}", "  of which base64 l2Msg");
+    // Before any of that, yawc inflates the frame (permessage-deflate). The feed's own
+    // compressed bytes aren't recorded, so recompress the capture the way the protocol
+    // does: one raw deflate stream over the whole connection, a sync flush per message.
+    let packed: Vec<Vec<u8>> = {
+        use flate2::{Compress, Compression, FlushCompress};
+        let mut c = Compress::new(Compression::default(), false);
+        lines
+            .iter()
+            .map(|l| {
+                let mut out = Vec::with_capacity(l.len() * 2 + 4096);
+                c.compress_vec(l.as_bytes(), &mut out, FlushCompress::Sync)
+                    .unwrap();
+                out
+            })
+            .collect()
+    };
+    let inflate_us = best_of(50, lines.len(), || {
+        use flate2::{Decompress, FlushDecompress};
+        let mut d = Decompress::new(false);
+        let mut buf = vec![0u8; 1 << 20];
+        for p in &packed {
+            let out0 = d.total_out();
+            d.decompress(p, &mut buf, FlushDecompress::Sync).unwrap();
+            black_box(&buf[..(d.total_out() - out0) as usize]);
+        }
+    });
+    println!(
+        "{:<44}{inflate_us:>10.3}",
+        "inflate one frame (in yawc, per frame)"
+    );
     let verify_us = best_of(20, entries.len(), || {
         for e in &entries {
             black_box(recover_signer(e, MAINNET_CHAIN_ID));

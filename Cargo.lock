@@ -1143,6 +1143,7 @@ dependencies = [
  "base64-simd",
  "bytes",
  "clap",
+ "flate2",
  "futures-util",
  "hex",
  "keccak-asm",
