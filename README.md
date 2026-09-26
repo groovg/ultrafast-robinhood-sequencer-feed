@@ -82,6 +82,11 @@ A few things to keep in mind:
 - `Feed::recv()` hands you messages through a buffer of 1024. If your bot takes longer
   per message than the feed produces them, the buffer fills up and you get a warning.
   Do slow work on another task.
+- `Feed::builder().busy_poll(true)` runs the sources on a thread that never sleeps and
+  keeps its caches warm. On our machine that took the time from the socket read to
+  `recv()` from 95 to 61 µs at the median, for one core at 100%. Spin on
+  `feed.try_recv()` on a core of your own to avoid a thread wake-up on the way out
+  (`rhfeed --busy-poll` does both).
 - Call `recv()` from a task you `tokio::spawn`, not directly in `#[tokio::main]`'s
   body. That body runs on its own thread, and waking it for each message took ~14 µs
   on our machine. A spawned task gets woken on the worker thread that just received the

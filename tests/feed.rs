@@ -136,3 +136,25 @@ async fn two_sources_deliver_every_message_once() {
     let firsts: u64 = stats.sources.iter().map(|s| s.first).sum();
     assert_eq!((firsts, stats.duplicate_messages), (20, 20));
 }
+
+#[tokio::test]
+async fn busy_polling_delivers_through_try_recv() {
+    let t = now();
+    let (url, _) = server(vec![vec![frame(&[entry(5, t)]), frame(&[entry(6, t)])]]).await;
+    let mut feed = Feed::builder().source(url).busy_poll(true).spawn();
+    assert_eq!(next(&mut feed).await.seq, 5);
+    // try_recv never waits; the second message shows up soon.
+    let started = std::time::Instant::now();
+    let msg = loop {
+        if let Some(msg) = feed.try_recv() {
+            break msg;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no message within 5 s"
+        );
+        tokio::task::yield_now().await;
+    };
+    assert_eq!((msg.seq, msg.live), (6, true));
+    assert!(msg.timing.is_some());
+}

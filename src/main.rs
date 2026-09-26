@@ -54,6 +54,10 @@ struct Args {
     /// the socket read to this program receiving the message
     #[arg(long)]
     timing: bool,
+    /// Read the feed on a thread that never sleeps, and spin waiting for its messages.
+    /// Lower latency, at the cost of two cores at 100%
+    #[arg(long)]
+    busy_poll: bool,
 }
 
 /// The filters, cheapest first. `to` and `selector` are just set lookups. `sender` needs
@@ -224,7 +228,10 @@ async fn run() {
         exit(1);
     });
 
-    let mut builder = urls.iter().fold(Feed::builder(), |b, url| b.source(*url));
+    let mut builder = urls
+        .iter()
+        .fold(Feed::builder(), |b, url| b.source(*url))
+        .busy_poll(args.busy_poll);
     if verify {
         builder = builder.verify(MAINNET_VERIFIER.clone());
     }
@@ -236,7 +243,17 @@ async fn run() {
     let mut stages: Vec<[Duration; STAGES.len()]> = Vec::new();
 
     let stream = async {
-        while let Some(msg) = feed.recv().await {
+        loop {
+            let msg = if args.busy_poll {
+                let Some(msg) = feed.try_recv() else {
+                    tokio::task::yield_now().await;
+                    continue;
+                };
+                msg
+            } else {
+                let Some(msg) = feed.recv().await else { break };
+                msg
+            };
             if let (true, Some(t)) = (args.timing, msg.timing) {
                 let received = Instant::now();
                 let at = [

@@ -86,21 +86,29 @@ On this machine, differences smaller than about 0.3 µs are noise.
 ## Live, stage by stage
 
 Every `FeedMessage` carries a timestamp for each stage it went through (`msg.timing`),
-and `rhfeed --timing` prints percentiles of them at exit. Two 60-second runs on the
-same desktop, `rhfeed --feed mainnet --feed mainnet --seconds 60 --timing`,
-2026-09-26. The first is before the changes of that day, the second after them. p50 /
-p99 in µs:
+and `rhfeed --timing` prints percentiles of them at exit. 60-second runs on the same
+desktop, `rhfeed --feed mainnet --feed mainnet --seconds 60 --timing`, 2026-09-26.
+"Before" is before the changes of that day. The other two ran back to back, the last
+one with `--busy-poll`. p50 / p99 in µs:
 
-| stage | before | after |
-|---|---:|---:|
-| TLS decrypt | 10.7 / 17.5 | 8.7 / 19.2 |
-| WebSocket + inflate | 17.7 / 89.2 | 17.8 / 68.4 |
-| JSON parse | 19.8 / 32.2 | 11.4 / 26.1 |
-| signature check | 61.6 / 132.6 | 47.0 / 120.7 |
-| decode transactions | 4.0 / 9.8 | 3.4 / 9.6 |
-| dedup, queue | 1.6 / 3.0 | 1.3 / 2.9 |
-| channel to `recv()` | 12.9 / 23.7 | 4.8 / 50.5 |
-| **total, last socket read to `recv()`** | **128.7 / 251.5** | **98.3 / 263.9** |
+| stage | before | after | after, busy poll |
+|---|---:|---:|---:|
+| TLS decrypt | 10.7 / 17.5 | 7.3 / 18.4 | 4.0 / 15.5 |
+| WebSocket + inflate | 17.7 / 89.2 | 17.7 / 85.0 | 14.2 / 56.1 |
+| JSON parse | 19.8 / 32.2 | 9.9 / 27.0 | 1.8 / 8.2 |
+| signature check | 61.6 / 132.6 | 46.1 / 217.0 | 36.0 / 146.9 |
+| decode transactions | 4.0 / 9.8 | 3.9 / 11.4 | 1.1 / 4.2 |
+| dedup, queue | 1.6 / 3.0 | 1.1 / 3.0 | 1.0 / 2.2 |
+| channel to `recv()` | 12.9 / 23.7 | 4.0 / 62.8 | 1.0 / 3.8 |
+| **total, last socket read to `recv()`** | **128.7 / 251.5** | **94.9 / 332.7** | **60.9 / 219.0** |
+
+With `busy_poll`, the sources run on a thread that never sleeps: it keeps checking the
+sockets instead of waiting for the OS to wake it, and whenever it has waited 1 ms for a
+frame it runs the last frame through the path again, which keeps that code and its data
+in cache. The CLI also spins waiting for messages. That costs two cores at 100%. The
+JSON and decode rows drop to what the tight loop measures. The table doesn't show the
+other gain: the time from a packet arriving to the source task reading it, which busy
+polling also cuts.
 
 - Every stage is several times slower live than in the tight loop above: the JSON
   parse takes 11 µs live and 1 µs in the loop. Frames come ~100 ms apart, and in
@@ -112,8 +120,9 @@ p99 in µs:
   main's own thread, each message has to wake that thread: 13.6 µs p50 in a separate
   test, against 3.6 µs for a spawned task, which the worker that received the message
   runs next.
-- Each run sees different traffic (4,532 and 4,137 transactions), which moves the
-  signature and decode rows a little.
+- Each run sees different traffic (4,532, 4,193 and 4,236 transactions), which moves
+  the signature and decode rows. Another busy-poll run with lighter traffic (3,774
+  transactions) came out at 50.5 µs p50.
 - Not included: the time from a packet reaching the machine to our task reading it
   (kernel and tokio's reactor). We can't timestamp that from inside the process on
   Windows.
