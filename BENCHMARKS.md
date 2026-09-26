@@ -83,6 +83,41 @@ whole path.
 
 On this machine, differences smaller than about 0.3 µs are noise.
 
+## Live, stage by stage
+
+Every `FeedMessage` carries a timestamp for each stage it went through (`msg.timing`),
+and `rhfeed --timing` prints percentiles of them at exit. Two 60-second runs on the
+same desktop, `rhfeed --feed mainnet --feed mainnet --seconds 60 --timing`,
+2026-09-26. The first is before the changes of that day, the second after them. p50 /
+p99 in µs:
+
+| stage | before | after |
+|---|---:|---:|
+| TLS decrypt | 10.7 / 17.5 | 8.7 / 19.2 |
+| WebSocket + inflate | 17.7 / 89.2 | 17.8 / 68.4 |
+| JSON parse | 19.8 / 32.2 | 11.4 / 26.1 |
+| signature check | 61.6 / 132.6 | 47.0 / 120.7 |
+| decode transactions | 4.0 / 9.8 | 3.4 / 9.6 |
+| dedup, queue | 1.6 / 3.0 | 1.3 / 2.9 |
+| channel to `recv()` | 12.9 / 23.7 | 4.8 / 50.5 |
+| **total, last socket read to `recv()`** | **128.7 / 251.5** | **98.3 / 263.9** |
+
+- Every stage is several times slower live than in the tight loop above: the JSON
+  parse takes 11 µs live and 1 µs in the loop. Frames come ~100 ms apart, and in
+  between the caches go cold and the core may clock down. `examples/bench.rs`
+  reproduces this with a 100 ms sleep before each message: the feed path takes
+  67.6-70.4 µs p50 that way, against 29-30 µs in the loop. That paced number is the one
+  to compare with a live run.
+- The channel row dropped because the CLI now reads `recv()` from a spawned task. On
+  main's own thread, each message has to wake that thread: 13.6 µs p50 in a separate
+  test, against 3.6 µs for a spawned task, which the worker that received the message
+  runs next.
+- Each run sees different traffic (4,532 and 4,137 transactions), which moves the
+  signature and decode rows a little.
+- Not included: the time from a packet reaching the machine to our task reading it
+  (kernel and tokio's reactor). We can't timestamp that from inside the process on
+  Windows.
+
 ## Which ECDSA library
 
 Our first numbers said UltrafastSecp256k1 was 1.65x faster than libsecp256k1. It turned
@@ -181,6 +216,9 @@ uv run --project ../robinhood-chain-sequencer-feed python bench/bench.py bench/c
 
 # Rust
 cargo run --release --example bench -- bench/capture.jsonl
+
+# where the time goes on the live feed, per stage
+cargo run --release -- --feed mainnet --feed mainnet --seconds 60 --timing
 
 # compare arrival times recorded in several places (seq<TAB>received_at per line)
 python bench/regions.py place1=a.tsv place2=b.tsv

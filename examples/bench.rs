@@ -195,6 +195,30 @@ fn main() {
         }
     });
     println!("{:<44}{path_us:>10.3}", "feed path: parse, verify, decode");
+    // The live feed sends a frame every ~100 ms, and in between the caches go cold, which
+    // a tight loop never shows. So: the same work with a 100 ms sleep before each message,
+    // median of 100 (takes 10 s).
+    let mut paced: Vec<f64> = lines
+        .iter()
+        .take(100)
+        .map(|line| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let started = Instant::now();
+            let frame = frame_from_slice(black_box(line).as_bytes()).unwrap();
+            for e in frame.entries() {
+                let l2 = rhfeed::codec::l2_msg(e).unwrap();
+                if MAINNET_VERIFIER.accepts_with(e, l2.as_deref()) {
+                    black_box(rhfeed::codec::parse_entry_with(e, l2.as_ref()));
+                }
+            }
+            started.elapsed().as_secs_f64() * 1e6
+        })
+        .collect();
+    paced.sort_by(f64::total_cmp);
+    println!(
+        "{:<44}{:>10.3}",
+        "  with 100 ms between messages (p50)", paced[50]
+    );
     let full_us = best_of(10, messages, || {
         for line in &lines {
             let frame = frame_from_slice(black_box(line).as_bytes()).unwrap();
