@@ -105,15 +105,6 @@ fn main() {
     });
     println!("{:<44}{frame_us:>10.3}", "frame JSON -> decoded txs");
     // Where that goes: the JSON alone, then the base64 inside it.
-    let json_us = best_of(50, messages, || {
-        for line in &lines {
-            black_box(serde_json::from_str::<Frame>(black_box(line)).unwrap());
-        }
-    });
-    println!(
-        "{:<44}{json_us:>10.3}",
-        "  of which JSON parse (serde_json)"
-    );
     let sonic_us = best_of(50, messages, || {
         for line in &lines {
             black_box(frame_from_slice(black_box(line).as_bytes()).unwrap());

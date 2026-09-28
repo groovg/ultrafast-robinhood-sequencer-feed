@@ -39,7 +39,6 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -121,41 +120,23 @@ pub struct Timing {
     pub sent: Instant,
 }
 
-/// Instants stored as nanoseconds since this, so they fit in an atomic. 0 means unset.
-static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
-
-fn to_nanos(t: Instant) -> u64 {
-    (t.saturating_duration_since(*EPOCH).as_nanos() as u64).max(1)
-}
-
-fn from_nanos(n: u64) -> Instant {
-    *EPOCH + Duration::from_nanos(n)
-}
-
 /// When reads on a stream returned bytes: the first since the last `take` and the most
 /// recent. Written from inside yawc by `Stamped`, read by the source once per frame.
 #[derive(Default)]
-struct ReadTimes {
-    first: AtomicU64,
-    last: AtomicU64,
-}
+struct ReadTimes(Mutex<(Option<Instant>, Option<Instant>)>);
 
 impl ReadTimes {
     fn record(&self) {
-        let now = to_nanos(Instant::now());
-        self.last.store(now, Relaxed);
-        if self.first.load(Relaxed) == 0 {
-            self.first.store(now, Relaxed);
-        }
+        let now = Instant::now();
+        let mut t = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        t.0.get_or_insert(now);
+        t.1 = Some(now);
     }
 
     fn take(&self) -> (Instant, Instant) {
-        let last = self.last.load(Relaxed);
-        let first = match self.first.swap(0, Relaxed) {
-            0 => last,
-            first => first,
-        };
-        (from_nanos(first), from_nanos(last))
+        let mut t = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let last = t.1.unwrap_or_else(Instant::now);
+        (t.0.take().unwrap_or(last), last)
     }
 }
 
@@ -224,7 +205,6 @@ pub struct Stats {
     pub live_messages: u64,
     pub duplicate_messages: u64,
     pub unverified_messages: u64,
-    pub reconnects: u64,
     pub reorgs: u64,
     pub sources: Vec<SourceStats>,
 }
@@ -332,7 +312,7 @@ impl State {
         }
     }
 
-    fn remember(&mut self, seq: i64, hash: Option<&str>, now: Instant, window: i64) {
+    fn remember(&mut self, seq: i64, hash: Option<&str>, now: Instant) {
         self.seen.insert(
             seq,
             Seen {
@@ -340,8 +320,8 @@ impl State {
                 at: now,
             },
         );
-        if self.seen.len() as i64 > window * 2 {
-            let cutoff = self.highest_seq - window;
+        if self.seen.len() as i64 > REORG_WINDOW * 2 {
+            let cutoff = self.highest_seq - REORG_WINDOW;
             self.seen.retain(|&s, _| s > cutoff);
         }
     }
@@ -351,19 +331,13 @@ struct Shared {
     verify: Option<Verifier>,
     /// With `FeedBuilder::senders`.
     senders: Option<Mutex<SenderPool>>,
-    reorg_window: i64,
     state: Mutex<State>,
-    /// When `warm` last ran, as `to_nanos`.
-    warmed: AtomicU64,
+    /// When `warm` last ran.
+    warmed: Mutex<Instant>,
 }
 
 impl Shared {
-    fn new(
-        urls: &[String],
-        verify: Option<Verifier>,
-        senders: Option<SenderPool>,
-        reorg_window: i64,
-    ) -> Self {
+    fn new(urls: &[String], verify: Option<Verifier>, senders: Option<SenderPool>) -> Self {
         let sources = urls
             .iter()
             .map(|url| SourceStats {
@@ -374,7 +348,6 @@ impl Shared {
         Self {
             verify,
             senders: senders.map(Mutex::new),
-            reorg_window,
             state: Mutex::new(State {
                 highest_seq: -1,
                 seen: HashMap::new(),
@@ -386,7 +359,7 @@ impl Shared {
                 recent: vec![(0, 0); urls.len()],
                 replace: vec![false; urls.len()],
             }),
-            warmed: AtomicU64::new(0),
+            warmed: Mutex::new(Instant::now()),
         }
     }
 
@@ -486,7 +459,7 @@ impl Shared {
                 Verdict::New => {}
             }
             st.highest_seq = seq;
-            st.remember(seq, hash, now, self.reorg_window);
+            st.remember(seq, hash, now);
             st.stats.sources[source].first += 1;
             if live {
                 st.recent[source].0 += 1;
@@ -507,11 +480,11 @@ impl Shared {
     /// Whether it's time for another warm-up. Once per interval between all sources,
     /// since a frame that arrives during one waits for it.
     fn may_warm(&self) -> bool {
-        let now = to_nanos(Instant::now());
-        if now - self.warmed.load(Relaxed) < WARM_INTERVAL.as_nanos() as u64 {
+        let mut warmed = self.warmed.lock().unwrap_or_else(|e| e.into_inner());
+        if warmed.elapsed() < WARM_INTERVAL {
             return false;
         }
-        self.warmed.store(now, Relaxed);
+        *warmed = Instant::now();
         true
     }
 
@@ -552,12 +525,10 @@ impl Shared {
             "dropping unverified message at seq {seq}: {}, expected one of {}. \
              Further ones are counted in stats.unverified_messages but not logged. \
              Check the verifier's chain id ({}) and signer set before suspecting the feed",
-            verify
-                .signer_of(entry)
-                .map_or("no usable signature".into(), |s| format!(
-                    "signed by 0x{}",
-                    hex::encode(s)
-                )),
+            crate::verify::recover_signer(entry, verify.chain_id).map_or(
+                "no usable signature".into(),
+                |s| format!("signed by 0x{}", hex::encode(s))
+            ),
             expected.join(", "),
             verify.chain_id,
         );
@@ -652,12 +623,6 @@ impl Feed {
         }
     }
 
-    /// The next live message if one is waiting, without waiting for one. For a
-    /// consumer that spins on a thread of its own (see `FeedBuilder::busy_poll`).
-    pub fn try_recv(&mut self) -> Option<FeedMessage> {
-        self.rx.try_recv().ok()
-    }
-
     pub fn stats(&self) -> Stats {
         self.shared.lock().stats.clone()
     }
@@ -723,12 +688,7 @@ impl FeedBuilder {
     pub fn spawn(self) -> Feed {
         assert!(!self.sources.is_empty(), "a feed needs at least one source");
         let senders = (self.senders > 0).then(|| SenderPool::new(self.senders));
-        let shared = Arc::new(Shared::new(
-            &self.sources,
-            self.verify,
-            senders,
-            REORG_WINDOW,
-        ));
+        let shared = Arc::new(Shared::new(&self.sources, self.verify, senders));
         let (tx, rx) = mpsc::channel(self.capacity.max(1));
         let sources: Vec<Source> = (self.sources.into_iter().enumerate())
             .map(|(index, url)| Source {
@@ -834,11 +794,7 @@ impl Source {
                 }
             };
             failures += 1;
-            {
-                let mut st = self.shared.lock();
-                st.stats.reconnects += 1;
-                st.stats.sources[self.index].reconnects += 1;
-            }
+            self.shared.lock().stats.sources[self.index].reconnects += 1;
             if err.contains("429") {
                 // The public feed allows two connections per IP and answers the rest with
                 // 429. Retrying quickly would just hit the limit again.
@@ -1075,7 +1031,7 @@ mod tests {
 
     fn shared(sources: usize, verify: Option<Verifier>) -> Shared {
         let urls: Vec<String> = (0..sources).map(|i| format!("ws://source{i}")).collect();
-        Shared::new(&urls, verify, None, 1024)
+        Shared::new(&urls, verify, None)
     }
 
     fn feed_at(
@@ -1126,10 +1082,13 @@ mod tests {
 
     #[test]
     fn the_window_is_bounded_and_an_unknown_hash_is_not_a_reorg() {
-        let s = Shared::new(&["ws://a".into()], None, None, 2);
-        let seqs: Vec<String> = (1..=10).map(|n| entry_json(n, &hash_of(n as u8))).collect();
+        let s = shared(1, None);
+        let last = REORG_WINDOW * 2 + 10;
+        let seqs: Vec<String> = (1..=last)
+            .map(|n| entry_json(n, &hash_of(n as u8)))
+            .collect();
         feed(&s, 0, &seqs);
-        assert!(s.lock().seen.len() <= 5);
+        assert!(s.lock().seen.len() as i64 <= REORG_WINDOW * 2);
         assert!(feed(&s, 0, &[entry_json(1, &hash_of(0xEE))]).is_empty());
         assert_eq!(s.lock().stats.reorgs, 0);
     }

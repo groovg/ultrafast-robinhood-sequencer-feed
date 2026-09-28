@@ -20,5 +20,5 @@ pub use consume::{
 };
 pub use verify::{
     FEED_PREFIX, MAINNET_CHAIN_ID, MAINNET_SIGNER, MAINNET_VERIFIER, Verifier, recover_signer,
-    recover_signer_with, signature_payload,
+    signature_payload,
 };

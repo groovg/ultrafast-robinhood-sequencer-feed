@@ -27,8 +27,8 @@ pub const L2_SIGNED_TX: u8 = 4;
 /// arbos rejects a batch at depth >= 16, so nothing nested deeper executes.
 pub const MAX_BATCH_DEPTH: usize = 16;
 
-pub const FILTER_PRECOMPILE: &str = "0x0000000000000000000000000000000000000074";
-pub const IS_FILTERED_SELECTOR: &str = "0x85c733a4";
+const FILTER_PRECOMPILE: &str = "0x0000000000000000000000000000000000000074";
+const IS_FILTERED_SELECTOR: &str = "0x85c733a4";
 
 // --------------------------------------------------------------------------- //
 // helpers for building filters
@@ -93,7 +93,7 @@ pub fn checksum(address: &[u8]) -> String {
 // --------------------------------------------------------------------------- //
 
 /// (item_start, payload_start, payload_end). `item_start` keeps the length prefix.
-pub type Field = (usize, usize, usize);
+type Field = (usize, usize, usize);
 
 /// Big-endian length of a long-form prefix, bounds-checked against `buf`.
 fn long_len(buf: &[u8], start: usize, end: usize) -> Result<usize, &'static str> {
@@ -105,7 +105,7 @@ fn long_len(buf: &[u8], start: usize, end: usize) -> Result<usize, &'static str>
 
 /// Offsets of every item in the RLP list at the head of `buf`. Nested lists are skipped
 /// over by length, not descended into.
-pub fn scan_list(buf: &[u8]) -> Result<Vec<Field>, &'static str> {
+fn scan_list(buf: &[u8]) -> Result<Vec<Field>, &'static str> {
     let &head = buf.first().ok_or("empty")?;
     if head < 0xC0 {
         return Err("not an RLP list");
@@ -164,7 +164,7 @@ fn rlp_header(len: usize, offset: u8, out: &mut Vec<u8>) {
     }
 }
 
-pub fn rlp_uint(value: u128) -> Vec<u8> {
+fn rlp_uint(value: u128) -> Vec<u8> {
     let be = value.to_be_bytes();
     let body = &be[(value.leading_zeros() / 8) as usize..];
     match body {
@@ -180,7 +180,7 @@ pub fn rlp_uint(value: u128) -> Vec<u8> {
 }
 
 /// `prefix || rlp_list(content)`, built in one allocation.
-pub fn rlp_list(prefix: &[u8], content: &[&[u8]]) -> Vec<u8> {
+fn rlp_list(prefix: &[u8], content: &[&[u8]]) -> Vec<u8> {
     let len: usize = content.iter().map(|c| c.len()).sum();
     let mut out = Vec::with_capacity(prefix.len() + 9 + len);
     out.extend_from_slice(prefix);
@@ -777,9 +777,9 @@ pub fn parse_entry_with(entry: &Entry, l2: Option<&Bytes>) -> FeedMessage {
 /// eth_call body asking the filter precompile whether a hash is blocked. The hash is
 /// checked here because a malformed one still encodes into a well-formed call that the
 /// node would answer about the wrong slot. See `is_filtered_call` in codec.py.
-pub fn is_filtered_call(tx_hash: &str) -> Result<serde_json::Value, String> {
+pub fn is_filtered_call(tx_hash: &str) -> Result<sonic_rs::Value, String> {
     let raw: [u8; 32] = fixed(tx_hash, "transaction hash")?;
-    Ok(serde_json::json!({
+    Ok(sonic_rs::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "eth_call",

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use serde::Serialize;
-use serde_json::value::RawValue;
+use sonic_rs::RawNumber;
 
 use rhfeed::{
     Feed, FeedMessage, LOCAL_RELAY, MAINNET_FEED, MAINNET_VERIFIER, TESTNET_FEED, Tx, addr, sel,
@@ -128,7 +128,7 @@ struct JsonTx {
     tx_type: u8,
     to: Option<String>,
     /// Written as a raw JSON number like the Python version does, since wei can exceed u64.
-    value: Box<RawValue>,
+    value: RawNumber,
     nonce: u64,
     gas: u64,
     selector: Option<String>,
@@ -161,7 +161,7 @@ fn json_line(msg: &FeedMessage, txs: &[&Tx], show_sender: bool) -> String {
                 hash: t.hash_hex(),
                 tx_type: t.tx_type,
                 to: t.to(),
-                value: RawValue::from_string(t.value_dec()).unwrap(),
+                value: sonic_rs::from_str(&t.value_dec()).unwrap(),
                 nonce: t.nonce,
                 gas: t.gas,
                 selector: t.selector_hex(),
@@ -171,7 +171,7 @@ fn json_line(msg: &FeedMessage, txs: &[&Tx], show_sender: bool) -> String {
             })
             .collect(),
     };
-    serde_json::to_string(&line).unwrap()
+    sonic_rs::to_string(&line).unwrap()
 }
 
 /// Logs go to stderr with a `#` prefix, so they stay visible when stdout is redirected.
@@ -249,7 +249,6 @@ async fn run() {
     let mut feed = builder.spawn();
     let mut shown = 0usize;
     let mut stages: Vec<[Duration; STAGES.len()]> = Vec::new();
-    let mut senders: Vec<Duration> = Vec::new();
 
     let stream = async {
         while let Some(msg) = feed.recv().await {
@@ -277,9 +276,7 @@ async fn run() {
             if show_sender {
                 if !pooled {
                     // All of this message's senders at once, spread over the cores.
-                    let started = Instant::now();
                     rhfeed::recover_senders(txs.iter().copied());
-                    senders.push(started.elapsed());
                 }
                 txs.retain(|t| keep.sender(t));
             }
@@ -329,17 +326,6 @@ async fn run() {
 
     if args.timing && !stages.is_empty() {
         print_timing(&mut stages);
-        if !senders.is_empty() {
-            senders.sort_unstable();
-            let at = |q: f64| senders[((senders.len() - 1) as f64 * q).round() as usize];
-            eprintln!(
-                "#   {:<28}{:>9.1}{:>9.1}{:>9.1}  (after recv)",
-                "senders (--sender)",
-                us(at(0.5)),
-                us(at(0.99)),
-                us(at(1.0))
-            );
-        }
     }
     let s = feed.stats();
     let counted = if keep.active() { "matched" } else { "seen" };
@@ -352,7 +338,9 @@ async fn run() {
     eprintln!(
         "# {shown} transactions {counted} | {} live messages, {} backlog skipped{checked}, \
          {} failed connections",
-        s.live_messages, s.backlog_messages, s.reconnects
+        s.live_messages,
+        s.backlog_messages,
+        s.sources.iter().map(|src| src.reconnects).sum::<u64>()
     );
     if s.sources.len() > 1 {
         // Shows which source was fastest from this machine.
@@ -403,10 +391,6 @@ fn print_timing(stages: &mut [[Duration; STAGES.len()]]) {
             at(1.0)
         );
     }
-}
-
-fn us(d: Duration) -> f64 {
-    d.as_secs_f64() * 1e6
 }
 
 fn ms(d: Duration) -> f64 {

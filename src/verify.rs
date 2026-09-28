@@ -104,12 +104,7 @@ fn preimage(
 /// forged message still recovers some address, so compare the result, don't just check
 /// for None.
 pub fn recover_signer(entry: &Entry, chain_id: u64) -> Option<[u8; 20]> {
-    recover_signer_with(entry, chain_id, l2_msg(entry).ok()?.as_deref())
-}
-
-/// `recover_signer` with the entry's l2Msg already decoded (see `codec::l2_msg`).
-pub fn recover_signer_with(entry: &Entry, chain_id: u64, l2: Option<&[u8]>) -> Option<[u8; 20]> {
-    let s = Signed::new(entry, chain_id, l2)?;
+    let s = Signed::new(entry, chain_id, l2_msg(entry).ok()?.as_deref())?;
     crate::secp::recover(&s.digest, &s.r, &s.s, s.recid)
 }
 
@@ -161,11 +156,6 @@ impl Verifier {
             signers: signers.into_iter().collect(),
             keys: Arc::default(),
         }
-    }
-
-    /// Who signed this message, whether or not you accept them.
-    pub fn signer_of(&self, entry: &Entry) -> Option<[u8; 20]> {
-        recover_signer(entry, self.chain_id)
     }
 
     /// A good signature from an allowed signer. False for an unsigned message too.

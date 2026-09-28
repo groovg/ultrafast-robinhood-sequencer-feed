@@ -84,7 +84,7 @@ async fn main() {
                     .map_or(tx.kind(), |(_, name)| *name);
                 println!(
                     "{}",
-                    serde_json::json!({
+                    sonic_rs::json!({
                         "block": msg.seq,
                         "seen_at": msg.received_at,
                         "hash": tx.hash_hex(),

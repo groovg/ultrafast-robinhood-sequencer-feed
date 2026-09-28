@@ -15,7 +15,6 @@ log = "0.4"
 # port recover senders with the same code and differ only in what surrounds it.
 secp256k1 = { version = "0.33", features = ["recovery"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
 keccak-asm = "0.1"
 # Only for secp::FixedKey: point arithmetic to check feed signatures against the known
 # key with precomputed tables. libsecp256k1 doesn't expose its point arithmetic.
@@ -36,6 +35,7 @@ sonic-rs = "0.5.10"
 rayon = "1.12.0"
 
 [dev-dependencies]
+serde_json = "1"
 futures-util = "0.3"
 tokio-tungstenite = "0.30"
 

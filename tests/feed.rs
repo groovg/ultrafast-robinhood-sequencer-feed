@@ -111,7 +111,7 @@ async fn a_reconnect_re_requests_the_last_seen_number_and_drops_the_duplicate() 
     let stats = feed.stats();
     // Each closed connection counts; the second may or may not have closed yet.
     assert_eq!(stats.duplicate_messages, 1);
-    assert!(stats.reconnects >= 1);
+    assert!(stats.sources[0].reconnects >= 1);
 }
 
 #[tokio::test]
@@ -138,23 +138,12 @@ async fn two_sources_deliver_every_message_once() {
 }
 
 #[tokio::test]
-async fn busy_polling_delivers_through_try_recv() {
+async fn busy_polling_delivers() {
     let t = now();
     let (url, _) = server(vec![vec![frame(&[entry(5, t)]), frame(&[entry(6, t)])]]).await;
     let mut feed = Feed::builder().source(url).busy_poll(true).spawn();
     assert_eq!(next(&mut feed).await.seq, 5);
-    // try_recv never waits; the second message shows up soon.
-    let started = std::time::Instant::now();
-    let msg = loop {
-        if let Some(msg) = feed.try_recv() {
-            break msg;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "no message within 5 s"
-        );
-        tokio::task::yield_now().await;
-    };
+    let msg = next(&mut feed).await;
     assert_eq!((msg.seq, msg.live), (6, true));
     assert!(msg.timing.is_some());
 }

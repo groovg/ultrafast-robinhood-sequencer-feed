@@ -215,7 +215,10 @@ fn a_real_message_recovers_the_batch_poster() {
     // A verifier that does not accept the signer still says who it was.
     let someone_else = Verifier::new(MAINNET_CHAIN_ID, [[0u8; 20]]);
     assert!(!someone_else.accepts(&e));
-    assert_eq!(someone_else.signer_of(&e), Some(MAINNET_SIGNER));
+    assert_eq!(
+        recover_signer(&e, someone_else.chain_id),
+        Some(MAINNET_SIGNER)
+    );
 }
 
 #[test]
