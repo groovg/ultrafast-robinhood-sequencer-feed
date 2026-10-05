@@ -98,21 +98,21 @@ last one with `--busy-poll`. p50 / p99 in µs:
 
 ### GitHub runner
 
-[`.github/workflows/bench.yml`](.github/workflows/bench.yml): AMD EPYC 7763, 4 vCPU,
-plain `cargo build --release`, the 39-frame test fixture, 2026-09-26.
+[`.github/workflows/bench.yml`](.github/workflows/bench.yml): AMD EPYC 9V45 (Zen 5),
+4 vCPU, plain `cargo build --release`, the 39-frame test fixture, 2026-10-06.
 
 | µs | libsecp256k1 (gcc) | ufsecp (clang) |
 |---|---:|---:|
-| feed path | 34.7 | 34.7 |
-| with 100 ms between messages (p50) | 76.0 | 81.5 |
-| signature check against the known key | 32.7 | 32.6 |
-| signature check by recovering the signer | 49.6 | 50.4 |
-| ECDSA recover | 41.9 | 42.4 |
-| `FixedKey` verify | 24.2 | 23.9 |
+| feed path | 16.2 | 16.0 |
+| with 100 ms between messages (p50) | 32.6 | 34.7 |
+| signature check against the known key | 15.1 | 14.8 |
+| signature check by recovering the signer | 30.9 | 30.7 |
+| ECDSA recover | 25.0 | 25.2 |
+| `FixedKey` verify | 10.2 | 9.6 |
 
-- The feed path on this runner type was 55.2 µs before the known-key check.
-- The known key gains less here than on Windows (1.7x against 2.9x), where MSVC slows
-  down libsecp256k1.
+- Here the known key is 2.5x cheaper than recovering the signer.
+- Earlier runs (2026-09-26) got an EPYC 7763, so their numbers aren't comparable. On
+  that CPU the feed path went from 55.2 to 34.7 µs with the known-key check.
 
 ### Cloud VM
 
