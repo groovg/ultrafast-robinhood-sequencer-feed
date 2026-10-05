@@ -7,11 +7,12 @@ delay our code adds on top of the network.
 Unless a section says otherwise, the machine is an AMD Ryzen 9 9950X3D desktop on
 Windows 11, and the recording is 60 seconds of Robinhood Chain mainnet from 2026-09-23
 (596 frames, 594 messages, 4,075 transactions). Each number is the best of several
-rounds after a warm-up, and differences under about 0.3 µs are noise.
+rounds after a warm-up, and differences under about 0.3 µs are noise. The Rust
+columns were last updated on 2026-10-06.
 
 ## At a glance
 
-- Feed path in a tight loop: 28.8 µs, against 111.6 µs for the Python version.
+- Feed path in a tight loop: 26.2 µs, against 111.6 µs for the Python version.
 - Live on the desktop, from the last socket read to `recv()`: 95 µs at the median, or
   61 µs with `busy_poll`.
 - Live on a Linux VM: 203 µs, or 97 µs with `busy_poll`. Before our first read, the
@@ -25,29 +26,32 @@ rounds after a warm-up, and differences under about 0.3 µs are noise.
 
 | | Python | Rust + libsecp256k1 | Rust + ufsecp (clang-cl) |
 |---|---:|---:|---:|
-| **feed path, µs per message** | 111.6 | **28.8** | 30.3 |
+| **feed path, µs per message** | 111.6 | 26.2 | **26.0** |
 | **per message, µs** | | | |
-| frame JSON to decoded txs | 33.0 | 2.6 | 2.7 |
-| signature check | 73.8 | **26.9** | 28.0 |
-| signature check by recovering the signer | 73.8 | 47.8 | 37.4 |
-| frame + signature + every sender | 543 | 301 | **225** |
+| frame JSON to decoded txs | 33.0 | 2.7 | 2.7 |
+| signature check | 73.8 | 24.2 | **24.0** |
+| signature check by recovering the signer | 73.8 | 46.9 | 35.9 |
+| frame + signature + every sender | 543 | 304 | **217** |
 | **per transaction, µs** | | | |
 | to_bytes, selector, value, nonce, gas | 1.84 | 0.063 | 0.062 |
 | + hash | 7.11 | 2.01 | 2.02 |
 | + to (checksummed) | 12.3 | 2.32 | 2.33 |
-| + sender | 63.9 | 37.2 | **27.0** |
+| + sender | 63.9 | 37.0 | **26.0** |
 | **ECDSA, µs** | | | |
-| recover to address | 39.3 | 32.0 | **21.7** |
-| verify against the known key (`FixedKey`) | | **12.2** | 12.7 |
-| transactions/s on one core, sender included | 18.7k | 28.9k | **40.9k** |
+| recover to address | 39.3 | 31.9 | **21.0** |
+| verify against the known key (`FixedKey`) | | 9.3 | **9.1** |
+| transactions/s on one core, sender included | 18.7k | 28.8k | **42.1k** |
 
 - What's left in the feed path is mostly cryptography: about 13 µs of keccak over the
-  signed data (~10 KB on average) and about 12 µs for the ECDSA check.
+  signed data (~10 KB on average) and about 9 µs for the ECDSA check.
 - Every feed message is signed by the same key. `FixedKey` verifies against that key
-  with precomputed tables (~370 KB each for the key and the generator) instead of
+  with precomputed tables (~330 KB each for the key and the generator) instead of
   recovering the signer. [libsecp256k1](https://github.com/bitcoin-core/secp256k1) can
-  only precompute for the generator, so it's built on [k256](https://crates.io/crates/k256)'s
-  point arithmetic. A test checks it against libsecp256k1's verify.
+  only precompute for the generator, so `FixedKey` is built on
+  [k256](https://crates.io/crates/k256)'s field arithmetic, with libsecp256k1's point
+  addition formulas (8 multiplications and 3 squarings, against about 12
+  multiplications for k256's own). Those took it from 12.2 to 9.3 µs. About 1.9 µs of
+  the rest is inverting s. A test checks it against libsecp256k1's verify.
 - A verifier recovers the first message from a new signer and checks the later ones
   against its key. The mainnet key is built in.
 - Senders still need recovery, one key each.
@@ -61,7 +65,7 @@ rounds after a warm-up, and differences under about 0.3 µs are noise.
   [sonic-rs](https://github.com/cloudwego/sonic-rs) (1.3x serde_json).
 - A tight loop keeps everything in the CPU caches, and the live feed doesn't. Compare
   live runs with the paced row of `examples/bench.rs` (100 ms before each message),
-  which took 67.6-70.4 µs.
+  which took 68-76 µs.
 
 ## Live, stage by stage
 
@@ -189,6 +193,7 @@ Libsecp256k1 build, same recording:
 | decode l2Msg once, hash the signed data as it's built | 54.3 µs |
 | final run on 2026-09-23 | 52.4 µs |
 | check the signature against the known key | 28.8 µs |
+| libsecp256k1's addition formulas in `FixedKey` | 26.2 µs |
 
 Borrowing the frame's strings instead of copying them (serde copies a `Cow<str>` inside
 an `Option`) took the JSON parse from 1.3 to 1.0 µs, within the noise of the whole path.

@@ -139,7 +139,7 @@ impl Signed {
 /// needs a new list.
 ///
 /// The first message from each accepted signer is checked by recovering its key, which
-/// is then kept with precomputed tables (a few ms to build, ~370 KB). Its later messages
+/// is then kept with precomputed tables (a few ms to build, ~330 KB). Its later messages
 /// are checked against that key, about 3 times faster than recovering. Clones share
 /// the keys.
 #[derive(Clone, Debug)]

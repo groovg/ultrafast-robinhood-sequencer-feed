@@ -140,7 +140,7 @@ let mut feed = rhfeed::Feed::builder()
   mostly because the public feed requires permessage-deflate. This client handles that
   itself.
 - It checks the sequencer's signature on every message by default, against the known
-  key, which costs about 27 µs. Use `--no-verify` to skip it (you'll need that for
+  key, which costs about 24 µs. Use `--no-verify` to skip it (you'll need that for
   testnet).
 - It can read from several sources at once and deliver each message once.
 - If a transaction has a field that can't be valid (a 30-byte `to` address, a nonce

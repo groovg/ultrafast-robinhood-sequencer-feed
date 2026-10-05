@@ -11,6 +11,7 @@
 use std::sync::LazyLock;
 
 use k256::elliptic_curve::group::{Curve, GroupEncoding};
+use k256::elliptic_curve::hazmat::FieldArithmetic;
 use k256::elliptic_curve::ops::Reduce;
 use k256::elliptic_curve::point::AffineCoordinates;
 use k256::elliptic_curve::subtle::CtOption;
@@ -20,8 +21,7 @@ use k256::{AffinePoint, ProjectivePoint, Scalar, U256};
 use crate::codec::keccak;
 
 /// The curve order. Big-endian, so array comparison is numeric comparison.
-#[cfg(feature = "ufsecp")]
-const N: [u8; 32] = [
+const N_BYTES: [u8; 32] = [
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
     0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
 ];
@@ -67,7 +67,7 @@ pub mod libsecp {
 pub mod ufsecp {
     use std::ffi::{c_int, c_void};
 
-    use super::N;
+    use super::N_BYTES as N;
 
     // The four functions used from UltrafastSecp256k1's C ABI (include/ufsecp/ufsecp.h).
     // Declared here rather than through its `ufsecp-sys` crate, which is not published.
@@ -145,15 +145,79 @@ pub mod ufsecp {
 // --------------------------------------------------------------------------- //
 
 /// Window width in bits. Each point gets `ROWS` rows of `2^(W-1)` multiples (about
-/// 370 KB with k256's point size), and a multiplication is one addition per row.
+/// 330 KB), and a multiplication is one addition per row.
 const W: usize = 8;
 const ROWS: usize = 256 / W + 1;
 const HALF: usize = 1 << (W - 1);
 
+/// secp256k1's field element, through the trait k256 exposes it by.
+type Fe = <k256::Secp256k1 as FieldArithmetic>::FieldElement;
+
+/// p - n, big-endian: an r below it may also stand for the x coordinate r + n.
+const P_MINUS_N: [u8; 32] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x45, 0x51, 0x23, 0x19, 0x50, 0xb7, 0x5f, 0xc4,
+    0x40, 0x2d, 0xa1, 0x72, 0x2f, 0xc9, 0xba, 0xee,
+];
+
+/// A table point in affine coordinates.
+#[derive(Clone, Copy)]
+struct Ge {
+    x: Fe,
+    y: Fe,
+}
+
+/// The running sum in Jacobian coordinates (x/z², y/z³).
+struct Gej {
+    x: Fe,
+    y: Fe,
+    z: Fe,
+    infinity: bool,
+}
+
+impl Gej {
+    /// `self += b` with libsecp256k1's `gej_add_ge_var` formulas: 8 multiplications and
+    /// 3 squarings, against about 12 multiplications for k256's complete formulas.
+    /// Returns false in the one case they don't cover, `b` equal to `self`, which would
+    /// need a doubling.
+    // The operands go by reference: by value it measured ~1 µs slower per verify.
+    #[allow(clippy::op_ref)]
+    fn add(&mut self, b: &Ge) -> bool {
+        if self.infinity {
+            *self = Gej {
+                x: b.x,
+                y: b.y,
+                z: Fe::ONE,
+                infinity: false,
+            };
+            return true;
+        }
+        let z12 = self.z.square();
+        let (u1, s1) = (self.x, self.y);
+        let u2 = b.x * &z12;
+        let s2 = b.y * &z12 * &self.z;
+        let h = u1.negate(4) + &u2;
+        let i = s2.negate(1) + &s1;
+        if bool::from(h.normalizes_to_zero()) {
+            if bool::from(i.normalizes_to_zero()) {
+                return false;
+            }
+            self.infinity = true;
+            return true;
+        }
+        self.z *= &h;
+        let h2 = h.square().negate(1);
+        let h3 = h2 * &h;
+        let t = u1 * &h2;
+        self.x = i.square() + &h3 + &t + &t;
+        self.y = (t + self.x) * &i + (h3 * &s1);
+        true
+    }
+}
+
 /// P, 2P, ..., HALF·P, times 2^(W·row) for each row. A scalar split into signed W-bit
 /// digits then multiplies with one addition per row and no doublings, which is what
 /// makes a known key cheaper than recovering one.
-struct Table(Vec<[AffinePoint; HALF]>);
+struct Table(Vec<[Ge; HALF]>);
 
 impl Table {
     fn new(point: ProjectivePoint) -> Self {
@@ -169,14 +233,19 @@ impl Table {
                 for _ in 0..W {
                     base = base.double();
                 }
-                affine
+                // No multiple in a row is the identity, since n is prime.
+                affine.map(|a| Ge {
+                    x: Fe::from_bytes(&a.x()).unwrap(),
+                    y: Fe::from_bytes(&a.y()).unwrap(),
+                })
             })
             .collect();
         Self(rows)
     }
 
-    /// `acc += k·P`, taking k's bytes as base-256 digits in -127..=128.
-    fn mul_add(&self, acc: &mut ProjectivePoint, k: &Scalar) {
+    /// `acc += k·P`, taking k's bytes as base-256 digits in -127..=128. False if an
+    /// addition needed a doubling.
+    fn mul_add(&self, acc: &mut Gej, k: &Scalar) -> bool {
         let bytes = k.to_bytes(); // big-endian
         let mut carry = 0;
         for (row, points) in self.0.iter().enumerate() {
@@ -187,22 +256,33 @@ impl Table {
                 digit -= 1 << W;
                 carry = 1;
             }
-            match digit {
-                0 => {}
-                d if d > 0 => *acc += &points[d as usize - 1],
-                d => *acc += &-points[(-d) as usize - 1],
+            let added = match digit {
+                0 => true,
+                d if d > 0 => acc.add(&points[d as usize - 1]),
+                d => {
+                    let p = points[(-d) as usize - 1];
+                    acc.add(&Ge {
+                        x: p.x,
+                        y: p.y.negate(1),
+                    })
+                }
+            };
+            if !added {
+                return false;
             }
         }
+        true
     }
 }
 
 static G: LazyLock<Table> = LazyLock::new(|| Table::new(ProjectivePoint::GENERATOR));
 
 /// A public key with precomputed tables, for checking many signatures from the same
-/// signer. Checking one is about 3 times cheaper than recovering the signer from it.
+/// signer. Checking one is several times cheaper than recovering the signer from it.
 /// Building the tables takes a few milliseconds.
 pub struct FixedKey {
     table: Table,
+    point: AffinePoint,
     pub address: [u8; 20],
 }
 
@@ -222,6 +302,7 @@ impl FixedKey {
         LazyLock::force(&G);
         Some(Self {
             table: Table::new(point.into()),
+            point,
             address: address(&uncompressed[1..]),
         })
     }
@@ -235,22 +316,41 @@ impl FixedKey {
             let k: CtOption<Scalar> = Scalar::from_repr((*b).into());
             Option::from(k).filter(|k: &Scalar| !bool::from(k.is_zero()))
         };
-        let (Some(r), Some(s)) = (nonzero(r), nonzero(s)) else {
+        let (Some(r_scalar), Some(s)) = (nonzero(r), nonzero(s)) else {
             return false;
         };
         let Some(s_inv) = Option::<Scalar>::from(s.invert_vartime()) else {
             return false;
         };
         let z = <Scalar as Reduce<U256>>::reduce(&U256::from_be_slice(digest));
-        // R = (z/s)·G + (r/s)·Q, and the signature holds if R's x is r mod n.
-        let mut acc = ProjectivePoint::IDENTITY;
-        G.mul_add(&mut acc, &(z * s_inv));
-        self.table.mul_add(&mut acc, &(r * s_inv));
-        if bool::from(acc.is_identity()) {
+        let (u1, u2) = (z * s_inv, r_scalar * s_inv);
+        // R = u1·G + u2·Q, and the signature holds if R's x is r mod n.
+        let mut acc = Gej {
+            x: Fe::ZERO,
+            y: Fe::ZERO,
+            z: Fe::ZERO,
+            infinity: true,
+        };
+        if !(G.mul_add(&mut acc, &u1) && self.table.mul_add(&mut acc, &u2)) {
+            // A doubling came up, which happens with probability ~2^-128.
+            let p = ProjectivePoint::GENERATOR * u1 + ProjectivePoint::from(self.point) * u2;
+            if bool::from(p.is_identity()) {
+                return false;
+            }
+            let x = p.to_affine().x();
+            return <Scalar as Reduce<U256>>::reduce(&U256::from_be_slice(&x)) == r_scalar;
+        }
+        if acc.infinity {
             return false;
         }
-        let x = acc.to_affine().x();
-        <Scalar as Reduce<U256>>::reduce(&U256::from_be_slice(&x)) == r
+        // x = X / Z², so compare X with r·Z², and with (r + n)·Z² when r + n < p.
+        let zz = acc.z.square();
+        let x_is = |c: Fe| bool::from(((c * zz).negate(1) + acc.x).normalizes_to_zero());
+        let r_fe = Fe::from_bytes(&(*r).into()).unwrap(); // r < n < p
+        if x_is(r_fe) {
+            return true;
+        }
+        *r < P_MINUS_N && x_is(r_fe + Fe::from_bytes(&N_BYTES.into()).unwrap())
     }
 }
 
