@@ -106,6 +106,9 @@ let mut feed = rhfeed::Feed::builder()
   On our desktop the time from the socket read to `recv()` went from 95 to 61 µs at the
   median. On a Linux VM it also cut the wait between a packet reaching the kernel and
   our first read from 153 to 46 µs.
+- How much it helps depends on the CPU. On AWS c7a (AMD) it saved 21 µs and on c7i
+  (Intel) 60 µs. On c8g (Graviton4) it saved almost nothing, because that machine
+  already gets about 42 µs without it. See [BENCHMARKS.md](BENCHMARKS.md#three-aws-instance-types).
 - `senders(7)` recovers every sender on 7 spinning threads while the signature is being
   checked, so `tx.sender()` is free when the message arrives. Recovering them after
   `recv()` with `recover_senders` took 273 µs per message, mostly spent waking

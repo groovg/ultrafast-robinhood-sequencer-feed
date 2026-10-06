@@ -17,6 +17,8 @@ columns were last updated on 2026-10-06.
   61 µs with `busy_poll`.
 - Live on a Linux VM: 203 µs, or 97 µs with `busy_poll`. Before our first read, the
   packet had waited 153 µs in the kernel, or 46 µs with `busy_poll`.
+- In AWS, Graviton4 (c8g) is the best machine for it: 42 µs live from the last read to
+  `recv()`, and about 49 µs from the NIC interrupt to `recv()`, without busy polling.
 - A copy-trading bot's senders (about 7 per message): 273 µs with `recover_senders`
   after `recv()`, 56 µs with `SenderPool`.
 - The network is where the milliseconds are: two connections save about 30 ms on half
@@ -149,6 +151,77 @@ transactions). p50 / p99 in µs:
   Busy poll: 45 and 46 µs. So from the packet to `recv()`, busy polling took the VM
   from about 360 µs to about 145 µs. This used the kernel's receive timestamps
   (`SO_TIMESTAMPNS`) in a patch that isn't merged.
+
+### Three AWS instance types
+
+On 2026-10-06 we ran the same measurements on three 8-vCPU instances in AWS us-east-1:
+c7a.2xlarge (AMD EPYC 9R14, Zen 4, one thread per core), c8g.2xlarge (Graviton4,
+Neoverse V2) and c7i.2xlarge (Intel Xeon 8488C, Sapphire Rapids, two threads per core).
+Ubuntu 24.04, kernel 7.0, the same recording as above. Plain `cargo build --release`
+unless noted.
+
+`examples/bench.rs`, µs, best of two runs:
+
+| | c7a | c8g | c7i |
+|---|---:|---:|---:|
+| feed path | 43.9 | 45.4 | 39.1 |
+| same, `target-cpu=native` | 42.8 | 45.2 | 38.6 |
+| with 100 ms between messages (p50) | 65.1 | 43.7 | 81.0 |
+| signature check against the known key | 40.7 | 41.3 | 36.2 |
+| `FixedKey` verify | 16.5 | 16.7 | 13.3 |
+| ECDSA recover, libsecp256k1 | 38.0 | 38.5 | 31.6 |
+| ECDSA recover, ufsecp (native) | 37.3 | 38.8 | 30.4 |
+| inflate one frame | 13.3 | 15.0 | 14.7 |
+| every sender of a message, `recover_senders`, 20 ms pauses | 152 | 81 | 444 |
+| same, `SenderPool` with 7 threads | 58 | 57 | 96 |
+
+- In a tight loop the three are within 15% of each other. After a pause they aren't:
+  Graviton4 loses nothing, while the AMD and Intel machines take 1.5x and 2x as long.
+  The paced row is the one that predicts live latency.
+- Of the 41 µs signature check on c7a and c8g, `FixedKey` is 17. Most of the other 24
+  is keccak over the signed data.
+- On Linux, ufsecp and `target-cpu=native` gain at most 1.2 µs on the feed path.
+- keccak-asm only uses the ARMv8.2 SHA3 instructions on Apple CPUs. We forced them on
+  Graviton4 to see: a transaction hash took 6.6 µs instead of 3.3, and the signature
+  check 64 µs instead of 41. The default is right.
+- c7i's 8 vCPUs are 4 cores with two threads each. Senders spread over all of them
+  after a pause took 444 µs.
+
+Live, `rhfeed --timing`, one connection, 3 minutes per row, back to back. Last socket
+read to `recv()`, p50 in µs:
+
+| | c7a | c8g | c7i |
+|---|---:|---:|---:|
+| normal | 77.6 | 41.9 | 108.1 |
+| busy poll | 56.8 | 39.5 | 47.6 |
+| native + ufsecp, normal | 81.1 | 38.3 | 124.7 |
+| native + ufsecp, busy poll | 53.7 | 41.0 | 51.7 |
+| busy poll, every sender known (`--sender`, 5 threads) | 66.3 | 58.8 | 110.6 |
+
+Before our first timestamp, the frame has already spent time in the kernel. We measured
+that with bpftrace on the NIC's interrupt handler, `tcp_rcv_established` and
+`tcp_recvmsg` (a separate run of about 1,200 frames each). Time before the interrupt
+fires isn't included. p50 in µs:
+
+| | c7a | c8g | c7i |
+|---|---:|---:|---:|
+| interrupt to TCP | 14 | 2 | 22 |
+| TCP to our first read, normal | 36 | 6 | 172 |
+| TCP to our first read, busy poll | 10 | 3 | 7 |
+| interrupt to `recv()`, normal | 136 | 49 | 317 |
+| interrupt to `recv()`, busy poll | 74 | 44 | 80 |
+
+- Graviton4 gets a frame from the interrupt to `recv()` in about 45 µs without spinning
+  any core. The other two need busy polling, two cores at 100%, to get near that.
+- On c7i a sleeping thread takes 172 µs to wake up and read. Busy polling matters most
+  there.
+- The kernel's own busy polling (`net.core.busy_poll`, `net.core.busy_read`) changed
+  nothing. The busy runtime calls `epoll_wait` with a zero timeout, and the kernel only
+  polls the NIC from `epoll_wait` when the call is allowed to wait.
+- Moving all NIC interrupts to CPU 0 and rhfeed to CPUs 2-7 helped on c7i only: with
+  busy polling, interrupt to TCP took 6 µs instead of 13. No change on the others.
+- Interrupt moderation (`adaptive-rx`, on by default) made no difference at the feed's
+  rate: a ping every 10 ms took 62 µs either way.
 
 ## Senders for copy trading
 
