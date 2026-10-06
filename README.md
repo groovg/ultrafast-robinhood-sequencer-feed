@@ -134,6 +134,10 @@ let mut feed = rhfeed::Feed::builder()
   path that's about 9 ms slower and stays there. If a connection is first on fewer than
   1 in 10 of its last 500 messages, `Feed` replaces it.
 - A connection that sends nothing at all for 15 s, not even a ping, is replaced too.
+- The feed has several backends, up to ~17 ms apart, and which one you get depends
+  mostly on your machine's IP. Machines in the same region can differ that much. If
+  milliseconds matter, compare a few machines with `bench/regions.py` and keep the
+  fastest. See [BENCHMARKS.md](BENCHMARKS.md#where-to-run-it).
 - When the program exits it prints, for each source, how often it was first and how far
   behind it was the rest of the time.
 

@@ -22,7 +22,7 @@ columns were last updated on 2026-10-06.
 - A copy-trading bot's senders (about 7 per message): 273 µs with `recover_senders`
   after `recv()`, 56 µs with `SenderPool`.
 - The network is where the milliseconds are: two connections save about 30 ms on half
-  the messages, and Virginia gets the feed first.
+  the messages, and the feed backend your machine's IP lands on can cost 17 ms more.
 
 ## Time per message
 
@@ -352,12 +352,35 @@ message (`bench/regions.py`). Two rounds, 30 and 15 minutes, about 27,000 messag
 - The feed is served through Cloudflare, so what counts is the route from your
   Cloudflare location to wherever the feed is served from. Distance to the sequencer
   doesn't predict it: Oregon was ahead of Ohio.
-- Virginia was the best place to read the feed from.
 - Machines in the same region can differ too. Two instances in Virginia were about
-  10 ms apart. If you care about milliseconds, try a few and keep the fastest.
+  10 ms apart.
+
+On 2026-10-06 we recorded for 9 hours (09:00 to 18:00 UTC, 318,527 messages) from four
+machines, two connections each: two in us-east-1, one in us-east-2 and one in
+ca-central-1. The order held every hour:
+
+| Machine | First | Median behind the fastest | Behind by more than 1 s |
+|---|---:|---:|---:|
+| us-east-2 (Ohio) | 92.2% | 0 | 0 messages |
+| us-east-1, first machine | 7.3% | 3.4 ms | 0 |
+| ca-central-1 (Montreal) | 0.4% | 9.8 ms | 0 |
+| us-east-1, second machine | 0.1% | 16.7 ms | 1,626 |
+
+- This time Ohio was fastest, and the two Virginia machines were 13 ms apart.
+- Behind Cloudflare's load balancer there are several feed backends, and they differ by
+  up to ~17 ms. Which one a connection gets depends mostly on the machine's IP. On two
+  test machines in Virginia, 11 of 12 new connections landed on the same backend as
+  before. That explains most of the difference between machines in one region.
+- The slow backend was also the unreliable one. The second Virginia machine fell more
+  than a second behind 20 times, four times by up to 17 s for about a minute, on both
+  of its connections at once. Two connections on the same backend don't protect you.
+- How the backends rank changes over hours. Measure from a few machines and keep the
+  fastest, and check again now and then.
 - Two connections from one machine usually trade places message by message, a few ms
   apart. Sometimes one gets stuck on a slower path for a long time, which is why
-  `Feed` replaces a connection that keeps losing.
+  `Feed` replaces a connection that keeps losing. Since the backend mostly follows the
+  IP, the new connection often lands on the same one: the Ohio machine replaced
+  connections 38 times in 9 hours.
 
 ## Running the benchmarks yourself
 
