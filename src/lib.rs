@@ -8,6 +8,7 @@
 
 pub mod codec;
 pub mod consume;
+pub mod intents;
 pub mod secp;
 pub mod verify;
 
@@ -18,6 +19,7 @@ pub use codec::{
 pub use consume::{
     Feed, FeedBuilder, LOCAL_RELAY, MAINNET_FEED, SourceStats, Stats, TESTNET_FEED, Timing,
 };
+pub use intents::{Intent, decode_intents};
 pub use verify::{
     FEED_PREFIX, MAINNET_CHAIN_ID, MAINNET_SIGNER, MAINNET_VERIFIER, Verifier, recover_signer,
     signature_payload,

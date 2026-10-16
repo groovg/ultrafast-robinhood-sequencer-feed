@@ -59,6 +59,21 @@ tokio::spawn(async move {
 It runs on [tokio](https://tokio.rs). Each source gets its own connection and task,
 and each message is delivered once, from whichever source had it first.
 
+### Trade intents
+
+`decode_intents(&tx)` reads a transaction's calldata and says what it asks for: a swap,
+transfer, approve, Relay fill or Relay sell, with tokens, amounts, recipient and the
+wallet it is for (`actor`). It knows ERC-20 and Permit2, Uniswap V2, V3 and the
+Universal Router (V2, V3 and V4 swaps), ERC-4337 bundles, Relay, 0x, and the chain's
+busiest launchpad and aggregator.
+
+- In a 4337 bundle the sender is a bundler, so `actor` is the wallet inside it. In a
+  Relay fill it is the wallet delivered to. `None` means the sender.
+- A transaction with no known selector costs one match and allocates nothing. Decoding
+  every transaction of a message takes about 0.5 µs, against 22 µs in Python.
+- An intent is what the calldata claims, not what happened. The transaction can still
+  revert.
+
 ## Plugging it into a bot
 
 Add the crate as a git dependency:
@@ -233,11 +248,13 @@ on, and connect to the feed directly if you care about reorgs.
 | Path | What's there |
 |---|---|
 | `src/codec.rs` | decoding frames and transactions, `recover_senders`, `SenderPool` |
+| `src/intents/` | reading calldata into trade intents, one module per protocol |
 | `src/verify.rs` | checking the sequencer's signature |
 | `src/secp.rs` | ECDSA: recovery (libsecp256k1 or UltrafastSecp256k1) and the known-key check |
 | `src/consume.rs` | `Feed`: connections, reconnects, dedup, reorgs, timing, busy polling |
 | `src/main.rs` | the `rhfeed` command |
 | `tests/golden.rs` | checks the decoder against the Python version's output in `tests/golden.jsonl` |
+| `tests/intents.rs` | checks the intents against the Python version's output in `tests/golden_intents.jsonl` |
 | `tests/robustness.rs` | feeds the decoder broken input and makes sure it doesn't crash |
 | `tests/feed.rs` | runs `Feed` against local WebSocket servers |
 | `tests/fixtures/` | real mainnet frames and a signed message (from the Python repo) |

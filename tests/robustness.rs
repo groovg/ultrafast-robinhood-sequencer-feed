@@ -70,6 +70,11 @@ fn touch(tx: &rhfeed::Tx) {
         tx.kind(),
     );
     let _ = (tx.value_dec(), tx.value_be(), tx.nonce, tx.gas, tx.data_len);
+    rhfeed::decode_intents(tx).iter().for_each(touch_intent);
+}
+
+fn touch_intent(intent: &rhfeed::Intent) {
+    let _ = (intent.describe(), sonic_rs::to_string(intent).unwrap());
 }
 
 fn rounds() -> usize {
@@ -176,5 +181,68 @@ fn random_bytes_never_panic() {
         for tx in decode_l2_message(&Bytes::from(bytes)) {
             touch(&tx);
         }
+    }
+}
+
+/// Calldata from the capture and from the intent fixture, broken at random, with the
+/// ABI's offset and length words as the favourite targets, under random paths.
+#[test]
+fn mutated_calldata_never_panics() {
+    use rhfeed::intents::{Call, Via, decode_call};
+
+    let lines = capture();
+    let mut datas: Vec<Vec<u8>> = lines
+        .iter()
+        .flat_map(|l| parse_frame(&frame_from_slice(l.as_bytes()).unwrap()))
+        .flat_map(|m| m.txs)
+        .map(|t| t.data().to_vec())
+        .filter(|d| d.len() >= 4)
+        .collect();
+    let golden = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden_intents.jsonl"),
+    )
+    .unwrap();
+    for line in golden.lines() {
+        let r: serde_json::Value = serde_json::from_str(line).unwrap();
+        if let Some(data) = r
+            .get("call")
+            .or(r.get("tx"))
+            .and_then(|c| c["data"].as_str())
+        {
+            datas.push(hex::decode(&data[2..]).unwrap());
+        }
+    }
+    let mut rng = Rng(0x5eed_0005);
+    for _ in 0..rounds() * 5 {
+        let source = &datas[rng.below(datas.len())];
+        let mut data = mutate(&mut rng, source);
+        if data.len() > 36 && rng.below(2) == 0 {
+            let at = 4 + 32 * rng.below((data.len() - 4) / 32);
+            let interesting: [u64; 6] = [
+                0,
+                32,
+                64,
+                data.len() as u64,
+                (data.len() - 32) as u64,
+                u64::MAX,
+            ];
+            let mut word = [0u8; 32];
+            word[24..].copy_from_slice(&interesting[rng.below(6)].to_be_bytes());
+            if rng.below(8) == 0 {
+                word = [0xff; 32];
+            }
+            data[at..at + 32].copy_from_slice(&word);
+        }
+        let path: Vec<[u8; 20]> = (0..rng.below(13)).map(|_| [rng.next() as u8; 20]).collect();
+        let call = Call {
+            to: (rng.below(4) != 0).then(|| [rng.next() as u8; 20]),
+            value: [rng.next() as u8; 32],
+            data: &data,
+            actor: (rng.below(2) == 0).then(|| [rng.next() as u8; 20]),
+            via: Via::from_slice(&path).unwrap(),
+        };
+        let mut out = Vec::new();
+        decode_call(&call, rng.below(10), &mut out);
+        out.iter().for_each(touch_intent);
     }
 }

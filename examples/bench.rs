@@ -15,8 +15,8 @@ use bytes::Bytes;
 
 use rhfeed::codec::Frame;
 use rhfeed::{
-    MAINNET_CHAIN_ID, MAINNET_VERIFIER, decode_transaction, frame_from_slice, keccak, parse_frame,
-    recover_signer, signature_payload,
+    MAINNET_CHAIN_ID, MAINNET_VERIFIER, decode_intents, decode_transaction, frame_from_slice,
+    keccak, parse_frame, recover_signer, signature_payload,
 };
 
 /// A digest, r, s and recovery id.
@@ -124,6 +124,19 @@ fn main() {
         }
     });
     println!("{:<44}{b64_us:>10.3}", "  of which base64 l2Msg");
+    // Trade intents from the calldata of every transaction, on decoded messages.
+    let decoded: Vec<_> = frames.iter().flat_map(|f| parse_frame(f)).collect();
+    let intents_us = best_of(200, messages, || {
+        for m in &decoded {
+            for t in &m.txs {
+                black_box(decode_intents(black_box(t)));
+            }
+        }
+    });
+    println!(
+        "{:<44}{intents_us:>10.3}",
+        "intents, every tx (decode_intents)"
+    );
     // Before any of that, yawc inflates the frame (permessage-deflate). The feed's own
     // compressed bytes aren't recorded, so recompress the capture the way the protocol
     // does: one raw deflate stream over the whole connection, a sync flush per message.

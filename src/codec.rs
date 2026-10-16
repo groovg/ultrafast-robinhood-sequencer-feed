@@ -195,6 +195,26 @@ fn be_uint<const N: usize>(bytes: &[u8]) -> Option<u128> {
     (bytes.len() <= N).then(|| bytes.iter().fold(0u128, |acc, &b| acc << 8 | u128::from(b)))
 }
 
+/// A big-endian unsigned integer of any length as a decimal string.
+pub fn decimal(be: &[u8]) -> String {
+    let mut n = be.to_vec();
+    let mut digits = Vec::new();
+    while n.iter().any(|&b| b != 0) {
+        let mut rem = 0u32;
+        for b in &mut n {
+            let cur = rem * 256 + u32::from(*b);
+            *b = (cur / 10) as u8;
+            rem = cur % 10;
+        }
+        digits.push(b'0' + rem as u8);
+    }
+    if digits.is_empty() {
+        return "0".into();
+    }
+    digits.reverse();
+    String::from_utf8(digits).unwrap()
+}
+
 fn pad32(bytes: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[32 - bytes.len()..].copy_from_slice(bytes);
@@ -229,6 +249,7 @@ pub struct Tx {
     pub selector: Option<[u8; 4]>,
     pub data_len: usize,
     value: (usize, usize),
+    data: (usize, usize),
     /// Empty for an envelope this does not model; offsets are into `raw[body..]`.
     fields: Vec<Field>,
     body: usize,
@@ -244,6 +265,7 @@ struct Modeled {
     selector: Option<[u8; 4]>,
     data_len: usize,
     value: (usize, usize),
+    data: (usize, usize),
     fields: Vec<Field>,
 }
 
@@ -269,6 +291,7 @@ fn model(body: &[u8], layout: [usize; 5]) -> Option<Modeled> {
         selector: data.get(..4).map(|s| s.try_into().unwrap()),
         data_len: data.len(),
         value: (fields[vi].1, fields[vi].2),
+        data: (fields[di].1, fields[di].2),
         fields,
     })
 }
@@ -308,22 +331,12 @@ impl Tx {
 
     /// Value in wei as a decimal string, since it can be bigger than any integer type.
     pub fn value_dec(&self) -> String {
-        let mut n = self.value_be().to_vec();
-        let mut digits = Vec::new();
-        while n.iter().any(|&b| b != 0) {
-            let mut rem = 0u32;
-            for b in &mut n {
-                let cur = rem * 256 + u32::from(*b);
-                *b = (cur / 10) as u8;
-                rem = cur % 10;
-            }
-            digits.push(b'0' + rem as u8);
-        }
-        if digits.is_empty() {
-            return "0".into();
-        }
-        digits.reverse();
-        String::from_utf8(digits).unwrap()
+        decimal(self.value_be())
+    }
+
+    /// The calldata. Empty for a plain transfer and for an envelope this does not model.
+    pub fn data(&self) -> &[u8] {
+        &self.body()[self.data.0..self.data.1]
     }
 
     pub fn selector_hex(&self) -> Option<String> {
@@ -544,6 +557,7 @@ pub fn decode_transaction(raw: Bytes) -> Option<Tx> {
         selector: m.selector,
         data_len: m.data_len,
         value: m.value,
+        data: m.data,
         fields: m.fields,
         body,
         hash: OnceLock::new(),

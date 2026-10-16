@@ -17,7 +17,7 @@ from coincurve import PublicKey
 from eth_hash.auto import keccak
 from orjson import loads
 
-from rhfeed import MAINNET_CHAIN_ID, MAINNET_VERIFIER, decode_transaction, parse_frame, recover_signer
+from rhfeed import MAINNET_CHAIN_ID, MAINNET_VERIFIER, decode_intents, decode_transaction, parse_frame, recover_signer
 from rhfeed.verify import signature_hash
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +64,15 @@ def main() -> None:
             parse_frame(loads(line))
 
     print(f"{'frame JSON -> decoded txs':<44}{best_of(10, messages, frames_only):>10.3f}")
+
+    decoded = [m for f in frames for m in parse_frame(f)]
+
+    def intents():
+        for m in decoded:
+            for t in m.txs:
+                decode_intents(t)
+
+    print(f"{'intents, every tx (decode_intents)':<44}{best_of(20, messages, intents):>10.3f}")
 
     def verify():
         for e in entries:
