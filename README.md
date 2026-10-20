@@ -20,6 +20,7 @@ cargo run --release                                    # mainnet, signatures che
 cargo run --release -- --feed mainnet --feed mainnet   # two connections, first copy wins
 cargo run --release -- --json --to 0xabc...            # JSON lines, one contract
 cargo run --release -- --timing --seconds 60           # where the time goes, per stage
+cargo run --release -- --actor 0xWALLET                # trades for one wallet, with intents
 cargo test
 ```
 
@@ -86,7 +87,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [`examples/copy_trade.rs`](examples/copy_trade.rs) is the reading half of a
 copy-trading bot. It follows a list of wallets and prints a JSON line the moment the
-sequencer orders one of their transactions:
+sequencer orders a trade for one of them, including trades inside 4337 bundles and
+Relay fills:
 
 ```bash
 cargo run --release --example copy_trade -- 0xWALLET_1 0xWALLET_2

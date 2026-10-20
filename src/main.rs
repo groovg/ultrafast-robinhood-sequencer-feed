@@ -11,7 +11,8 @@ use serde::Serialize;
 use sonic_rs::RawNumber;
 
 use rhfeed::{
-    Feed, FeedMessage, LOCAL_RELAY, MAINNET_FEED, MAINNET_VERIFIER, TESTNET_FEED, Tx, addr, sel,
+    Feed, FeedMessage, Intent, LOCAL_RELAY, MAINNET_FEED, MAINNET_VERIFIER, TESTNET_FEED, Tx, addr,
+    decode_intents, sel,
 };
 
 /// How many characters of an address to print. Hashes are printed in full because
@@ -50,6 +51,11 @@ struct Args {
     /// signature recovery per transaction
     #[arg(long)]
     sender: Vec<String>,
+    /// Only transactions whose decoded intent is for this wallet (the user inside a 4337
+    /// bundle or the wallet a Relay fill delivers to) or, when the calldata names no one,
+    /// that it sent. Shows senders
+    #[arg(long)]
+    actor: Vec<String>,
     /// At the end, print how long each stage took per message (p50, p99, max), from
     /// the socket read to this program receiving the message
     #[arg(long)]
@@ -60,12 +66,15 @@ struct Args {
     busy_poll: bool,
 }
 
-/// The filters, cheapest first. `to` and `selector` are just set lookups. `sender` needs
-/// an ECDSA recovery, so it's checked last.
+/// The filters, cheapest first. `to` and `selector` are just set lookups. Then the
+/// calldata is decoded for `actor`, and `sender` goes last because it needs an ECDSA
+/// recovery. `actor` needs the sender only when some intent names no actor, and keeps
+/// only the followed actors' intents: one bundle can carry several wallets' trades.
 struct Filter {
     to: Option<HashSet<[u8; 20]>>,
     selector: Option<HashSet<[u8; 4]>>,
     sender: Option<HashSet<[u8; 20]>>,
+    actor: Option<HashSet<[u8; 20]>>,
 }
 
 fn set<T: std::hash::Hash + Eq>(
@@ -88,11 +97,17 @@ impl Filter {
             to: set(&args.to, addr)?,
             selector: set(&args.selector, sel)?,
             sender: set(&args.sender, addr)?,
+            actor: set(&args.actor, addr)?,
         })
     }
 
     fn active(&self) -> bool {
-        self.to.is_some() || self.selector.is_some() || self.sender.is_some()
+        self.to.is_some() || self.selector.is_some() || self.wants_sender()
+    }
+
+    /// Both `sender` and `actor` show who sent each transaction.
+    fn wants_sender(&self) -> bool {
+        self.sender.is_some() || self.actor.is_some()
     }
 
     /// The filters that need no ECDSA: `to` and `selector`.
@@ -106,13 +121,51 @@ impl Filter {
                 .is_none_or(|s| tx.selector.is_some_and(|v| s.contains(&v)))
     }
 
-    /// The `sender` filter. Run `recover_senders` on the candidates first, so this
-    /// reads cached senders instead of recovering them one at a time.
-    fn sender(&self, tx: &Tx) -> bool {
+    /// Whether `finish` will need this transaction's sender: always for `sender`; for
+    /// `actor` when an intent names no actor or names a followed one, since a kept
+    /// transaction shows its sender.
+    fn needs_sender(&self, intents: &[Intent]) -> bool {
+        self.sender.is_some()
+            || self.actor.as_ref().is_some_and(|follow| {
+                intents.is_empty()
+                    || intents
+                        .iter()
+                        .any(|i| i.actor.is_none_or(|a| follow.contains(&a)))
+            })
+    }
+
+    /// The `actor` and `sender` filters. Run `recover_senders` on the transactions
+    /// `needs_sender` picks first, so this reads cached senders instead of recovering
+    /// them one at a time.
+    fn finish(&self, tx: &Tx, intents: &mut Vec<Intent>) -> bool {
+        if let Some(follow) = &self.actor {
+            match actors_intents(std::mem::take(intents), || tx.sender_bytes(), follow) {
+                Some(mine) => *intents = mine,
+                None => return false,
+            }
+        }
         self.sender
             .as_ref()
             .is_none_or(|s| tx.sender_bytes().is_some_and(|v| s.contains(&v)))
     }
+}
+
+/// The intents of a followed actor, or None if the transaction has none. An intent with
+/// no decoded actor, or a call with nothing decoded at all, is the sender's own, so the
+/// sender is asked for only then.
+fn actors_intents(
+    intents: Vec<Intent>,
+    sender: impl FnOnce() -> Option<[u8; 20]>,
+    follow: &HashSet<[u8; 20]>,
+) -> Option<Vec<Intent>> {
+    let decoded = !intents.is_empty();
+    let unclaimed = !decoded || intents.iter().any(|i| i.actor.is_none());
+    let followed = unclaimed && sender().is_some_and(|s| follow.contains(&s));
+    let mine: Vec<Intent> = intents
+        .into_iter()
+        .filter(|i| i.actor.map_or(followed, |a| follow.contains(&a)))
+        .collect();
+    (!mine.is_empty() || (!decoded && followed)).then_some(mine)
 }
 
 fn short(address: Option<String>, placeholder: &str) -> String {
@@ -123,7 +176,7 @@ fn short(address: Option<String>, placeholder: &str) -> String {
 }
 
 #[derive(Serialize)]
-struct JsonTx {
+struct JsonTx<'a> {
     hash: String,
     tx_type: u8,
     to: Option<String>,
@@ -136,19 +189,20 @@ struct JsonTx {
     raw_len: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     sender: Option<Option<String>>,
+    intents: &'a [Intent],
 }
 
 #[derive(Serialize)]
-struct JsonMsg {
+struct JsonMsg<'a> {
     seq: i64,
     timestamp: u64,
     received_at: f64,
     kind: String,
     from_parent_chain: bool,
-    txs: Vec<JsonTx>,
+    txs: Vec<JsonTx<'a>>,
 }
 
-fn json_line(msg: &FeedMessage, txs: &[&Tx], show_sender: bool) -> String {
+fn json_line(msg: &FeedMessage, txs: &[(&Tx, Vec<Intent>)], show_sender: bool) -> String {
     let line = JsonMsg {
         seq: msg.seq,
         timestamp: msg.timestamp,
@@ -157,7 +211,7 @@ fn json_line(msg: &FeedMessage, txs: &[&Tx], show_sender: bool) -> String {
         from_parent_chain: msg.from_parent_chain(),
         txs: txs
             .iter()
-            .map(|t| JsonTx {
+            .map(|(t, intents)| JsonTx {
                 hash: t.hash_hex(),
                 tx_type: t.tx_type,
                 to: t.to(),
@@ -168,6 +222,7 @@ fn json_line(msg: &FeedMessage, txs: &[&Tx], show_sender: bool) -> String {
                 kind: t.kind(),
                 raw_len: t.raw.len(),
                 sender: show_sender.then(|| t.sender()),
+                intents,
             })
             .collect(),
     };
@@ -236,8 +291,8 @@ async fn run() {
         builder = builder.verify(MAINNET_VERIFIER.clone());
     }
     // Recovering a sender costs about 15 times more than all other fields together, so
-    // we only show senders when --sender already made us recover them.
-    let show_sender = keep.sender.is_some();
+    // we only show senders when --sender or --actor already made us recover them.
+    let show_sender = keep.wants_sender();
     // With --busy-poll, the feed recovers the senders itself while it checks the
     // signature, on spinning threads: as many as a typical message has transactions
     // (7), leaving cores for the rest.
@@ -272,13 +327,19 @@ async fn run() {
                 row[STAGES.len() - 1] = received.saturating_duration_since(t.last_read);
                 stages.push(row);
             }
-            let mut txs: Vec<&Tx> = msg.txs.iter().filter(|t| keep.cheap(t)).collect();
+            let mut txs: Vec<(&Tx, Vec<Intent>)> = msg
+                .txs
+                .iter()
+                .filter(|t| keep.cheap(t))
+                .map(|t| (t, decode_intents(t)))
+                .collect();
             if show_sender {
                 if !pooled {
-                    // All of this message's senders at once, spread over the cores.
-                    rhfeed::recover_senders(txs.iter().copied());
+                    // The senders this message needs, all at once, spread over the cores.
+                    let needed = txs.iter().filter(|(_, i)| keep.needs_sender(i));
+                    rhfeed::recover_senders(needed.map(|(t, _)| *t));
                 }
-                txs.retain(|t| keep.sender(t));
+                txs.retain_mut(|(t, intents)| keep.finish(t, intents));
             }
             if txs.is_empty() && keep.active() {
                 continue;
@@ -294,7 +355,7 @@ async fn run() {
                 String::new()
             };
             println!("seq {}{tag}  {} tx", msg.seq, txs.len());
-            for t in txs {
+            for (t, intents) in txs {
                 let who = if show_sender {
                     format!("{} -> ", short(t.sender(), "?"))
                 } else {
@@ -307,6 +368,9 @@ async fn run() {
                     short(t.to(), "deploy"),
                     t.selector_hex().unwrap_or_default()
                 );
+                for i in intents {
+                    println!("        ↳ {}", i.describe());
+                }
             }
         }
     };
@@ -395,4 +459,66 @@ fn print_timing(stages: &mut [[Duration; STAGES.len()]]) {
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rhfeed::intents::{Kind, decode};
+
+    const FOLLOWED: [u8; 20] = [0x05; 20];
+    const NOBODY: [u8; 20] = [0x11; 20];
+    const SENDER: [u8; 20] = [0x22; 20];
+
+    /// A swap for `actor`, or an approve with no actor when None.
+    fn intent(actor: Option<[u8; 20]>) -> Intent {
+        let mut data = vec![0x09, 0x5e, 0xa7, 0xb3];
+        data.extend([0u8; 64]);
+        let mut i = decode(Some([1; 20]), &[], &data).remove(0);
+        if actor.is_some() {
+            i.kind = Kind::Swap;
+            i.actor = actor;
+        }
+        i
+    }
+
+    fn follow(a: [u8; 20]) -> HashSet<[u8; 20]> {
+        HashSet::from([a])
+    }
+
+    #[test]
+    fn only_the_followed_actors_intents_are_kept() {
+        let (mine, theirs) = (intent(Some(FOLLOWED)), intent(Some(NOBODY)));
+        let both = vec![mine.clone(), theirs];
+        let kept = actors_intents(
+            both,
+            || panic!("nothing needs the sender"),
+            &follow(FOLLOWED),
+        );
+        assert_eq!(kept, Some(vec![mine]));
+    }
+
+    #[test]
+    fn unclaimed_intents_are_kept_only_for_a_followed_sender() {
+        let (claimed, unclaimed) = (intent(Some(NOBODY)), intent(None));
+        let both = || vec![claimed.clone(), unclaimed.clone()];
+        let sender = || Some(SENDER);
+        let kept = |a| actors_intents(both(), sender, &follow(a));
+        assert_eq!(kept(SENDER), Some(vec![unclaimed.clone()]));
+        assert_eq!(kept(NOBODY), Some(vec![claimed.clone()]));
+        assert_eq!(kept(FOLLOWED), None);
+    }
+
+    #[test]
+    fn a_call_with_nothing_decoded_is_the_senders() {
+        assert_eq!(
+            actors_intents(vec![], || Some(SENDER), &follow(SENDER)),
+            Some(vec![])
+        );
+        assert_eq!(
+            actors_intents(vec![], || Some(SENDER), &follow(NOBODY)),
+            None
+        );
+        assert_eq!(actors_intents(vec![], || None, &follow(NOBODY)), None);
+    }
 }
