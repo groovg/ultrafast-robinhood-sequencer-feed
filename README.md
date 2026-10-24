@@ -170,9 +170,11 @@ let mut feed = rhfeed::Feed::builder()
 - If a transaction has a field that can't be valid (a 30-byte `to` address, a nonce
   over 64 bits) we keep only its hash and raw bytes. Python passes the odd value
   through. No node would accept such a transaction anyway.
-- It decodes transactions only from L2Message entries (kind 3), like arbos does. Python
-  decodes l2Msg for every kind, so an EthDeposit whose address happens to start with
-  byte 4 comes out as a bogus transaction there.
+- If arbos refuses any part of an l2Msg, the whole message runs with no transactions,
+  so we show none. Both versions do that. Ours also checks each envelope the way geth's
+  decoder does: field types, integers without leading zeros, length prefixes in their
+  shortest form. Python checks only the field count and trailing bytes, so it can show
+  a transaction that never executes, next to others that don't either.
 - The WebSocket client is [yawc](https://github.com/infinitefield/yawc).
   [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite) doesn't support
   permessage-deflate.

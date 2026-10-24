@@ -2,10 +2,12 @@
 //! values out.
 //!
 //! Ported from the Python version's `src/rhfeed/codec.py`, whose docstring explains the
-//! design. One difference: if a field can't fit the type geth would parse it into (a
-//! nonce or gas over 64 bits, a value over 256 bits, a `to` that isn't empty or 20
-//! bytes), we keep only the hash and raw bytes. Python passes the odd value through.
-//! Nodes reject such transactions, so they never execute either way.
+//! design. Two differences. If a field can't fit the type geth would parse it into (a
+//! nonce or gas over 64 bits, a blob or 7702 value over 256 bits, a `to` that isn't
+//! empty or 20 bytes), we keep only the hash and raw bytes, where Python passes the odd
+//! value through. Inside an l2Msg, an envelope is held to everything geth's decoder
+//! checks on its fields (types, canonical integers and lengths), where Python checks
+//! only the field count and trailing bytes.
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -20,12 +22,19 @@ use serde::Deserialize;
 /// arbostypes: the L1 message kind whose l2Msg holds sequenced transactions.
 pub const L1_L2_MESSAGE: i64 = 3;
 
-/// arbos/parse_l2.go: L2 message kinds. Only these two carry user transactions.
+/// arbos/parse_l2.go: L2 message kinds. Only Batch and SignedTx carry the user
+/// transactions a consumer cares about. 0 and 1 are unsigned transactions an L1 sender
+/// posts through the delayed inbox; arbos runs them, but they are not surfaced.
+pub const L2_UNSIGNED_USER_TX: u8 = 0;
+pub const L2_CONTRACT_TX: u8 = 1;
 pub const L2_BATCH: u8 = 3;
 pub const L2_SIGNED_TX: u8 = 4;
 
-/// arbos rejects a batch at depth >= 16, so nothing nested deeper executes.
+/// arbos rejects a batch at depth >= 16, and with it the whole l2Msg.
 pub const MAX_BATCH_DEPTH: usize = 16;
+
+/// arbostypes.MaxL2MessageSize. ParseL2Transactions ignores a longer l2Msg outright.
+pub const MAX_L2_MESSAGE_SIZE: usize = 256 * 1024;
 
 const FILTER_PRECOMPILE: &str = "0x0000000000000000000000000000000000000074";
 const IS_FILTERED_SELECTOR: &str = "0x85c733a4";
@@ -269,7 +278,7 @@ struct Modeled {
     fields: Vec<Field>,
 }
 
-fn model(body: &[u8], layout: [usize; 5]) -> Option<Modeled> {
+fn model(body: &[u8], layout: [usize; 5], uint256_value: bool) -> Option<Modeled> {
     let fields = scan_list(body).ok()?;
     let [ni, gi, ti, vi, di] = layout;
     if fields.len() < di + 4 {
@@ -281,7 +290,9 @@ fn model(body: &[u8], layout: [usize; 5]) -> Option<Modeled> {
         to => Some(to.try_into().ok()?),
     };
     let data = item(di);
-    if item(vi).len() > 32 {
+    // Blob and 7702 values are uint256 in geth. Older types use a big.Int, which can be
+    // longer: such a transaction decodes, so its siblings in an l2Msg still execute.
+    if uint256_value && item(vi).len() > 32 {
         return None;
     }
     Some(Modeled {
@@ -546,7 +557,7 @@ pub fn decode_transaction(raw: Bytes) -> Option<Tx> {
     let tx_type = if typed { head } else { 0 };
     let body = usize::from(typed);
     // A type we don't handle, or one that doesn't parse: keep just the hash and raw bytes.
-    let m = layout(tx_type).and_then(|l| model(&raw[body..], l));
+    let m = layout(tx_type).and_then(|l| model(&raw[body..], l, tx_type >= 3));
     let m = m.unwrap_or_default();
     Some(Tx {
         raw,
@@ -566,32 +577,115 @@ pub fn decode_transaction(raw: Bytes) -> Option<Tx> {
 }
 
 /// Walk an l2Msg, flattening nested batches into the signed transactions inside.
+///
+/// Anything parseL2Message refuses, anywhere in the message, voids the whole l2Msg:
+/// the error goes up through every enclosing batch and the block producer runs the
+/// message with no transactions. So the result is then empty. That covers a batch past
+/// the depth cap, an empty entry, a kind arbos does not run, and an envelope geth's
+/// `UnmarshalBinary` refuses.
 pub fn decode_l2_message(payload: &Bytes) -> Vec<Tx> {
     let mut out = Vec::new();
-    walk(payload, 0, &mut out);
+    if payload.len() > MAX_L2_MESSAGE_SIZE || walk(payload, 0, &mut out).is_err() {
+        out.clear();
+    }
     out
 }
 
-fn walk(payload: &Bytes, depth: usize, out: &mut Vec<Tx>) {
-    match payload.first() {
-        Some(&L2_SIGNED_TX) => out.extend(decode_transaction(payload.slice(1..))),
-        // Past the cap arbos accepts, so nothing below here executes.
-        Some(&L2_BATCH) if depth < MAX_BATCH_DEPTH => {
-            // A Batch is repeated [8-byte big-endian length][nested L2 message].
+/// arbos refuses the l2Msg this came from.
+struct Rejected;
+
+fn walk(payload: &Bytes, depth: usize, out: &mut Vec<Tx>) -> Result<(), Rejected> {
+    // No kind byte: parseL2Message fails its first read.
+    let &kind = payload.first().ok_or(Rejected)?;
+    match kind {
+        L2_SIGNED_TX => {
+            let tx = decode_transaction(payload.slice(1..)).ok_or(Rejected)?;
+            if !geth_accepts(&tx) {
+                return Err(Rejected);
+            }
+            out.push(tx);
+        }
+        L2_BATCH if depth < MAX_BATCH_DEPTH => {
+            // Repeated [8-byte big-endian length][nested L2 message]. As in
+            // util.BytestringFromReader, a truncated length or body ends the batch and
+            // keeps what came before. A zero length reads an empty message, refused above.
             let mut offset = 1;
             while offset + 8 <= payload.len() {
                 let len = u64::from_be_bytes(payload[offset..offset + 8].try_into().unwrap());
                 offset += 8;
-                if len == 0 || len > (payload.len() - offset) as u64 {
-                    return;
+                if len > (payload.len() - offset) as u64 {
+                    break;
                 }
                 let end = offset + len as usize;
-                walk(&payload.slice(offset..end), depth + 1, out);
+                walk(&payload.slice(offset..end), depth + 1, out)?;
                 offset = end;
             }
         }
-        _ => {}
+        L2_UNSIGNED_USER_TX | L2_CONTRACT_TX => {
+            // parseUnsignedTx: 32-byte words for gas limit, max fee, nonce (kind 0 only),
+            // to and value, then calldata. Gas limit and nonce must fit a uint64.
+            let words = if kind == L2_UNSIGNED_USER_TX { 5 } else { 4 };
+            let body = &payload[1..];
+            let high_zero = |at: usize| body[at..at + 24].iter().all(|&b| b == 0);
+            if body.len() < 32 * words
+                || !high_zero(0)
+                || (kind == L2_UNSIGNED_USER_TX && !high_zero(64))
+            {
+                return Err(Rejected);
+            }
+        }
+        // A batch past the cap, NonmutatingCall (2) and SignedCompressedTx (7), which are
+        // unimplemented, Heartbeat (6), refused since 2022, and any unknown kind.
+        _ => return Err(Rejected),
     }
+    Ok(())
+}
+
+/// Whether geth's `UnmarshalBinary` decodes this envelope and arbos then takes it.
+///
+/// `decode_transaction` keeps any envelope, for its hash. Inside an l2Msg one that geth
+/// refuses voids the whole message. Each envelope is checked field by field against the
+/// Go type it decodes into: `8` uint64, `i` big.Int, `u` uint256, `a` optional address,
+/// `A` address, `b` bytes, `l` list. Integers must be canonical (no leading zero), and so
+/// must every length prefix. Blob envelopes decode, but parseL2Message refuses them.
+///
+/// shortcut: the items inside access and authorization lists aren't checked. The
+/// Python version checks only the field count and trailing bytes.
+fn geth_accepts(tx: &Tx) -> bool {
+    let spec: &[u8] = match tx.raw.first() {
+        Some(0xc0..) => b"8i8aibiii",
+        Some(1) => b"i8i8aibliii",
+        Some(2) => b"i8ii8aibliii",
+        Some(4) => b"u8uu8Aublluuu",
+        _ => return false,
+    };
+    let (body, f) = (tx.body(), &tx.fields);
+    // rlp.DecodeBytes also refuses bytes after the list.
+    if f.len() != spec.len() || f.last().is_some_and(|l| l.2 != body.len()) {
+        return false;
+    }
+    if body[0] >= 0xf8 && (body[1] == 0 || body.len() - f[0].0 < 56) {
+        return false; // the list's own length in long form, where short form fits
+    }
+    f.iter().zip(spec).all(|(&(i, s, e), &want)| {
+        let (head, payload) = (body[i], &body[s..e]);
+        let canonical = match head {
+            0x81 => payload[0] >= 0x80,
+            0xb8..=0xbf | 0xf8.. => body[i + 1] != 0 && e - s >= 56,
+            _ => true,
+        };
+        let int = |max: usize| payload.first() != Some(&0) && payload.len() <= max;
+        canonical
+            && (head >= 0xc0) == (want == b'l')
+            && match want {
+                b'8' => int(8),
+                b'i' => int(usize::MAX),
+                b'u' => int(32),
+                b'a' => payload.is_empty() || payload.len() == 20,
+                b'A' => payload.len() == 20,
+                _ => true,
+            }
+    })
 }
 
 // --------------------------------------------------------------------------- //
@@ -696,6 +790,9 @@ pub struct FeedMessage {
     pub block_hash: Option<String>,
     pub delayed_messages_read: u64,
     pub l1_block_number: u64,
+    /// Set on a message read out of the delayed inbox (its index there), None on one the
+    /// sequencer built.
+    pub request_id: Option<String>,
     /// Set by `Feed`; meaningless for a frame decoded straight off disk.
     pub live: bool,
     /// Unix seconds when the first copy of this message arrived, from any source.
@@ -726,9 +823,13 @@ impl FeedMessage {
         })
     }
 
-    /// Anything not an L2Message entered through Ethereum, not the sequencer.
+    /// Entered through Ethereum, not the sequencer: every kind but L2Message, and an
+    /// L2Message an L1 sender posted to the delayed inbox. The sequencer leaves out a
+    /// transaction that fails to apply. A delayed message keeps whatever was posted, and
+    /// the block producer skips, with no receipt, a transaction whose signature, nonce or
+    /// balance doesn't hold. Treat these `txs` as claims, not as what will execute.
     pub fn from_parent_chain(&self) -> bool {
-        self.l1_kind != L1_L2_MESSAGE
+        self.request_id.is_some() || self.l1_kind != L1_L2_MESSAGE
     }
 }
 
@@ -776,6 +877,9 @@ pub fn parse_entry_with(entry: &Entry, l2: Option<&Bytes>) -> FeedMessage {
             .and_then(|w| w.delayed_messages_read)
             .unwrap_or(0),
         l1_block_number: header.and_then(|h| h.block_number).unwrap_or(0),
+        request_id: header
+            .and_then(|h| h.request_id.as_deref())
+            .map(str::to_owned),
         live: true,
         received_at: 0.0,
         reorg: false,
@@ -933,8 +1037,9 @@ mod tests {
 
     #[test]
     fn only_an_l2_message_is_decoded_into_transactions() {
-        // A signed-transaction marker (0x04) at the start of l2Msg, under two kinds.
-        let l2 = Bytes::from([[4u8].as_slice(), &[0xc0; 51]].concat());
+        // A signed-transaction marker (0x04) and a legacy envelope of nine empty fields,
+        // under two kinds.
+        let l2 = Bytes::from([[4u8, 0xc9].as_slice(), &[0x80; 9]].concat());
         let json = |kind: i64| {
             format!(
                 r#"{{"messages":[{{"message":{{"message":{{"header":{{"kind":{kind}}}}}}}}}]}}"#

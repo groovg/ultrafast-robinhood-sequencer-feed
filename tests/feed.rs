@@ -23,7 +23,7 @@ fn entry(seq: i64, timestamp: u64) -> String {
     format!(
         r#"{{"sequenceNumber":{seq},"blockHash":"0x{:064x}","message":{{"delayedMessagesRead":1,
         "message":{{"header":{{"kind":3,"sender":"0xa4b000000000000000000073657175656e636572",
-        "blockNumber":1,"timestamp":{timestamp}}},"l2Msg":"BAAAAAAAAAAA"}}}}}}"#,
+        "blockNumber":1,"timestamp":{timestamp}}},"l2Msg":"BMmAgICAgICAgIA="}}}}}}"#,
         seq
     )
 }
@@ -154,6 +154,6 @@ async fn a_feed_can_recover_the_senders_itself() {
     let mut feed = Feed::builder().source(url).senders(2).spawn();
     let msg = next(&mut feed).await;
     assert_eq!((msg.seq, msg.txs.len()), (8, 1));
-    // The test transaction is junk, so it has no sender either way.
+    // The test transaction has an empty signature, so it has no sender either way.
     assert_eq!(msg.txs[0].sender_bytes(), None);
 }

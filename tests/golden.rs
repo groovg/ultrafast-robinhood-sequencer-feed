@@ -12,7 +12,9 @@ use std::path::Path;
 use bytes::Bytes;
 use serde_json::Value;
 
-use rhfeed::codec::{Entry, L2_BATCH, L2_SIGNED_TX, MAX_BATCH_DEPTH, decode_l2_message};
+use rhfeed::codec::{
+    Entry, L2_BATCH, L2_SIGNED_TX, MAX_BATCH_DEPTH, MAX_L2_MESSAGE_SIZE, decode_l2_message,
+};
 use rhfeed::{
     FEED_PREFIX, MAINNET_CHAIN_ID, MAINNET_SIGNER, MAINNET_VERIFIER, SenderPool, Tx, Verifier,
     decode_transaction, frame_from_slice, parse_frame, recover_senders, recover_signer,
@@ -92,6 +94,8 @@ fn every_captured_frame_decodes_exactly_as_python_does() {
             assert_eq!(m.block_hash.as_deref(), w["block_hash"].as_str(), "{ctx}");
             assert_eq!(m.delayed_messages_read, w["delayed_messages_read"], "{ctx}");
             assert_eq!(m.l1_block_number, w["l1_block_number"], "{ctx}");
+            assert_eq!(m.request_id.as_deref(), w["request_id"].as_str(), "{ctx}");
+            assert_eq!(m.from_parent_chain(), w["from_parent_chain"], "{ctx}");
             let wtxs = w["txs"].as_array().unwrap();
             assert_eq!(m.txs.len(), wtxs.len(), "{ctx}: tx count");
             for (t, wt) in m.txs.iter().zip(wtxs) {
@@ -139,8 +143,147 @@ fn every_signed_template_decodes_exactly_as_python_does() {
     assert_eq!(templates.len(), 5);
     for t in templates {
         let raw = hex::decode(t["tx"]["raw"].as_str().unwrap()).unwrap();
+        let name = t["template"].as_str().unwrap();
+        let l2 = Bytes::from([&[L2_SIGNED_TX], raw.as_slice()].concat());
+        assert_eq!(
+            decode_l2_message(&l2).len() as u64,
+            t["l2"],
+            "{name} in an l2Msg"
+        );
         let tx = decode_transaction(Bytes::from(raw)).unwrap();
-        assert_tx(&tx, &t["tx"], t["template"].as_str().unwrap());
+        assert_tx(&tx, &t["tx"], name);
+    }
+}
+
+#[test]
+fn every_l2msg_arbos_refuses_is_voided_as_python_does() {
+    let all = golden();
+    let cases: Vec<&Value> = all.iter().filter(|g| g.get("l2msg").is_some()).collect();
+    assert!(cases.len() >= 24, "{}", cases.len());
+    for case in cases {
+        let l2 = Bytes::from(hex::decode(case["hex"].as_str().unwrap()).unwrap());
+        let got: Vec<String> = decode_l2_message(&l2).iter().map(Tx::hash_hex).collect();
+        let want: Vec<&str> = case["hashes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h.as_str().unwrap())
+            .collect();
+        assert_eq!(got, want, "{}", case["l2msg"]);
+    }
+}
+
+#[test]
+fn an_l2msg_past_the_size_cap_is_ignored() {
+    // A valid unsigned user tx (kind 0) padded with calldata up to the cap.
+    let unsigned = |calldata: usize| {
+        let word = |v: u64| [[0u8; 24].as_slice(), &v.to_be_bytes()].concat();
+        let body = [word(21_000), word(100_000_000), word(3), word(0), word(0)].concat();
+        [vec![0u8], body, vec![0; calldata]].concat()
+    };
+    let batch = |second: Vec<u8>| {
+        let first = signed_l2_msg();
+        let mut out = vec![L2_BATCH];
+        for m in [first, second] {
+            out.extend((m.len() as u64).to_be_bytes());
+            out.extend(m);
+        }
+        Bytes::from(out)
+    };
+    let pad = MAX_L2_MESSAGE_SIZE - batch(unsigned(0)).len();
+    assert_eq!(batch(unsigned(pad)).len(), MAX_L2_MESSAGE_SIZE);
+    assert_eq!(decode_l2_message(&batch(unsigned(pad))).len(), 1);
+    assert!(decode_l2_message(&batch(unsigned(pad + 1))).is_empty());
+}
+
+/// geth refuses what Python lets through. Each case breaks one rule in the first
+/// transaction of a two-entry batch, so the second one must be voided with it.
+#[test]
+fn an_envelope_geth_refuses_voids_its_siblings() {
+    let raw = signed_l2_msg()[1..].to_vec(); // 0x02 || list of 12 fields
+    let body = &raw[1..];
+    // Re-encode the 12 fields with one of them replaced.
+    let fields = rlp_items(body);
+    let with = |k: usize, item: &[u8]| {
+        let mut items = fields.clone();
+        items[k] = item.to_vec();
+        let content: Vec<u8> = items.concat();
+        [vec![2u8], rlp_list_header(content.len()), content].concat()
+    };
+    let cases: [(&str, Vec<u8>); 7] = [
+        ("nonce with a leading zero", with(1, &[0x82, 0x00, 0x09])),
+        ("nonce as 0x00", with(1, &[0x00])),
+        ("single byte in string form", with(1, &[0x81, 0x09])),
+        (
+            "nonce over 64 bits",
+            with(1, &[[0x89u8].as_slice(), &[1; 9]].concat()),
+        ),
+        (
+            "to of 19 bytes",
+            with(5, &[[0x93u8].as_slice(), &[1; 19]].concat()),
+        ),
+        ("access list as a string", with(8, &[0x80])),
+        ("data as a list", with(7, &[0xc0])),
+    ];
+    let second = signed_l2_msg();
+    for (name, bad) in cases {
+        let first = [vec![L2_SIGNED_TX], bad].concat();
+        let mut l2 = vec![L2_BATCH];
+        for m in [&first, &second] {
+            l2.extend((m.len() as u64).to_be_bytes());
+            l2.extend(m);
+        }
+        assert!(decode_l2_message(&Bytes::from(l2)).is_empty(), "{name}");
+    }
+    // The untouched envelope, re-encoded the same way, still decodes.
+    let same = [vec![L2_SIGNED_TX], with(1, &fields[1])].concat();
+    assert_eq!(decode_l2_message(&Bytes::from(same)).len(), 1);
+}
+
+/// Every top-level item of an RLP list, prefix included.
+fn rlp_items(list: &[u8]) -> Vec<Vec<u8>> {
+    let (mut i, end) = match list[0] {
+        h @ 0xc0..=0xf7 => (1, 1 + usize::from(h - 0xc0)),
+        h => {
+            let n = usize::from(h - 0xf7);
+            let len = list[1..=n].iter().fold(0, |a, &b| a << 8 | usize::from(b));
+            (1 + n, 1 + n + len)
+        }
+    };
+    let mut out = Vec::new();
+    while i < end {
+        let len = match list[i] {
+            ..=0x7f => 1,
+            c @ 0x80..=0xb7 => 1 + usize::from(c - 0x80),
+            c @ 0xb8..=0xbf => {
+                let n = usize::from(c - 0xb7);
+                1 + n
+                    + list[i + 1..=i + n]
+                        .iter()
+                        .fold(0, |a, &b| a << 8 | usize::from(b))
+            }
+            c @ 0xc0..=0xf7 => 1 + usize::from(c - 0xc0),
+            c => {
+                let n = usize::from(c - 0xf7);
+                1 + n
+                    + list[i + 1..=i + n]
+                        .iter()
+                        .fold(0, |a, &b| a << 8 | usize::from(b))
+            }
+        };
+        out.push(list[i..i + len].to_vec());
+        i += len;
+    }
+    out
+}
+
+fn rlp_list_header(len: usize) -> Vec<u8> {
+    if len < 56 {
+        vec![0xc0 + len as u8]
+    } else {
+        let be = len.to_be_bytes();
+        let skip = be.iter().take_while(|&&b| b == 0).count();
+        [vec![0xf7 + (8 - skip) as u8], be[skip..].to_vec()].concat()
     }
 }
 
