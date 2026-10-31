@@ -371,11 +371,17 @@ impl Shared {
     /// Every message in `frame` this source is first to deliver, verified, with `live`
     /// set and transactions decoded when live. The lock is never held across
     /// verification or decoding, so sources do that work in parallel.
+    ///
+    /// Until the connection is `live`, each entry is judged on its own timestamp. A relay
+    /// replays its backlog in frames of hundreds of messages, so the frame's last entry
+    /// says nothing about the ones before it. Only an entry that passes verification can
+    /// end the backlog: a forged one with a fresh timestamp must not promote the older,
+    /// real entries behind it.
     fn ingest(
         &self,
         source: usize,
         frame: &Frame,
-        live: bool,
+        is_live: &mut bool,
         received_at: f64,
         mut timing: Timing,
     ) -> Vec<FeedMessage> {
@@ -384,13 +390,18 @@ impl Shared {
         for entry in frame.entries() {
             let seq = entry.sequence_number.unwrap_or(-1);
             let hash = entry.block_hash.as_deref();
+            let live_now = *is_live || {
+                let stamp = entry.header().and_then(|h| h.timestamp).unwrap_or(0);
+                stamp != 0 && received_at - stamp as f64 <= LIVE_THRESHOLD
+            };
             {
                 let mut st = self.lock();
                 if let Verdict::Duplicate = st.classify(seq, hash) {
-                    st.late_copy(source, seq, live, now);
+                    st.late_copy(source, seq, live_now, now);
                     continue;
                 }
             }
+            let live = live_now;
             // Decode l2Msg once and use it for both the signature and the transactions.
             // A backlog message that isn't being verified needs neither.
             let l2 = if live || self.verify.is_some() {
@@ -468,6 +479,8 @@ impl Shared {
             } else {
                 st.stats.backlog_messages += 1;
             }
+            drop(st);
+            *is_live |= live;
             msg.live = live;
             msg.source = source;
             msg.received_at = received_at;
@@ -881,6 +894,7 @@ impl Source {
     async fn read(&self, mut ws: Socket, [tcp, tls]: [Arc<ReadTimes>; 2]) -> End {
         let started = Instant::now();
         let mut live = false;
+        let mut backlog = 0;
         let mut last_frame = started;
         let mut last_heard = started;
         let mut last_narrated = started;
@@ -945,27 +959,25 @@ impl Source {
                 decoded: at,
                 sent: at,
             };
-            if !live {
-                let stamp = parsed
-                    .entries()
-                    .last()
-                    .and_then(|e| e.header())
-                    .and_then(|h| h.timestamp)
-                    .unwrap_or(0);
-                live = (stamp != 0 && received_at - stamp as f64 <= LIVE_THRESHOLD)
-                    || started.elapsed() > MAX_BACKLOG;
-                if live {
-                    info!("{} is live", self.url);
-                } else if last_narrated.elapsed() >= POLL_INTERVAL {
+            let was_live = live;
+            // Fallback for a skewed clock: the backlog is finite, so stop waiting for it.
+            live |= started.elapsed() > MAX_BACKLOG;
+            let msgs = self
+                .shared
+                .ingest(self.index, &parsed, &mut live, received_at, timing);
+            if !was_live {
+                backlog += msgs.iter().filter(|m| !m.live).count();
+                if let Some(first) = msgs.iter().find(|m| m.live) {
+                    info!(
+                        "{} is live at seq {}, {backlog} backlog messages skipped",
+                        self.url, first.seq
+                    );
+                } else if !live && last_narrated.elapsed() >= POLL_INTERVAL {
                     // Frames are arriving but none are recent yet, so we're still in the backlog.
                     last_narrated = now;
                     info!("{}: draining backlog, none current yet", self.url);
                 }
             }
-
-            let msgs = self
-                .shared
-                .ingest(self.index, &parsed, live, received_at, timing);
             let slow = std::mem::take(&mut self.shared.lock().replace[self.index]);
             for mut msg in msgs {
                 if !msg.live {
@@ -1008,11 +1020,14 @@ mod tests {
     use crate::verify::MAINNET_VERIFIER;
 
     fn entry_json(seq: i64, block_hash: &str) -> String {
-        let now = unix_now() as u64;
+        entry_at(seq, block_hash, unix_now() as u64)
+    }
+
+    fn entry_at(seq: i64, block_hash: &str, now: u64) -> String {
         format!(
             r#"{{"sequenceNumber":{seq},"blockHash":"{block_hash}","message":{{"delayedMessagesRead":500,
             "message":{{"header":{{"kind":3,"sender":"0xa4b000000000000000000073657175656e636572",
-            "blockNumber":25000000,"timestamp":{now}}},"l2Msg":"BAAAAAAAAAAA"}}}}}}"#
+            "blockNumber":25000000,"timestamp":{now}}},"l2Msg":"BMmAgICAgICAgIA="}}}}}}"#
         )
     }
 
@@ -1037,13 +1052,13 @@ mod tests {
     fn feed_at(
         s: &Shared,
         source: usize,
-        live: bool,
+        mut live: bool,
         now: Instant,
         entries: &[String],
     ) -> Vec<(i64, bool)> {
         let json = format!(r#"{{"version":1,"messages":[{}]}}"#, entries.join(","));
         let frame = frame_from_slice(json.as_bytes()).unwrap();
-        s.ingest(source, &frame, live, 0.0, stamps(now))
+        s.ingest(source, &frame, &mut live, unix_now(), stamps(now))
             .iter()
             .map(|m| (m.seq, m.reorg))
             .collect()
@@ -1101,14 +1116,48 @@ mod tests {
         assert_eq!((st.stats.unverified_messages, st.highest_seq), (1, -1));
     }
 
+    fn ingest(s: &Shared, live: &mut bool, entries: &[String]) -> Vec<FeedMessage> {
+        let json = format!(r#"{{"messages":[{}]}}"#, entries.join(","));
+        let frame = frame_from_slice(json.as_bytes()).unwrap();
+        s.ingest(0, &frame, live, unix_now(), stamps(Instant::now()))
+    }
+
     #[test]
     fn a_backlog_message_is_counted_but_not_decoded() {
         let s = shared(1, None);
-        let json = format!(r#"{{"messages":[{}]}}"#, entry_json(1, &hash_of(1)));
-        let frame = frame_from_slice(json.as_bytes()).unwrap();
-        let out = s.ingest(0, &frame, false, 0.0, stamps(Instant::now()));
-        assert!(!out[0].live && out[0].txs.is_empty());
+        let mut live = false;
+        let out = ingest(&s, &mut live, &[entry_at(1, &hash_of(1), 1_000)]);
+        assert!(!out[0].live && out[0].txs.is_empty() && !live);
         assert_eq!(s.lock().stats.backlog_messages, 1);
+    }
+
+    #[test]
+    fn each_entry_of_a_frame_is_judged_on_its_own_timestamp() {
+        let s = shared(1, None);
+        let mut live = false;
+        let now = unix_now() as u64;
+        let entries = [
+            entry_at(1, &hash_of(1), now - 30),
+            entry_at(2, &hash_of(2), now - 1),
+            entry_at(3, &hash_of(3), now - 40), // live already, whatever its stamp
+        ];
+        let out = ingest(&s, &mut live, &entries);
+        let got: Vec<_> = out.iter().map(|m| (m.seq, m.live, m.txs.len())).collect();
+        assert_eq!(got, [(1, false, 0), (2, true, 1), (3, true, 1)]);
+        assert!(live);
+    }
+
+    #[test]
+    fn a_forged_fresh_entry_does_not_end_the_backlog() {
+        let s = shared(1, Some(MAINNET_VERIFIER.clone()));
+        let mut live = false;
+        // A real, verified mainnet message from 2026, behind a forgery stamped now.
+        let real = include_str!("../tests/fixtures/verified_message.json").trim();
+        let out = ingest(&s, &mut live, &[entry_json(1, &hash_of(1)), real.into()]);
+        assert!(!live);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].live);
+        assert_eq!(s.lock().stats.unverified_messages, 1);
     }
 
     #[test]
@@ -1172,7 +1221,7 @@ mod tests {
             1,
             false,
             t0 + Duration::from_secs(60),
-            &[entry_json(7, &hash_of(7))],
+            &[entry_at(7, &hash_of(7), 1_000)],
         );
         assert_eq!(s.lock().stats.sources[1].late, 0);
     }

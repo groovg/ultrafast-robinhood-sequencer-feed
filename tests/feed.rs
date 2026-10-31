@@ -93,6 +93,22 @@ async fn the_backlog_is_skipped_and_live_messages_delivered() {
 }
 
 #[tokio::test]
+async fn a_frame_that_ends_the_backlog_delivers_only_its_live_part() {
+    let t = now();
+    let (url, _) = server(vec![vec![frame(&[
+        entry(1, t - 30),
+        entry(2, t - 20),
+        entry(3, t),
+    ])]])
+    .await;
+    let mut feed = Feed::builder().source(url).spawn();
+    let msg = next(&mut feed).await;
+    assert_eq!((msg.seq, msg.live), (3, true));
+    let stats = feed.stats();
+    assert_eq!((stats.backlog_messages, stats.live_messages), (2, 1));
+}
+
+#[tokio::test]
 async fn a_reconnect_re_requests_the_last_seen_number_and_drops_the_duplicate() {
     let t = now();
     let (url, mut requested) = server(vec![
