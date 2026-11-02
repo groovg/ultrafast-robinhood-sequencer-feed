@@ -99,6 +99,9 @@ A few things to keep in mind:
 - Filter on `to_bytes` and `selector` first. They're already sliced out and cost
   nothing. Senders need ECDSA, so recover them only for what's left.
 - A transaction in the feed has been ordered, not executed. It can still revert.
+- A third-party feed that takes its access key in the URL (in the path, the query or
+  `user:pass@`) works as a source. Logs and stats show only its host. Keep signature
+  checking on for any feed you don't run yourself.
 - This crate only reads. Signing and sending your own transactions is up to you, for
   example with [alloy](https://github.com/alloy-rs/alloy).
 - `Feed::recv()` hands you messages through a buffer of 1024. If your bot takes longer

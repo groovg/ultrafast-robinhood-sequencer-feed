@@ -37,6 +37,7 @@
 //! - Problems are logged: which source can't connect, which one is connected but silent.
 //!   A connection that sends nothing at all for 15 s, not even a ping, is replaced.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -212,6 +213,7 @@ pub struct Stats {
 /// Per-source counters: who delivered first, and how far behind the rest were.
 #[derive(Debug, Default, Clone)]
 pub struct SourceStats {
+    /// The source URL as it is safe to log (see `redact`).
     pub url: String,
     pub connected: bool,
     pub reconnects: u64,
@@ -236,6 +238,22 @@ fn unix_now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// A feed URL as it is safe to log: scheme, host and port. Third-party feeds take the
+/// access key in the path, the query or `user:pass@`, so anything after the host is cut.
+/// A URL with nothing after the host, like Robinhood's feeds, comes back unchanged.
+fn redact(url: &str) -> Cow<'_, str> {
+    let start = url.find("://").map_or(0, |i| i + 3);
+    let rest = &url[start..];
+    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if host.len() == authority.len() && tail.trim_matches('/').is_empty() {
+        return Cow::Borrowed(url);
+    }
+    Cow::Owned(format!("{}{host}/…", &url[..start]))
 }
 
 // --------------------------------------------------------------------------- //
@@ -341,7 +359,7 @@ impl Shared {
         let sources = urls
             .iter()
             .map(|url| SourceStats {
-                url: url.clone(),
+                url: redact(url).into_owned(),
                 ..SourceStats::default()
             })
             .collect();
@@ -706,6 +724,7 @@ impl FeedBuilder {
         let sources: Vec<Source> = (self.sources.into_iter().enumerate())
             .map(|(index, url)| Source {
                 index,
+                name: redact(&url).into_owned(),
                 url,
                 shared: shared.clone(),
                 tx: tx.clone(),
@@ -758,6 +777,8 @@ fn busy_poll(sources: Vec<Source>, tx: mpsc::Sender<FeedMessage>) {
 struct Source {
     index: usize,
     url: String,
+    /// `url` as it is safe to log, see `redact`.
+    name: String,
     shared: Arc<Shared>,
     tx: mpsc::Sender<FeedMessage>,
     reconnect_delay: Duration,
@@ -779,12 +800,12 @@ impl Source {
         let mut delay = self.reconnect_delay;
         let mut failures = 0u32;
         loop {
-            info!("connecting to {}", self.url);
+            info!("connecting to {}", self.name);
             let err = match self.connect().await {
                 Err(err) => err,
                 Ok((ws, times)) => {
                     if failures > 0 {
-                        warn!("{} is reachable again", self.url);
+                        warn!("{} is reachable again", self.name);
                     }
                     failures = 0;
                     delay = self.reconnect_delay;
@@ -797,7 +818,7 @@ impl Source {
                             info!(
                                 "{}: first on under 1 in {SLOW_SHARE} of the last \
                                  {SLOW_WINDOW} messages, trying a new connection",
-                                self.url
+                                self.name
                             );
                             self.shared.lock().stats.sources[self.index].replaced += 1;
                             continue;
@@ -806,6 +827,8 @@ impl Source {
                     }
                 }
             };
+            // An error can quote the URL, key and all.
+            let err = err.replace(self.url.as_str(), &self.name);
             failures += 1;
             self.shared.lock().stats.sources[self.index].reconnects += 1;
             if err.contains("429") {
@@ -815,7 +838,7 @@ impl Source {
                 warn!(
                     "{} refused the connection as rate-limited (HTTP 429): the public feed allows \
                      two connections per IP. Retrying every {}s",
-                    self.url,
+                    self.name,
                     delay.as_secs()
                 );
                 tokio::time::sleep(delay).await;
@@ -825,7 +848,7 @@ impl Source {
             // like a quiet feed.
             warn!(
                 "cannot read {} ({err}), retrying in {:.1}s{}",
-                self.url,
+                self.name,
                 delay.as_secs_f64(),
                 if failures == 1 {
                     "; is the URL right and reachable?"
@@ -922,7 +945,7 @@ impl Source {
                         warn!(
                             "no frames from {} for {:.0}s. Connected, but nothing is \
                              arriving. For a relay, usually its own upstream is down",
-                            self.url,
+                            self.name,
                             idle.as_secs_f64(),
                         );
                     }
@@ -970,12 +993,12 @@ impl Source {
                 if let Some(first) = msgs.iter().find(|m| m.live) {
                     info!(
                         "{} is live at seq {}, {backlog} backlog messages skipped",
-                        self.url, first.seq
+                        self.name, first.seq
                     );
                 } else if !live && last_narrated.elapsed() >= POLL_INTERVAL {
                     // Frames are arriving but none are recent yet, so we're still in the backlog.
                     last_narrated = now;
-                    info!("{}: draining backlog, none current yet", self.url);
+                    info!("{}: draining backlog, none current yet", self.name);
                 }
             }
             let slow = std::mem::take(&mut self.shared.lock().replace[self.index]);
@@ -995,7 +1018,7 @@ impl Source {
                                 "consumer is falling behind: {} messages buffered, \
                                  {} waits until it catches up",
                                 self.tx.max_capacity(),
-                                self.url
+                                self.name
                             );
                         }
                         if self.tx.send(msg).await.is_err() {
@@ -1070,6 +1093,27 @@ mod tests {
 
     fn hash_of(n: u8) -> String {
         format!("0x{}", format!("{n:02x}").repeat(32))
+    }
+
+    #[test]
+    fn a_key_in_the_url_stays_out_of_the_log() {
+        for (url, want) in [
+            (MAINNET_FEED, MAINNET_FEED),
+            ("ws://127.0.0.1:9642", "ws://127.0.0.1:9642"),
+            ("ws://127.0.0.1:9642/", "ws://127.0.0.1:9642/"),
+            ("wss://feed.example.com/SECRET", "wss://feed.example.com/…"),
+            (
+                "wss://feed.example.com?key=SECRET",
+                "wss://feed.example.com/…",
+            ),
+            (
+                "wss://user:SECRET@feed.example.com:443",
+                "wss://feed.example.com:443/…",
+            ),
+            ("wss://u:SECRET@h/p?k=SECRET#f", "wss://h/…"),
+        ] {
+            assert_eq!(redact(url), want, "{url}");
+        }
     }
 
     #[test]
