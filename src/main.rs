@@ -382,11 +382,12 @@ async fn run() {
             None => std::future::pending().await,
         }
     };
-    tokio::select! {
-        () = stream => {}
-        () = deadline => {}
-        _ = tokio::signal::ctrl_c() => {}
-    }
+    // The stream ends on its own only when every source has stopped for good.
+    let ended = tokio::select! {
+        () = stream => true,
+        () = deadline => false,
+        _ = tokio::signal::ctrl_c() => false,
+    };
 
     if args.timing && !stages.is_empty() {
         print_timing(&mut stages);
@@ -423,6 +424,12 @@ async fn run() {
                 }
             );
         }
+    }
+    if ended {
+        for err in s.sources.iter().filter_map(|src| src.error.as_deref()) {
+            eprintln!("rhfeed: {err}");
+        }
+        exit(1);
     }
 }
 

@@ -35,11 +35,19 @@ fn frame(entries: &[String]) -> Message {
     ))
 }
 
+async fn server(scripts: Vec<Vec<Message>>) -> (String, mpsc::UnboundedReceiver<Option<String>>) {
+    server_with(scripts, None).await
+}
+
 /// A feed server. Each accepted connection reports its requested sequence number, then
-/// gets the next script from `scripts` sent to it, frame by frame, and is closed.
+/// gets the next script from `scripts` sent to it, frame by frame, and is closed. With
+/// `chain`, the handshake response announces that chain id, as Nitro relays do.
 // The handshake callback's error type is tungstenite's, not ours to shrink.
 #[allow(clippy::result_large_err)]
-async fn server(scripts: Vec<Vec<Message>>) -> (String, mpsc::UnboundedReceiver<Option<String>>) {
+async fn server_with(
+    scripts: Vec<Vec<Message>>,
+    chain: Option<&'static str>,
+) -> (String, mpsc::UnboundedReceiver<Option<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let (requested_tx, requested_rx) = mpsc::unbounded_channel();
@@ -48,20 +56,27 @@ async fn server(scripts: Vec<Vec<Message>>) -> (String, mpsc::UnboundedReceiver<
             let (stream, _) = listener.accept().await.unwrap();
             let requested = Arc::new(Mutex::new(None));
             let seen = requested.clone();
-            let mut ws =
-                tokio_tungstenite::accept_hdr_async(stream, move |req: &Request, res: Response| {
+            let mut ws = tokio_tungstenite::accept_hdr_async(
+                stream,
+                move |req: &Request, mut res: Response| {
                     *seen.lock().unwrap() = req
                         .headers()
                         .get("Arbitrum-Requested-Sequence-Number")
                         .map(|v| v.to_str().unwrap().to_owned());
+                    if let Some(chain) = chain {
+                        res.headers_mut()
+                            .insert("Arbitrum-Chain-Id", chain.parse().unwrap());
+                    }
                     Ok(res)
-                })
-                .await
-                .unwrap();
+                },
+            )
+            .await
+            .unwrap();
             // A test that does not care about the header has dropped the receiver.
             let _ = requested_tx.send(requested.lock().unwrap().clone());
             for msg in script {
-                ws.send(msg).await.unwrap();
+                // The client may have hung up, which some tests expect.
+                let _ = ws.send(msg).await;
             }
             let _ = ws.close(None).await;
         }
@@ -172,4 +187,33 @@ async fn a_feed_can_recover_the_senders_itself() {
     assert_eq!((msg.seq, msg.txs.len()), (8, 1));
     // The test transaction has an empty signature, so it has no sender either way.
     assert_eq!(msg.txs[0].sender_bytes(), None);
+}
+
+#[tokio::test]
+async fn a_feed_of_another_chain_is_refused_when_verifying() {
+    let t = now();
+    for busy in [false, true] {
+        let (url, _) = server_with(vec![vec![frame(&[entry(1, t)])]], Some("46630")).await;
+        let mut feed = Feed::builder()
+            .source(url)
+            .verify(rhfeed::MAINNET_VERIFIER.clone())
+            .busy_poll(busy)
+            .spawn();
+        // The only source stops for good, so the stream ends instead of retrying.
+        let end = tokio::time::timeout(Duration::from_secs(5), feed.recv()).await;
+        assert!(matches!(end, Ok(None)), "busy {busy}");
+        let err = feed.stats().sources[0].error.clone().unwrap();
+        assert!(
+            err.contains("chain 46630") && err.contains("chain 4663,"),
+            "{err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_announced_chain_is_ignored_without_verification() {
+    let (url, _) = server_with(vec![vec![frame(&[entry(4, now())])]], Some("0xb626")).await;
+    let mut feed = Feed::builder().source(url).spawn();
+    assert_eq!(next(&mut feed).await.seq, 4);
+    assert!(feed.stats().sources[0].error.is_none());
 }

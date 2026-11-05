@@ -45,7 +45,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
-use log::{info, warn};
+use log::{error, info, warn};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -70,6 +70,7 @@ pub const TESTNET_FEED: &str = "wss://feed.testnet.chain.robinhood.com";
 
 const FEED_CLIENT_VERSION: &str = "Arbitrum-Feed-Client-Version";
 const REQUESTED_SEQ: &str = "Arbitrum-Requested-Sequence-Number";
+const CHAIN_ID: &str = "Arbitrum-Chain-Id";
 
 /// A message stamped this recently by the sequencer is live.
 const LIVE_THRESHOLD: f64 = 5.0;
@@ -146,6 +147,9 @@ impl ReadTimes {
 struct Stamped<S> {
     inner: S,
     times: Arc<ReadTimes>,
+    /// Collects the first bytes read, up to the end of the HTTP response head, because
+    /// yawc doesn't hand the handshake response back. None once that's done.
+    head: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Stamped<S> {
@@ -158,9 +162,42 @@ impl<S: AsyncRead + Unpin> AsyncRead for Stamped<S> {
         let res = Pin::new(&mut self.inner).poll_read(cx, buf);
         if buf.filled().len() > before {
             self.times.record();
+            if let Some(head) = &self.head {
+                let mut head = head.lock().unwrap_or_else(|e| e.into_inner());
+                head.extend_from_slice(&buf.filled()[before..]);
+                let done = head_end(&head).is_some() || head.len() > 64 << 10;
+                drop(head);
+                if done {
+                    self.head = None;
+                }
+            }
         }
         res
     }
+}
+
+fn head_end(head: &[u8]) -> Option<usize> {
+    head.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// The chain a feed announces in its handshake response. Nitro relays and Conduit's feeds
+/// do, Robinhood's public feeds don't. Decimal or 0x hex, the first value that parses.
+fn announced_chain_id(head: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(&head[..head_end(head)?]).ok()?;
+    text.split("\r\n").skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if !name.trim().eq_ignore_ascii_case(CHAIN_ID) {
+            return None;
+        }
+        let value = value.trim();
+        match value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+        {
+            Some(hex) => u64::from_str_radix(hex, 16).ok(),
+            None => value.parse().ok(),
+        }
+    })
 }
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for Stamped<S> {
@@ -216,6 +253,9 @@ pub struct SourceStats {
     /// The source URL as it is safe to log (see `redact`).
     pub url: String,
     pub connected: bool,
+    /// Why this source stopped for good, if it did. Today only for a feed that
+    /// announces a different chain than the verifier checks.
+    pub error: Option<String>,
     pub reconnects: u64,
     /// Messages this source delivered before any other.
     pub first: u64,
@@ -759,12 +799,12 @@ fn busy_poll(sources: Vec<Source>, tx: mpsc::Sender<FeedMessage>) {
         .build()
         .expect("cannot build a tokio runtime");
     runtime.block_on(async move {
-        for source in sources {
-            tokio::spawn(source.run());
-        }
+        let mut tasks: JoinSet<()> = sources.into_iter().map(Source::run).collect();
         // While a task has yielded, the scheduler checks the sockets with a zero timeout
-        // instead of parking the thread until one is ready.
-        while !tx.is_closed() {
+        // instead of parking the thread until one is ready. Stops when the `Feed` is
+        // dropped, or when every source has stopped for good, so `recv()` sees the end.
+        while !tx.is_closed() && !tasks.is_empty() {
+            while tasks.try_join_next().is_some() {}
             tokio::task::yield_now().await;
         }
     });
@@ -803,7 +843,15 @@ impl Source {
             info!("connecting to {}", self.name);
             let err = match self.connect().await {
                 Err(err) => err,
-                Ok((ws, times)) => {
+                Ok((ws, times, chain_id)) => {
+                    if let Err(wrong) = self.check_chain(chain_id) {
+                        // Every message would fail verification, and reconnecting can't
+                        // change that. Nitro's own client treats it as fatal too. Dropping
+                        // the socket aborts the connection without a close handshake.
+                        error!("{wrong}");
+                        self.shared.lock().stats.sources[self.index].error = Some(wrong);
+                        return;
+                    }
                     if failures > 0 {
                         warn!("{} is reachable again", self.name);
                     }
@@ -865,9 +913,21 @@ impl Source {
         self.shared.lock().stats.sources[self.index].connected = connected;
     }
 
+    /// Refuse a feed that announces a chain other than the verifier's. A feed that
+    /// announces none is read as before.
+    fn check_chain(&self, announced: Option<u64>) -> Result<(), String> {
+        match (&self.shared.verify, announced) {
+            (Some(v), Some(chain)) if chain != v.chain_id => Err(format!(
+                "{} serves chain {chain}, and the verifier checks chain {}, so it would drop \n                 every message. Not retrying",
+                self.name, v.chain_id
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// A WebSocket over TLS over TCP, with the reads on both sides of TLS `Stamped`.
-    /// Returns the stamps of the (TCP, TLS) reads.
-    async fn connect(&self) -> Result<(Socket, [Arc<ReadTimes>; 2]), String> {
+    /// Returns the stamps of the (TCP, TLS) reads and the chain id the feed announced.
+    async fn connect(&self) -> Result<(Socket, [Arc<ReadTimes>; 2], Option<u64>), String> {
         let url: url::Url = self.url.parse().map_err(|e| format!("bad URL: {e}"))?;
         let host = url.host_str().ok_or("URL without a host")?.to_owned();
         let port = url.port_or_known_default().ok_or("URL without a port")?;
@@ -886,6 +946,7 @@ impl Source {
         let tcp = Stamped {
             inner: tcp,
             times: Arc::clone(&times[0]),
+            head: None,
         };
         let stream = match url.scheme() {
             "ws" => MaybeTlsStream::Plain(tcp),
@@ -899,9 +960,11 @@ impl Source {
             }
             other => return Err(format!("not a WebSocket URL scheme: {other}")),
         };
+        let head = Arc::default();
         let stream = Stamped {
             inner: stream,
             times: Arc::clone(&times[1]),
+            head: Some(Arc::clone(&head)),
         };
         // Since 2026-09-17 the public feed refuses a handshake that does not offer
         // permessage-deflate. A local relay serves uncompressed and ignores the offer.
@@ -911,7 +974,8 @@ impl Source {
         let ws = WebSocket::handshake_with_request(url, stream, options, request)
             .await
             .map_err(|e| e.to_string())?;
-        Ok((ws, times))
+        let chain_id = announced_chain_id(&head.lock().unwrap_or_else(|e| e.into_inner()));
+        Ok((ws, times, chain_id))
     }
 
     async fn read(&self, mut ws: Socket, [tcp, tls]: [Arc<ReadTimes>; 2]) -> End {
@@ -1093,6 +1157,35 @@ mod tests {
 
     fn hash_of(n: u8) -> String {
         format!("0x{}", format!("{n:02x}").repeat(32))
+    }
+
+    #[test]
+    fn the_announced_chain_id_is_read_from_the_response_head() {
+        let head = |headers: &str| {
+            // A frame's binary bytes can follow the head in the same read.
+            let head = format!("HTTP/1.1 101 Switching Protocols\r\n{headers}\r\n");
+            [head.as_bytes(), b"\x81\x05\xff\xfe"].concat()
+        };
+        let cases = [
+            (
+                "Upgrade: websocket\r\nArbitrum-Chain-Id: 4663\r\n",
+                Some(4663),
+            ),
+            ("arbitrum-chain-id:0x1237\r\n", Some(4663)),
+            (
+                "Arbitrum-Chain-Id: nope\r\nArbitrum-Chain-Id: 46630\r\n",
+                Some(46630),
+            ),
+            ("Upgrade: websocket\r\n", None),
+        ];
+        for (headers, want) in cases {
+            assert_eq!(announced_chain_id(&head(headers)), want, "{headers:?}");
+        }
+        // Not the whole head yet.
+        assert_eq!(
+            announced_chain_id(b"HTTP/1.1 101\r\nArbitrum-Chain-Id: 1\r\n"),
+            None
+        );
     }
 
     #[test]

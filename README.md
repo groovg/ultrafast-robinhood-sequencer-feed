@@ -102,6 +102,9 @@ A few things to keep in mind:
 - A third-party feed that takes its access key in the URL (in the path, the query or
   `user:pass@`) works as a source. Logs and stats show only its host. Keep signature
   checking on for any feed you don't run yourself.
+- Nitro relays and Conduit's feeds announce their chain id in the handshake. If it isn't
+  the chain the verifier checks, that source stops with an error in its stats instead
+  of dropping every message. When every source has stopped, `recv()` returns `None`.
 - This crate only reads. Signing and sending your own transactions is up to you, for
   example with [alloy](https://github.com/alloy-rs/alloy).
 - `Feed::recv()` hands you messages through a buffer of 1024. If your bot takes longer
