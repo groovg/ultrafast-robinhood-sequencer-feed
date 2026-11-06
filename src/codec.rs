@@ -259,6 +259,9 @@ pub struct Tx {
     pub data_len: usize,
     value: (usize, usize),
     data: (usize, usize),
+    /// The calldata of a transaction arbos builds from a parent-chain message, which
+    /// isn't a slice of its envelope. None for a signed one.
+    input: Option<Box<[u8]>>,
     /// Empty for an envelope this does not model; offsets are into `raw[body..]`.
     fields: Vec<Field>,
     body: usize,
@@ -347,7 +350,10 @@ impl Tx {
 
     /// The calldata. Empty for a plain transfer and for an envelope this does not model.
     pub fn data(&self) -> &[u8] {
-        &self.body()[self.data.0..self.data.1]
+        match &self.input {
+            Some(input) => input,
+            None => &self.body()[self.data.0..self.data.1],
+        }
     }
 
     pub fn selector_hex(&self) -> Option<String> {
@@ -569,6 +575,7 @@ pub fn decode_transaction(raw: Bytes) -> Option<Tx> {
         data_len: m.data_len,
         value: m.value,
         data: m.data,
+        input: None,
         fields: m.fields,
         body,
         hash: OnceLock::new(),
@@ -689,6 +696,206 @@ fn geth_accepts(tx: &Tx) -> bool {
 }
 
 // --------------------------------------------------------------------------- //
+// transactions arbos builds from parent-chain messages
+// --------------------------------------------------------------------------- //
+
+/// arbostypes: the parent-chain kinds arbos turns into one transaction of a type of its
+/// own. Its hash covers the chain id, which the message doesn't carry.
+pub const L1_SUBMIT_RETRYABLE: i64 = 9;
+pub const L1_ETH_DEPOSIT: i64 = 12;
+pub const ARB_DEPOSIT_TX: u8 = 0x64;
+pub const ARB_SUBMIT_RETRYABLE_TX: u8 = 0x69;
+/// A submit-retryable transaction calls the ArbRetryableTx precompile with its own
+/// fields as `submitRetryable(...)` calldata (go-ethereum arb_types.go).
+const ARB_RETRYABLE_TX: [u8; 20] = {
+    let mut a = [0; 20];
+    a[19] = 0x6e;
+    a
+};
+const SUBMIT_RETRYABLE_SELECTOR: [u8; 4] = [0xc9, 0xf9, 0x5d, 0x32];
+
+/// RLP of a byte string.
+fn rlp_bytes(value: &[u8]) -> Vec<u8> {
+    match value {
+        [b] if *b < 0x80 => vec![*b],
+        _ => {
+            let mut out = Vec::with_capacity(9 + value.len());
+            rlp_header(value.len(), 0x80, &mut out);
+            out.extend_from_slice(value);
+            out
+        }
+    }
+}
+
+/// RLP of a big-endian unsigned integer of any width.
+fn rlp_be(value: &[u8]) -> Vec<u8> {
+    rlp_bytes(&value[value.iter().take_while(|&&b| b == 0).count()..])
+}
+
+/// A header field arbos reads as `size` raw bytes: a hex string of exactly that length.
+fn header_bytes<const N: usize>(value: Option<&Cow<str>>) -> Option<[u8; N]> {
+    unhex(value?, "").ok()?.try_into().ok()
+}
+
+/// The transaction arbos builds from a SubmitRetryable or an EthDeposit message, as
+/// parseSubmitRetryableMessage and parseEthDepositMessage in arbos/parse_l2.go do (nitro
+/// v3.12.2). Its hash, sender, to, value, gas and input match `eth_getTransactionByHash`.
+/// A message arbos refuses gives None. A retryable's auto-redeem (type 0x68) isn't built:
+/// its fields depend on the block's base fee, which the feed doesn't carry.
+pub fn decode_parent_chain_message(header: &Header, payload: &[u8], chain_id: u64) -> Option<Tx> {
+    if payload.len() > MAX_L2_MESSAGE_SIZE {
+        return None; // ParseL2Transactions refuses it before looking at the kind
+    }
+    // A nil RequestId arrives as JSON null, and parse_l2.go refuses the message.
+    let request_id = header_bytes::<32>(header.request_id.as_ref())?;
+    let poster = header_bytes::<20>(header.sender.as_ref())?;
+    let chain = rlp_uint(chain_id.into());
+    let word = |i: usize| -> &[u8; 32] { payload[32 * i..32 * i + 32].try_into().unwrap() };
+    let address = |w: &[u8; 32]| -> [u8; 20] { w[12..].try_into().unwrap() };
+    match header.kind? {
+        L1_ETH_DEPOSIT => {
+            // A 20-byte address, then a 32-byte amount, both read with io.ReadFull.
+            let (to, value) = (payload.get(..20)?, payload.get(20..52)?);
+            let envelope = rlp_list(
+                &[ARB_DEPOSIT_TX],
+                &[
+                    &chain,
+                    &rlp_bytes(&request_id),
+                    &rlp_bytes(&poster),
+                    &rlp_bytes(to),
+                    &rlp_be(value),
+                ],
+            );
+            // The value is the envelope's last field, so its minimal big-endian bytes end
+            // where the envelope does. Offsets are into the body, after the type byte.
+            let value_len = 32 - value.iter().take_while(|&&b| b == 0).count();
+            let end = envelope.len() - 1;
+            let value = (end - value_len, end);
+            Some(built(
+                ARB_DEPOSIT_TX,
+                envelope,
+                to.try_into().ok()?,
+                0,
+                value,
+                None,
+                poster,
+            ))
+        }
+        L1_SUBMIT_RETRYABLE => {
+            if payload.len() < 9 * 32 {
+                return None;
+            }
+            let (retry_to, call_value, deposit, max_submission_fee) =
+                (word(0), word(1), word(2), word(3));
+            let (fee_refund, beneficiary, gas_limit, max_fee, data_length) =
+                (word(4), word(5), word(6), word(7), word(8));
+            if gas_limit[..24].iter().any(|&b| b != 0) || data_length[..24].iter().any(|&b| b != 0)
+            {
+                return None; // the gas limit must fit a uint64, and so must the length
+            }
+            let gas = u64::from_be_bytes(gas_limit[24..].try_into().unwrap());
+            let length = u64::from_be_bytes(data_length[24..].try_into().unwrap()) as usize;
+            if length > MAX_L2_MESSAGE_SIZE {
+                return None;
+            }
+            // A plain Read, not ReadFull: a short tail is zero-padded, and only none at
+            // all fails.
+            let tail = &payload[9 * 32..];
+            if length > 0 && tail.is_empty() {
+                return None;
+            }
+            let mut retry_data = tail[..length.min(tail.len())].to_vec();
+            retry_data.resize(length, 0);
+            let l1_base_fee = header.base_fee_l1.unwrap_or(0).to_be_bytes();
+            let to = address(retry_to);
+            let envelope = rlp_list(
+                &[ARB_SUBMIT_RETRYABLE_TX],
+                &[
+                    &chain,
+                    &rlp_bytes(&request_id),
+                    &rlp_bytes(&poster),
+                    &rlp_be(&l1_base_fee),
+                    &rlp_be(deposit),
+                    &rlp_be(max_fee),
+                    &rlp_uint(gas.into()),
+                    // The zero address is encoded as nil.
+                    &rlp_bytes(if to == [0; 20] { &[] } else { &to }),
+                    &rlp_be(call_value),
+                    &rlp_bytes(&address(beneficiary)),
+                    &rlp_be(max_submission_fee),
+                    &rlp_bytes(&address(fee_refund)),
+                    &rlp_bytes(&retry_data),
+                ],
+            );
+            // What eth_getTransactionByHash returns as `input`. Addresses are re-padded:
+            // arbos keeps only the low 20 bytes of each word.
+            let pad = |a: [u8; 20]| [[0u8; 12].as_slice(), &a].concat();
+            let input = [
+                &SUBMIT_RETRYABLE_SELECTOR[..],
+                &request_id,
+                &pad32(&l1_base_fee),
+                deposit,
+                call_value,
+                max_fee,
+                gas_limit,
+                max_submission_fee,
+                &pad(address(fee_refund)),
+                &pad(address(beneficiary)),
+                &pad(to),
+                &pad32(&(32 * 11u32).to_be_bytes()),
+                data_length,
+                &retry_data,
+                &vec![0; length.next_multiple_of(32) - length],
+            ]
+            .concat();
+            Some(built(
+                ARB_SUBMIT_RETRYABLE_TX,
+                envelope,
+                ARB_RETRYABLE_TX,
+                gas,
+                (0, 0),
+                Some(input),
+                poster,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// A transaction arbos builds, with no signature: its sender is the message's poster.
+fn built(
+    tx_type: u8,
+    envelope: Vec<u8>,
+    to: [u8; 20],
+    gas: u64,
+    value: (usize, usize),
+    input: Option<Vec<u8>>,
+    sender: [u8; 20],
+) -> Tx {
+    let data_len = input.as_ref().map_or(0, Vec::len);
+    let selector = input
+        .as_ref()
+        .and_then(|d| d.get(..4))
+        .map(|s| s.try_into().unwrap());
+    Tx {
+        raw: envelope.into(),
+        tx_type,
+        nonce: 0,
+        gas,
+        to_bytes: Some(to),
+        selector,
+        data_len,
+        value,
+        data: (0, 0),
+        input: input.map(Vec::into_boxed_slice),
+        fields: Vec::new(),
+        body: 1,
+        hash: OnceLock::new(),
+        sender: OnceLock::from(Some(sender)),
+    }
+}
+
+// --------------------------------------------------------------------------- //
 // frames
 // --------------------------------------------------------------------------- //
 
@@ -753,6 +960,17 @@ pub struct Header<'a> {
     pub request_id: Option<Cow<'a, str>>,
     #[serde(rename = "baseFeeL1")]
     pub base_fee_l1: Option<u128>,
+}
+
+/// Each entry of a frame as JSON text of its own, for a frame that `frame_from_slice`
+/// refuses although it is JSON: one entry with a field of the wrong type fails the whole
+/// frame there. Parse each text with `sonic_rs::from_str` and drop the ones that fail.
+/// Slow, and meant only for that case. None if `json` isn't JSON with a messages array.
+pub fn entry_texts(json: &[u8]) -> Option<Vec<String>> {
+    use sonic_rs::{JsonContainerTrait, JsonValueTrait};
+    let frame: sonic_rs::Value = sonic_rs::from_slice(json).ok()?;
+    let messages = frame.get("messages")?.as_array()?;
+    Some(messages.iter().map(|e| e.to_string()).collect())
 }
 
 /// Parse one relay frame, borrowing its strings from `json`. Uses sonic-rs, which is
@@ -835,10 +1053,16 @@ impl FeedMessage {
 
 /// Every message in a frame, transactions decoded. One frame can carry several.
 pub fn parse_frame(frame: &Frame) -> Vec<FeedMessage> {
+    parse_frame_on(frame, None)
+}
+
+/// `parse_frame`, plus the transactions arbos builds from SubmitRetryable and EthDeposit
+/// messages, whose hashes cover the chain id.
+pub fn parse_frame_on(frame: &Frame, chain_id: Option<u64>) -> Vec<FeedMessage> {
     frame
         .entries()
         .iter()
-        .map(|e| parse_entry_with(e, l2_msg(e).ok().flatten().as_ref()))
+        .map(|e| parse_entry_on(e, l2_msg(e).ok().flatten().as_ref(), chain_id))
         .collect()
 }
 
@@ -855,13 +1079,21 @@ pub fn l2_msg(entry: &Entry) -> Result<Option<Bytes>, base64_simd::Error> {
 /// One entry of a frame, with its l2Msg already decoded by `l2_msg`. Transactions are
 /// decoded only if `l2` is given, which is how the consumer skips decoding the backlog.
 pub fn parse_entry_with(entry: &Entry, l2: Option<&Bytes>) -> FeedMessage {
+    parse_entry_on(entry, l2, None)
+}
+
+/// `parse_entry_with`, plus the transaction of a SubmitRetryable or EthDeposit message
+/// when `chain_id` is given.
+pub fn parse_entry_on(entry: &Entry, l2: Option<&Bytes>, chain_id: Option<u64>) -> FeedMessage {
     let header = entry.header();
     let kind = header.and_then(|h| h.kind).unwrap_or(-1);
     // Only an L2Message carries signed transactions. Other kinds lay out l2Msg their own
-    // way (an EthDeposit is an address and an amount), and arbos never reads them as
-    // transactions, so neither do we.
-    let txs = match l2 {
-        Some(l2) if kind == L1_L2_MESSAGE => decode_l2_message(l2),
+    // way (an EthDeposit is an address and an amount), as arbos reads them.
+    let txs = match (l2, header, chain_id) {
+        (Some(l2), _, _) if kind == L1_L2_MESSAGE => decode_l2_message(l2),
+        (Some(l2), Some(h), Some(chain)) => decode_parent_chain_message(h, l2, chain)
+            .into_iter()
+            .collect(),
         _ => Vec::new(),
     };
     FeedMessage {

@@ -15,6 +15,7 @@ of what arbos refuses, with the hashes of the transactions it yields.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -76,6 +77,43 @@ def main() -> None:
     for name, l2_msg in l2_messages():
         hashes = [t.hash for t in decode_l2_message(l2_msg)]
         print(json.dumps({"l2msg": name, "hex": l2_msg.hex(), "hashes": hashes}))
+
+    for name, entry, chain_id in parent_chain_entries():
+        (msg,) = parse_frame({"messages": [entry]}, chain_id=chain_id)
+        txs = [tx_record(t) | {"data": t.data.hex()} for t in msg.txs]
+        print(json.dumps({"parent": name, "entry": entry, "chain_id": chain_id, "txs": txs}))
+
+
+def parent_chain_entries():
+    """The baseline's SubmitRetryable and EthDeposit entries, whose built transactions were
+    checked against each chain's eth_getTransactionByHash, and its malformed variants. Only
+    variants our typed frame can parse: a header field of the wrong JSON type fails the
+    whole entry there, which tests/feed.rs covers."""
+    import test_parent_chain as t
+
+    for seq, node in sorted(t.NODE.items()):
+        yield f"{seq}", t.ENTRIES[seq], node[0]
+        yield f"{seq}-no-chain-id", t.ENTRIES[seq], None
+    yield "18382981-wrong-chain", t.ENTRIES[18382981], 4663
+    for cut in (0, 51):
+        yield f"deposit-cut-{cut}", t._with_payload(18382979, t._payload(18382979)[:cut]), 99801
+    retryable = t._payload(18382981)
+    yield "retryable-8-words", t._with_payload(18382981, retryable[:287]), 99801
+    yield "retryable-no-data", t._with_payload(18382981, retryable[:288]), 99801
+    yield "retryable-short-tail", t._with_payload(18382981, retryable[:-1]), 99801
+    gas = bytearray(retryable)
+    gas[6 * 32 + 23] = 1
+    yield "retryable-gas-past-uint64", t._with_payload(18382981, bytes(gas)), 99801
+    no_id = copy.deepcopy(t.ENTRIES[18382979])
+    del no_id["message"]["message"]["header"]["requestId"]
+    yield "deposit-no-request-id", no_id, 99801
+    for seq in (18382979, 18382981):
+        yield f"{seq}-null-request-id", t._with_header(seq, requestId=None), t.NODE[seq][0]
+        yield f"{seq}-null-sender", t._with_header(seq, sender=None), t.NODE[seq][0]
+    yield "retryable-null-base-fee", t._with_header(18382981, baseFeeL1=None), 99801
+    bad = copy.deepcopy(t.ENTRIES[18382981])
+    bad["message"]["message"]["l2Msg"] = "abc"
+    yield "retryable-not-base64", bad, 99801
 
 
 def l2_messages():

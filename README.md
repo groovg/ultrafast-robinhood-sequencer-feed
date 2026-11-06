@@ -99,6 +99,13 @@ A few things to keep in mind:
 - Filter on `to_bytes` and `selector` first. They're already sliced out and cost
   nothing. Senders need ECDSA, so recover them only for what's left.
 - A transaction in the feed has been ordered, not executed. It can still revert.
+- `msg.from_parent_chain()` marks a message that came in through Ethereum. A
+  SubmitRetryable or EthDeposit message carries the transaction arbos builds from it
+  (type 0x69 or 0x64, unsigned, sent by the poster), with the same hash a node reports.
+  That hash covers the chain id, which `Feed` takes from `chain_id(...)` on the builder,
+  from the feed's handshake, from Robinhood's own feed URLs, or from the verifier. An
+  L2Message from the delayed inbox keeps whatever was posted, so treat its transactions
+  as claims.
 - A third-party feed that takes its access key in the URL (in the path, the query or
   `user:pass@`) works as a source. Logs and stats show only its host. Keep signature
   checking on for any feed you don't run yourself.
@@ -181,6 +188,9 @@ let mut feed = rhfeed::Feed::builder()
   decoder does: field types, integers without leading zeros, length prefixes in their
   shortest form. Python checks only the field count and trailing bytes, so it can show
   a transaction that never executes, next to others that don't either.
+- An entry with a header field of the wrong JSON type (a number for `requestId`, say)
+  can't be read by Nitro either. We drop that entry and keep the rest of its frame.
+  Python keeps the entry, without transactions.
 - The WebSocket client is [yawc](https://github.com/infinitefield/yawc).
   [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite) doesn't support
   permessage-deflate.

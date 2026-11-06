@@ -57,9 +57,10 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use yawc::{HttpRequestBuilder, MaybeTlsStream, OpCode, Options, WebSocket};
 
 use crate::codec::{
-    Entry, FeedMessage, Frame, SenderPool, frame_from_slice, l2_msg, parse_entry_with,
+    Entry, FeedMessage, Frame, SenderPool, entry_texts, frame_from_slice, l2_msg, parse_entry_on,
+    parse_entry_with,
 };
-use crate::verify::Verifier;
+use crate::verify::{MAINNET_CHAIN_ID, Verifier};
 
 /// Where a local Nitro relay listens by default (see README.md for running one).
 pub const LOCAL_RELAY: &str = "ws://127.0.0.1:9642";
@@ -67,6 +68,8 @@ pub const LOCAL_RELAY: &str = "ws://127.0.0.1:9642";
 /// Robinhood's public endpoints. At most two connections per IP.
 pub const MAINNET_FEED: &str = "wss://feed.mainnet.chain.robinhood.com";
 pub const TESTNET_FEED: &str = "wss://feed.testnet.chain.robinhood.com";
+/// eth_chainId on Robinhood Chain testnet.
+pub const TESTNET_CHAIN_ID: u64 = 46630;
 
 const FEED_CLIENT_VERSION: &str = "Arbitrum-Feed-Client-Version";
 const REQUESTED_SEQ: &str = "Arbitrum-Requested-Sequence-Number";
@@ -440,6 +443,7 @@ impl Shared {
         source: usize,
         frame: &Frame,
         is_live: &mut bool,
+        chain_id: Option<u64>,
         received_at: f64,
         mut timing: Timing,
     ) -> Vec<FeedMessage> {
@@ -482,7 +486,7 @@ impl Shared {
                 // Decode first, so the pool recovers the senders while this thread
                 // checks the signature.
                 (Some(pool), true) => {
-                    let msg = parse_entry_with(entry, decodable);
+                    let msg = parse_entry_on(entry, decodable, chain_id);
                     let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
                     let good = pool.recover_while(&msg.txs, accepted);
                     timing.verified = Instant::now();
@@ -499,7 +503,7 @@ impl Shared {
                         continue;
                     }
                     timing.verified = Instant::now();
-                    let msg = parse_entry_with(entry, decodable);
+                    let msg = parse_entry_on(entry, decodable, chain_id);
                     timing.decoded = Instant::now();
                     msg
                 }
@@ -668,6 +672,7 @@ impl Feed {
             capacity: 1024,
             busy_poll: false,
             senders: 0,
+            chain_id: None,
         }
     }
 
@@ -706,6 +711,7 @@ pub struct FeedBuilder {
     capacity: usize,
     busy_poll: bool,
     senders: usize,
+    chain_id: Option<u64>,
 }
 
 impl FeedBuilder {
@@ -746,6 +752,14 @@ impl FeedBuilder {
         self
     }
 
+    /// The chain id to build SubmitRetryable and EthDeposit transactions with, whose
+    /// hashes cover it. Without it, each source uses what its feed announces, Robinhood's
+    /// chain id for its own feeds, or the verifier's.
+    pub fn chain_id(mut self, chain_id: u64) -> Self {
+        self.chain_id = Some(chain_id);
+        self
+    }
+
     /// Recover every transaction's sender before handing a message over, on a
     /// `SenderPool` of `threads` spinning threads, while the source checks the feed
     /// signature. `tx.sender()` is then free. Each thread keeps a core at 100%.
@@ -769,6 +783,7 @@ impl FeedBuilder {
                 shared: shared.clone(),
                 tx: tx.clone(),
                 reconnect_delay: self.reconnect_delay,
+                chain_id: self.chain_id,
                 warm: self.busy_poll,
             })
             .collect();
@@ -822,6 +837,8 @@ struct Source {
     shared: Arc<Shared>,
     tx: mpsc::Sender<FeedMessage>,
     reconnect_delay: Duration,
+    /// Set with `FeedBuilder::chain_id`, otherwise found on each connection.
+    chain_id: Option<u64>,
     /// Rerun the last frame whenever idle for `WARM_INTERVAL` (with `busy_poll`).
     warm: bool,
 }
@@ -858,7 +875,7 @@ impl Source {
                     failures = 0;
                     delay = self.reconnect_delay;
                     self.set_connected(true);
-                    let end = self.read(ws, times).await;
+                    let end = self.read(ws, times, self.chain_for(chain_id)).await;
                     self.set_connected(false);
                     match end {
                         End::Stopped => return,
@@ -911,6 +928,17 @@ impl Source {
 
     fn set_connected(&self, connected: bool) {
         self.shared.lock().stats.sources[self.index].connected = connected;
+    }
+
+    /// The chain id deposits and retryables are built with: the one set on the builder,
+    /// else what the feed announced, else Robinhood's for its own feeds, else the
+    /// verifier's. None leaves those messages without transactions.
+    fn chain_for(&self, announced: Option<u64>) -> Option<u64> {
+        self.chain_id.or(announced).or(match self.url.as_str() {
+            MAINNET_FEED => Some(MAINNET_CHAIN_ID),
+            TESTNET_FEED => Some(TESTNET_CHAIN_ID),
+            _ => self.shared.verify.as_ref().map(|v| v.chain_id),
+        })
     }
 
     /// Refuse a feed that announces a chain other than the verifier's. A feed that
@@ -978,7 +1006,12 @@ impl Source {
         Ok((ws, times, chain_id))
     }
 
-    async fn read(&self, mut ws: Socket, [tcp, tls]: [Arc<ReadTimes>; 2]) -> End {
+    async fn read(
+        &self,
+        mut ws: Socket,
+        [tcp, tls]: [Arc<ReadTimes>; 2],
+        chain_id: Option<u64>,
+    ) -> End {
         let started = Instant::now();
         let mut live = false;
         let mut backlog = 0;
@@ -1031,9 +1064,31 @@ impl Source {
             last_frame = now;
             stall_warned = false;
 
+            let texts: Vec<String>;
             let parsed = match frame_from_slice(frame.payload()) {
                 Ok(parsed) => parsed,
-                Err(err) => return End::Failed(format!("unreadable frame: {err}")),
+                Err(err) => {
+                    let Some(t) = entry_texts(frame.payload()) else {
+                        return End::Failed(format!("unreadable frame: {err}"));
+                    };
+                    // JSON, but an entry has a field of the wrong type. Nitro can't read it
+                    // either. Reconnecting would only get the same frame again, so keep
+                    // the entries that parse.
+                    texts = t;
+                    let entries: Vec<Entry> = texts
+                        .iter()
+                        .filter_map(|t| sonic_rs::from_str(t).ok())
+                        .collect();
+                    warn!(
+                        "{}: dropped {} of {} messages in a frame ({err})",
+                        self.name,
+                        texts.len() - entries.len(),
+                        texts.len()
+                    );
+                    Frame {
+                        messages: Some(entries),
+                    }
+                }
             };
             let at = Instant::now();
             let timing = Timing {
@@ -1049,9 +1104,14 @@ impl Source {
             let was_live = live;
             // Fallback for a skewed clock: the backlog is finite, so stop waiting for it.
             live |= started.elapsed() > MAX_BACKLOG;
-            let msgs = self
-                .shared
-                .ingest(self.index, &parsed, &mut live, received_at, timing);
+            let msgs = self.shared.ingest(
+                self.index,
+                &parsed,
+                &mut live,
+                chain_id,
+                received_at,
+                timing,
+            );
             if !was_live {
                 backlog += msgs.iter().filter(|m| !m.live).count();
                 if let Some(first) = msgs.iter().find(|m| m.live) {
@@ -1145,7 +1205,7 @@ mod tests {
     ) -> Vec<(i64, bool)> {
         let json = format!(r#"{{"version":1,"messages":[{}]}}"#, entries.join(","));
         let frame = frame_from_slice(json.as_bytes()).unwrap();
-        s.ingest(source, &frame, &mut live, unix_now(), stamps(now))
+        s.ingest(source, &frame, &mut live, None, unix_now(), stamps(now))
             .iter()
             .map(|m| (m.seq, m.reorg))
             .collect()
@@ -1256,7 +1316,7 @@ mod tests {
     fn ingest(s: &Shared, live: &mut bool, entries: &[String]) -> Vec<FeedMessage> {
         let json = format!(r#"{{"messages":[{}]}}"#, entries.join(","));
         let frame = frame_from_slice(json.as_bytes()).unwrap();
-        s.ingest(0, &frame, live, unix_now(), stamps(Instant::now()))
+        s.ingest(0, &frame, live, None, unix_now(), stamps(Instant::now()))
     }
 
     #[test]

@@ -217,3 +217,49 @@ async fn an_announced_chain_is_ignored_without_verification() {
     assert_eq!(next(&mut feed).await.seq, 4);
     assert!(feed.stats().sources[0].error.is_none());
 }
+
+/// An EthDeposit entry on chain 4663 with a fresh timestamp, from the golden fixture.
+fn deposit(seq: i64) -> String {
+    let golden = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden.jsonl"),
+    )
+    .unwrap();
+    let case: serde_json::Value = golden
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .find(|g: &serde_json::Value| g["parent"] == "100868052")
+        .unwrap();
+    let mut entry = case["entry"].clone();
+    entry["sequenceNumber"] = seq.into();
+    entry["message"]["message"]["header"]["timestamp"] = now().into();
+    entry.to_string()
+}
+
+#[tokio::test]
+async fn a_deposit_carries_its_transaction_with_the_chain_id_set() {
+    let (url, _) = server(vec![vec![frame(&[deposit(1)])]]).await;
+    let mut feed = Feed::builder().source(url).chain_id(4663).spawn();
+    let msg = next(&mut feed).await;
+    assert!(msg.from_parent_chain());
+    assert_eq!(
+        msg.txs[0].hash_hex(),
+        "0xcb29b668d7f387ca6fa429853959d4354f7f918458bf4492846bfdeea759a313"
+    );
+}
+
+#[tokio::test]
+async fn a_feed_that_announces_its_chain_needs_no_chain_id() {
+    let (url, _) = server_with(vec![vec![frame(&[deposit(1)])]], Some("4663")).await;
+    let mut feed = Feed::builder().source(url).spawn();
+    assert_eq!(next(&mut feed).await.txs.len(), 1);
+}
+
+#[tokio::test]
+async fn an_entry_with_a_mistyped_field_is_dropped_and_the_rest_kept() {
+    let t = now();
+    let bad = entry(1, t).replace(r#""blockNumber":1"#, r#""blockNumber":1,"requestId":7"#);
+    let (url, _) = server(vec![vec![frame(&[bad, entry(2, t)])]]).await;
+    let mut feed = Feed::builder().source(url).spawn();
+    // Failing the frame would reconnect, and this server has nothing more to send.
+    assert_eq!(next(&mut feed).await.seq, 2);
+}

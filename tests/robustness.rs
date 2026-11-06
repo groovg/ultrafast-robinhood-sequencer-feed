@@ -246,3 +246,31 @@ fn mutated_calldata_never_panics() {
         out.iter().for_each(touch_intent);
     }
 }
+
+#[test]
+fn mutated_deposits_and_retryables_never_panic() {
+    let golden =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden.jsonl"))
+            .unwrap();
+    let entries: Vec<String> = golden
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|g| g.get("parent").is_some() && !g["txs"].as_array().unwrap().is_empty())
+        .map(|g| g["entry"].to_string())
+        .collect();
+    let mut rng = Rng(0x5eed_0006);
+    for _ in 0..rounds() {
+        let entry = &entries[rng.below(entries.len())];
+        let json = format!(r#"{{"messages":[{entry}]}}"#);
+        let frame = frame_from_slice(json.as_bytes()).unwrap();
+        let e = &frame.entries()[0];
+        let l2 = rhfeed::codec::l2_msg(e).unwrap().unwrap();
+        let payload = mutate(&mut rng, &l2);
+        if let Some(tx) =
+            rhfeed::codec::decode_parent_chain_message(e.header().unwrap(), &payload, 4663)
+        {
+            touch(&tx);
+            let _ = tx.data();
+        }
+    }
+}

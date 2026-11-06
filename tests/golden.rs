@@ -17,8 +17,8 @@ use rhfeed::codec::{
 };
 use rhfeed::{
     FEED_PREFIX, MAINNET_CHAIN_ID, MAINNET_SIGNER, MAINNET_VERIFIER, SenderPool, Tx, Verifier,
-    decode_transaction, frame_from_slice, parse_frame, recover_senders, recover_signer,
-    signature_payload,
+    decode_transaction, frame_from_slice, parse_frame, parse_frame_on, recover_senders,
+    recover_signer, signature_payload,
 };
 
 fn golden() -> Vec<Value> {
@@ -488,4 +488,60 @@ fn ufsecp_and_libsecp256k1_recover_the_same_addresses() {
         }
     }
     assert!(n >= 4);
+}
+
+// --------------------------------------------------------------------------- //
+// transactions arbos builds from parent-chain messages
+// --------------------------------------------------------------------------- //
+
+#[test]
+fn deposits_and_retryables_are_built_as_python_and_the_node_do() {
+    let all = golden();
+    let cases: Vec<&Value> = all.iter().filter(|g| g.get("parent").is_some()).collect();
+    assert!(cases.len() >= 20, "{}", cases.len());
+    let mut built = 0;
+    for case in cases {
+        let name = case["parent"].as_str().unwrap();
+        let json = format!(r#"{{"messages":[{}]}}"#, case["entry"]);
+        let frame = frame_from_slice(json.as_bytes()).unwrap();
+        let msgs = parse_frame_on(&frame, case["chain_id"].as_u64());
+        let msg = &msgs[0];
+        let want = case["txs"].as_array().unwrap();
+        assert_eq!(msg.txs.len(), want.len(), "{name}");
+        for (tx, w) in msg.txs.iter().zip(want) {
+            assert_tx(tx, w, name);
+            assert_eq!(
+                hex::encode(tx.data()),
+                w["data"].as_str().unwrap(),
+                "{name}: data"
+            );
+            built += 1;
+        }
+        assert!(msg.from_parent_chain(), "{name}");
+    }
+    assert_eq!(built, 7);
+}
+
+#[test]
+fn a_parent_chain_payload_past_the_size_cap_is_refused() {
+    let all = golden();
+    for seq in ["18382979", "18382981"] {
+        let case = all.iter().find(|g| g["parent"] == seq).unwrap();
+        let mut entry = case["entry"].clone();
+        let count = |entry: &Value| {
+            let json = format!(r#"{{"messages":[{entry}]}}"#);
+            let frame = frame_from_slice(json.as_bytes()).unwrap();
+            parse_frame_on(&frame, case["chain_id"].as_u64())[0]
+                .txs
+                .len()
+        };
+        assert_eq!(count(&entry), 1, "{seq}");
+        let l2 = &mut entry["message"]["message"]["l2Msg"];
+        let mut payload = base64_simd::STANDARD
+            .decode_to_vec(l2.as_str().unwrap())
+            .unwrap();
+        payload.resize(MAX_L2_MESSAGE_SIZE + 1, 0);
+        *l2 = Value::String(base64_simd::STANDARD.encode_to_string(&payload));
+        assert_eq!(count(&entry), 0, "{seq}");
+    }
 }
