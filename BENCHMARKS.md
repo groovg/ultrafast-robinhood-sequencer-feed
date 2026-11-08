@@ -7,12 +7,13 @@ delay our code adds on top of the network.
 Unless a section says otherwise, the machine is an AMD Ryzen 9 9950X3D desktop on
 Windows 11, and the recording is 60 seconds of Robinhood Chain mainnet from 2026-09-23
 (596 frames, 594 messages, 4,075 transactions). Each number is the best of several
-rounds after a warm-up, and differences under about 0.3 µs are noise. The Rust
-columns were last updated on 2026-10-06.
+rounds after a warm-up, and differences under about 0.3 µs are noise. The Python and
+libsecp256k1 columns were measured together in November 2026, Python at its commit
+`d6a9e4e`. The ufsecp column is from 2026-10-06.
 
 ## At a glance
 
-- Feed path in a tight loop: 26.2 µs, against 111.6 µs for the Python version.
+- Feed path in a tight loop: 26.6 µs, against 175 µs for the Python version.
 - Live on the desktop, from the last socket read to `recv()`: 95 µs at the median, or
   61 µs with `busy_poll`.
 - Live on a Linux VM: 203 µs, or 97 µs with `busy_poll`. Before our first read, the
@@ -28,22 +29,35 @@ columns were last updated on 2026-10-06.
 
 | | Python | Rust + libsecp256k1 | Rust + ufsecp (clang-cl) |
 |---|---:|---:|---:|
-| **feed path, µs per message** | 111.6 | 26.2 | **26.0** |
+| **feed path, µs per message** | 175.1 | 26.6 | **26.0** |
 | **per message, µs** | | | |
-| frame JSON to decoded txs | 33.0 | 2.7 | 2.7 |
-| signature check | 73.8 | 24.2 | **24.0** |
-| signature check by recovering the signer | 73.8 | 46.9 | 35.9 |
-| frame + signature + every sender | 543 | 304 | **217** |
+| frame JSON to decoded txs | 59.3 | 3.0 | 2.7 |
+| trade intents, every tx | 25.3 | 0.52 | |
+| signature check | 111.1 | 24.3 | **24.0** |
+| signature check by recovering the signer | 111.1 | 47.2 | 35.9 |
+| frame + signature + every sender | 819 | 312 | **217** |
 | **per transaction, µs** | | | |
-| to_bytes, selector, value, nonce, gas | 1.84 | 0.063 | 0.062 |
-| + hash | 7.11 | 2.01 | 2.02 |
-| + to (checksummed) | 12.3 | 2.32 | 2.33 |
-| + sender | 63.9 | 37.0 | **26.0** |
+| to_bytes, selector, value, nonce, gas | 1.90 | 0.069 | 0.062 |
+| + hash | 7.17 | 2.06 | 2.02 |
+| + to (checksummed) | 12.4 | 2.35 | 2.33 |
+| + sender | 64.6 | 37.3 | **26.0** |
 | **ECDSA, µs** | | | |
-| recover to address | 39.3 | 31.9 | **21.0** |
-| verify against the known key (`FixedKey`) | | 9.3 | **9.1** |
-| transactions/s on one core, sender included | 18.7k | 28.8k | **42.1k** |
+| recover to address | 54.6 | 32.6 | **21.0** |
+| verify against the known key (`FixedKey`) | | 9.2 | **9.1** |
+| transactions/s on one core, sender included | 12.8k | 28.7k | **42.1k** |
 
+- Python's feed path went from 111.6 to 175 µs between its commits `95c96f0` and
+  `d6a9e4e`. Part of that is its decoder doing more work (33 to 59 µs), part is the
+  environment: its ECDSA recovery, which its changes don't touch, also measured slower
+  (39.3 to 54.6 µs).
+- Decoding got about 0.2 µs slower per message on our side, at the edge of the noise.
+  An l2Msg is now held to what arbos and geth accept, field by field, and a message
+  that arbos would refuse in any part carries no transactions. The feed path didn't
+  move.
+- Trade intents (`decode_intents` on every transaction of a message) take 0.52 µs,
+  about 50 times less than Python. A transaction whose selector no decoder knows costs
+  one match and allocates nothing. Both versions agree on all 4,075 transactions of
+  the recording.
 - What's left in the feed path is mostly cryptography: about 13 µs of keccak over the
   signed data (~10 KB on average) and about 9 µs for the ECDSA check.
 - Every feed message is signed by the same key. `FixedKey` verifies against that key

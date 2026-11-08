@@ -71,7 +71,7 @@ busiest launchpad and aggregator.
 - In a 4337 bundle the sender is a bundler, so `actor` is the wallet inside it. In a
   Relay fill it is the wallet delivered to. `None` means the sender.
 - A transaction with no known selector costs one match and allocates nothing. Decoding
-  every transaction of a message takes about 0.5 µs, against 22 µs in Python.
+  every transaction of a message takes about 0.5 µs, against 25 µs in Python.
 - An intent is what the calldata claims, not what happened. The transaction can still
   revert.
 
