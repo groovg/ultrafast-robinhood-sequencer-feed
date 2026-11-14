@@ -114,24 +114,46 @@ fn long_len(buf: &[u8], start: usize, end: usize) -> Result<usize, &'static str>
 
 /// Offsets of every item in the RLP list at the head of `buf`. Nested lists are skipped
 /// over by length, not descended into.
+#[cfg(test)]
 fn scan_list(buf: &[u8]) -> Result<Vec<Field>, &'static str> {
+    scan(buf).map(|(fields, _)| fields)
+}
+
+/// What geth's decoder would object to in a list, noted while scanning it, so checking
+/// costs no second pass. One bit per item for the first 32.
+#[derive(Clone, Copy, Default)]
+struct Shape {
+    /// Items that are lists, not strings.
+    lists: u32,
+    /// Items whose payload starts with a zero byte: a non-canonical integer.
+    zero_led: u32,
+    /// Every length prefix, the list's own included, is in its shortest form, and the
+    /// list ends where `buf` does.
+    strict: bool,
+}
+
+/// `scan_list`, plus the list's `Shape`.
+fn scan(buf: &[u8]) -> Result<(Vec<Field>, Shape), &'static str> {
     let &head = buf.first().ok_or("empty")?;
     if head < 0xC0 {
         return Err("not an RLP list");
     }
+    let mut shape = Shape {
+        strict: true,
+        ..Shape::default()
+    };
     let (mut i, end) = if head < 0xF8 {
         (1, 1 + usize::from(head - 0xC0))
     } else {
         let s = 1 + usize::from(head - 0xF7);
-        (
-            s,
-            s.checked_add(long_len(buf, 1, s)?)
-                .ok_or("RLP length overflow")?,
-        )
+        let len = long_len(buf, 1, s)?;
+        shape.strict = buf[1] != 0 && len >= 56;
+        (s, s.checked_add(len).ok_or("RLP length overflow")?)
     };
     if end > buf.len() {
         return Err("truncated RLP list");
     }
+    shape.strict &= end == buf.len();
 
     let mut out = Vec::with_capacity(16);
     while i < end {
@@ -143,23 +165,31 @@ fn scan_list(buf: &[u8]) -> Result<Vec<Field>, &'static str> {
             // bytes, long form above it with the length's length in the prefix.
             let short = usize::from(c - if c < 0xC0 { 0x80 } else { 0xC0 });
             if short < 56 {
+                // A byte under 0x80 has to encode itself, not sit in a 1-byte string.
+                shape.strict &= c != 0x81 || buf.get(i + 1).is_none_or(|&b| b >= 0x80);
                 (i + 1, i + 1 + short)
             } else {
                 let s = i + 1 + (short - 55);
-                (
-                    s,
-                    s.checked_add(long_len(buf, i + 1, s)?)
-                        .ok_or("RLP length overflow")?,
-                )
+                let len = long_len(buf, i + 1, s)?;
+                shape.strict &= buf[i + 1] != 0 && len >= 56;
+                (s, s.checked_add(len).ok_or("RLP length overflow")?)
             }
         };
+        if let Some(bit) = 1u32.checked_shl(out.len() as u32) {
+            if c >= 0xC0 {
+                shape.lists |= bit;
+            }
+            if e > s && buf.get(s) == Some(&0) {
+                shape.zero_led |= bit;
+            }
+        }
         out.push((i, s, e));
         i = e;
     }
     if i != end {
         return Err("malformed RLP list");
     }
-    Ok(out)
+    Ok((out, shape))
 }
 
 fn rlp_header(len: usize, offset: u8, out: &mut Vec<u8>) {
@@ -279,10 +309,11 @@ struct Modeled {
     value: (usize, usize),
     data: (usize, usize),
     fields: Vec<Field>,
+    shape: Shape,
 }
 
 fn model(body: &[u8], layout: [usize; 5], uint256_value: bool) -> Option<Modeled> {
-    let fields = scan_list(body).ok()?;
+    let (fields, shape) = scan(body).ok()?;
     let [ni, gi, ti, vi, di] = layout;
     if fields.len() < di + 4 {
         return None; // payload fields plus v, r, s
@@ -307,6 +338,7 @@ fn model(body: &[u8], layout: [usize; 5], uint256_value: bool) -> Option<Modeled
         value: (fields[vi].1, fields[vi].2),
         data: (fields[di].1, fields[di].2),
         fields,
+        shape,
     })
 }
 
@@ -558,6 +590,11 @@ impl std::fmt::Debug for Tx {
 
 /// One signed transaction envelope: legacy, 2930, 1559, blob or 7702.
 pub fn decode_transaction(raw: Bytes) -> Option<Tx> {
+    decode_shaped(raw).map(|(tx, _)| tx)
+}
+
+/// `decode_transaction`, plus the envelope's `Shape` for `geth_accepts`.
+fn decode_shaped(raw: Bytes) -> Option<(Tx, Shape)> {
     let &head = raw.first()?;
     let typed = head < 0x80;
     let tx_type = if typed { head } else { 0 };
@@ -565,7 +602,7 @@ pub fn decode_transaction(raw: Bytes) -> Option<Tx> {
     // A type we don't handle, or one that doesn't parse: keep just the hash and raw bytes.
     let m = layout(tx_type).and_then(|l| model(&raw[body..], l, tx_type >= 3));
     let m = m.unwrap_or_default();
-    Some(Tx {
+    let tx = Tx {
         raw,
         tx_type,
         nonce: m.nonce,
@@ -580,7 +617,8 @@ pub fn decode_transaction(raw: Bytes) -> Option<Tx> {
         body,
         hash: OnceLock::new(),
         sender: OnceLock::new(),
-    })
+    };
+    Some((tx, m.shape))
 }
 
 /// Walk an l2Msg, flattening nested batches into the signed transactions inside.
@@ -606,8 +644,8 @@ fn walk(payload: &Bytes, depth: usize, out: &mut Vec<Tx>) -> Result<(), Rejected
     let &kind = payload.first().ok_or(Rejected)?;
     match kind {
         L2_SIGNED_TX => {
-            let tx = decode_transaction(payload.slice(1..)).ok_or(Rejected)?;
-            if !geth_accepts(&tx) {
+            let (tx, shape) = decode_shaped(payload.slice(1..)).ok_or(Rejected)?;
+            if !geth_accepts(&tx, shape) {
                 return Err(Rejected);
             }
             out.push(tx);
@@ -651,49 +689,40 @@ fn walk(payload: &Bytes, depth: usize, out: &mut Vec<Tx>) -> Result<(), Rejected
 /// Whether geth's `UnmarshalBinary` decodes this envelope and arbos then takes it.
 ///
 /// `decode_transaction` keeps any envelope, for its hash. Inside an l2Msg one that geth
-/// refuses voids the whole message. Each envelope is checked field by field against the
-/// Go type it decodes into: `8` uint64, `i` big.Int, `u` uint256, `a` optional address,
-/// `A` address, `b` bytes, `l` list. Integers must be canonical (no leading zero), and so
-/// must every length prefix. Blob envelopes decode, but parseL2Message refuses them.
+/// refuses voids the whole message. Each field is checked against the Go type it decodes
+/// into: lists must be lists and everything else strings, integers can't have a leading
+/// zero (and 7702's are uint256), every length prefix must be in its shortest form, and
+/// nothing may follow the list. `scan` noted all of that in `shape` on its one pass, and
+/// `model` has held nonce and gas to 64 bits, `to` to 0 or 20 bytes, and a 7702 value to
+/// 256 bits. Blob envelopes decode, but parseL2Message refuses them.
 ///
 /// shortcut: the items inside access and authorization lists aren't checked. The
 /// Python version checks only the field count and trailing bytes.
-fn geth_accepts(tx: &Tx) -> bool {
-    let spec: &[u8] = match tx.raw.first() {
-        Some(0xc0..) => b"8i8aibiii",
-        Some(1) => b"i8i8aibliii",
-        Some(2) => b"i8ii8aibliii",
-        Some(4) => b"u8uu8Aublluuu",
+fn geth_accepts(tx: &Tx, shape: Shape) -> bool {
+    // Field count, then one bit per field for lists and one for integers.
+    let (count, lists, ints) = match tx.raw.first() {
+        // nonce gasPrice gas to value data v r s
+        Some(0xc0..) => (9, 0, 0b1_1101_0111),
+        // chainId nonce gasPrice gas to value data accessList v r s
+        Some(1) => (11, 1 << 7, 0b111_0010_1111),
+        // chainId nonce tip feeCap gas to value data accessList v r s
+        Some(2) => (12, 1 << 8, 0b1110_0101_1111),
+        // the same, plus authorizationList, with every integer a uint256 and `to` a plain
+        // address, since a 7702 transaction can't create a contract
+        Some(4) => {
+            let wide = |k: usize| INTS_7702 >> k & 1 != 0 && tx.fields[k].2 - tx.fields[k].1 > 32;
+            if tx.fields.len() != 13 || (0..13).any(wide) || tx.to_bytes.is_none() {
+                return false;
+            }
+            (13, 0b11 << 8, INTS_7702)
+        }
         _ => return false,
     };
-    let (body, f) = (tx.body(), &tx.fields);
-    // rlp.DecodeBytes also refuses bytes after the list.
-    if f.len() != spec.len() || f.last().is_some_and(|l| l.2 != body.len()) {
-        return false;
-    }
-    if body[0] >= 0xf8 && (body[1] == 0 || body.len() - f[0].0 < 56) {
-        return false; // the list's own length in long form, where short form fits
-    }
-    f.iter().zip(spec).all(|(&(i, s, e), &want)| {
-        let (head, payload) = (body[i], &body[s..e]);
-        let canonical = match head {
-            0x81 => payload[0] >= 0x80,
-            0xb8..=0xbf | 0xf8.. => body[i + 1] != 0 && e - s >= 56,
-            _ => true,
-        };
-        let int = |max: usize| payload.first() != Some(&0) && payload.len() <= max;
-        canonical
-            && (head >= 0xc0) == (want == b'l')
-            && match want {
-                b'8' => int(8),
-                b'i' => int(usize::MAX),
-                b'u' => int(32),
-                b'a' => payload.is_empty() || payload.len() == 20,
-                b'A' => payload.len() == 20,
-                _ => true,
-            }
-    })
+    shape.strict && tx.fields.len() == count && shape.lists == lists && shape.zero_led & ints == 0
 }
+
+/// The integer fields of a 7702 envelope, one bit each.
+const INTS_7702: u32 = 0b1_1100_0101_1111;
 
 // --------------------------------------------------------------------------- //
 // transactions arbos builds from parent-chain messages

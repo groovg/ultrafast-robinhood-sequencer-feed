@@ -545,3 +545,36 @@ fn a_parent_chain_payload_past_the_size_cap_is_refused() {
         assert_eq!(count(&entry), 0, "{seq}");
     }
 }
+
+#[test]
+fn a_7702_envelope_without_to_or_with_a_wide_integer_is_refused() {
+    let all = golden();
+    let case = all.iter().find(|g| g["l2msg"] == "eip7702").unwrap();
+    let l2 = hex::decode(case["hex"].as_str().unwrap()).unwrap();
+    let raw = &l2[1..]; // 0x04 || list
+    let fields = rlp_items(&raw[1..]);
+    let with = |k: usize, item: &[u8]| {
+        let mut items = fields.clone();
+        items[k] = item.to_vec();
+        let content = items.concat();
+        let env = [vec![4u8], rlp_list_header(content.len()), content].concat();
+        decode_l2_message(&Bytes::from([vec![L2_SIGNED_TX], env].concat())).len()
+    };
+    assert_eq!(with(1, &fields[1]), 1, "re-encoded as is");
+    assert_eq!(with(5, &[0x80]), 0, "no to");
+    let wide = [[0xa1u8].as_slice(), &[1; 33]].concat();
+    assert_eq!(with(2, &wide), 0, "a 33-byte tip");
+    // The same envelope's list header in long form, although it would fit the short one.
+    let content: Vec<u8> = fields.concat();
+    if content.len() < 256 {
+        let env = [vec![4u8, 0xf8, content.len() as u8], content.clone()].concat();
+        let short_fits = content.len() < 56;
+        let got = decode_l2_message(&Bytes::from([vec![L2_SIGNED_TX], env].concat())).len();
+        assert_eq!(got, usize::from(!short_fits));
+    }
+    // Nine empty fields: legacy, 9 bytes, so the long form is refused.
+    let short = [vec![L2_SIGNED_TX, 0xc9], vec![0x80; 9]].concat();
+    let long = [vec![L2_SIGNED_TX, 0xf8, 9], vec![0x80; 9]].concat();
+    assert_eq!(decode_l2_message(&Bytes::from(short)).len(), 1);
+    assert!(decode_l2_message(&Bytes::from(long)).is_empty());
+}
