@@ -483,10 +483,32 @@ impl Job {
             let Some(&tx) = self.txs.get(i) else {
                 return;
             };
-            // SAFETY: `recover` waits until every index handed out here is done, so the
-            // transaction is still borrowed. An index past the end follows no pointer.
+            // Counted even if recovery panics, so `recover_while` can't wait forever.
+            let _done = Done(&self.done);
+            // SAFETY: `recover_while` waits until every index handed out here is done, so
+            // the transaction is still borrowed. An index past the end follows no pointer.
             unsafe { (*tx).sender_bytes() };
-            self.done.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+struct Done<'a>(&'a AtomicUsize);
+
+impl Drop for Done<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Finishes a job and waits for the other threads, on return or while unwinding: they
+/// hold pointers to transactions that are only borrowed for that call.
+struct Finish<'a>(&'a Job);
+
+impl Drop for Finish<'_> {
+    fn drop(&mut self) {
+        self.0.work();
+        while self.0.done.load(Ordering::Acquire) < self.0.txs.len() {
+            std::hint::spin_loop();
         }
     }
 }
@@ -560,11 +582,9 @@ impl SenderPool {
         drop(sample);
         *self.job.lock().unwrap_or_else(|e| e.into_inner()) = Some(job.clone());
         self.epoch.fetch_add(1, Ordering::Release);
+        let finish = Finish(&job);
         let out = f();
-        job.work();
-        while job.done.load(Ordering::Acquire) < job.txs.len() {
-            std::hint::spin_loop();
-        }
+        drop(finish);
         *self.job.lock().unwrap_or_else(|e| e.into_inner()) = None;
         out
     }
@@ -1080,18 +1100,14 @@ impl FeedMessage {
     }
 }
 
-/// Every message in a frame, transactions decoded. One frame can carry several.
-pub fn parse_frame(frame: &Frame) -> Vec<FeedMessage> {
-    parse_frame_on(frame, None)
-}
-
-/// `parse_frame`, plus the transactions arbos builds from SubmitRetryable and EthDeposit
-/// messages, whose hashes cover the chain id.
-pub fn parse_frame_on(frame: &Frame, chain_id: Option<u64>) -> Vec<FeedMessage> {
+/// Every message in a frame, transactions decoded. One frame can carry several. With
+/// `chain_id`, SubmitRetryable and EthDeposit messages carry the transaction arbos builds
+/// from them, whose hash covers the chain id.
+pub fn parse_frame(frame: &Frame, chain_id: Option<u64>) -> Vec<FeedMessage> {
     frame
         .entries()
         .iter()
-        .map(|e| parse_entry_on(e, l2_msg(e).ok().flatten().as_ref(), chain_id))
+        .map(|e| parse_entry_with(e, l2_msg(e).ok().flatten().as_ref(), chain_id))
         .collect()
 }
 
@@ -1107,13 +1123,8 @@ pub fn l2_msg(entry: &Entry) -> Result<Option<Bytes>, base64_simd::Error> {
 
 /// One entry of a frame, with its l2Msg already decoded by `l2_msg`. Transactions are
 /// decoded only if `l2` is given, which is how the consumer skips decoding the backlog.
-pub fn parse_entry_with(entry: &Entry, l2: Option<&Bytes>) -> FeedMessage {
-    parse_entry_on(entry, l2, None)
-}
-
-/// `parse_entry_with`, plus the transaction of a SubmitRetryable or EthDeposit message
-/// when `chain_id` is given.
-pub fn parse_entry_on(entry: &Entry, l2: Option<&Bytes>, chain_id: Option<u64>) -> FeedMessage {
+/// `chain_id` as in `parse_frame`.
+pub fn parse_entry_with(entry: &Entry, l2: Option<&Bytes>, chain_id: Option<u64>) -> FeedMessage {
     let header = entry.header();
     let kind = header.and_then(|h| h.kind).unwrap_or(-1);
     // Only an L2Message carries signed transactions. Other kinds lay out l2Msg their own
@@ -1282,6 +1293,19 @@ mod tests {
     }
 
     #[test]
+    fn a_panic_in_recover_while_still_finishes_the_job() {
+        let legacy = Bytes::from_static(b"\xc9\x80\x80\x80\x80\x80\x80\x80\x80\x80");
+        let txs: Vec<Tx> = (0..4)
+            .map(|_| decode_transaction(legacy.clone()).unwrap())
+            .collect();
+        let mut pool = SenderPool::new(0);
+        let run = std::panic::AssertUnwindSafe(|| pool.recover_while(&txs, || panic!("boom")));
+        assert!(std::panic::catch_unwind(run).is_err());
+        // Every sender was worked out before the panic left recover_while.
+        assert!(txs.iter().all(|t| t.sender.get().is_some()));
+    }
+
+    #[test]
     fn junk_does_not_panic() {
         for junk in [
             &b"\x02\xff\xff"[..],
@@ -1309,7 +1333,7 @@ mod tests {
         for (kind, txs) in [(3, 1), (12, 0)] {
             let text = json(kind);
             let frame = frame_from_slice(text.as_bytes()).unwrap();
-            let msg = parse_entry_with(&frame.entries()[0], Some(&l2));
+            let msg = parse_entry_with(&frame.entries()[0], Some(&l2), None);
             assert_eq!(msg.txs.len(), txs, "kind {kind}");
         }
     }
