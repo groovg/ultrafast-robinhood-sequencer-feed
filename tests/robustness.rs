@@ -120,7 +120,7 @@ fn mutated_transactions_never_panic() {
     let lines = capture();
     let raws: Vec<Bytes> = lines
         .iter()
-        .flat_map(|l| parse_frame(&frame_from_slice(l.as_bytes()).unwrap()))
+        .flat_map(|l| parse_frame(&frame_from_slice(l.as_bytes()).unwrap(), None))
         .flat_map(|m| m.txs)
         .map(|t| t.raw)
         .collect();
@@ -164,7 +164,7 @@ fn mutated_frames_never_panic() {
                 let _ = MAINNET_VERIFIER.accepts(entry);
             }
         }
-        for msg in parse_frame(&frame) {
+        for msg in parse_frame(&frame, None) {
             msg.txs.iter().for_each(touch);
         }
     }
@@ -193,7 +193,7 @@ fn mutated_calldata_never_panics() {
     let lines = capture();
     let mut datas: Vec<Vec<u8>> = lines
         .iter()
-        .flat_map(|l| parse_frame(&frame_from_slice(l.as_bytes()).unwrap()))
+        .flat_map(|l| parse_frame(&frame_from_slice(l.as_bytes()).unwrap(), None))
         .flat_map(|m| m.txs)
         .map(|t| t.data().to_vec())
         .filter(|d| d.len() >= 4)

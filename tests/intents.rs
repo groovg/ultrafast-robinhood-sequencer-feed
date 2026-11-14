@@ -78,7 +78,7 @@ fn intents_match_the_python_baseline() {
     let frames = std::fs::read_to_string(root.join("tests/fixtures/frames.jsonl")).unwrap();
     let mut txs = HashMap::new();
     for line in frames.lines().filter(|l| !l.trim().is_empty()) {
-        for msg in parse_frame(&frame_from_slice(line.as_bytes()).unwrap()) {
+        for msg in parse_frame(&frame_from_slice(line.as_bytes()).unwrap(), None) {
             for tx in msg.txs {
                 txs.insert(tx.hash_hex(), tx);
             }

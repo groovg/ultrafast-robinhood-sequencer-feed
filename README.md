@@ -77,11 +77,12 @@ busiest launchpad and aggregator.
 
 ## Plugging it into a bot
 
-Add the crate as a git dependency:
+Add the crate as a git dependency. `default-features = false` leaves out the `rhfeed`
+command and its argument parser:
 
 ```toml
 [dependencies]
-rhfeed = { git = "https://github.com/groovg/ultrafast-robinhood-sequencer-feed" }
+rhfeed = { git = "https://github.com/groovg/ultrafast-robinhood-sequencer-feed", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 

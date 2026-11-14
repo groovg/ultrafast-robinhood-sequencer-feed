@@ -17,8 +17,8 @@ use rhfeed::codec::{
 };
 use rhfeed::{
     FEED_PREFIX, MAINNET_CHAIN_ID, MAINNET_SIGNER, MAINNET_VERIFIER, SenderPool, Tx, Verifier,
-    decode_transaction, frame_from_slice, parse_frame, parse_frame_on, recover_senders,
-    recover_signer, signature_payload,
+    decode_transaction, frame_from_slice, parse_frame, recover_senders, recover_signer,
+    signature_payload,
 };
 
 fn golden() -> Vec<Value> {
@@ -82,7 +82,7 @@ fn every_captured_frame_decodes_exactly_as_python_does() {
     for line in golden().iter().filter(|g| g.get("line").is_some()) {
         let i = line["line"].as_u64().unwrap() as usize;
         let frame = frame_from_slice(frames[i].as_bytes()).unwrap();
-        let got = parse_frame(&frame);
+        let got = parse_frame(&frame, None);
         let want = line["messages"].as_array().unwrap();
         assert_eq!(got.len(), want.len(), "frame {i}");
         for (m, w) in got.iter().zip(want) {
@@ -115,7 +115,7 @@ fn recovering_senders_in_bulk_matches_python() {
     for line in golden().iter().filter(|g| g.get("line").is_some()) {
         let i = line["line"].as_u64().unwrap() as usize;
         let frame = frame_from_slice(frames[i].as_bytes()).unwrap();
-        for (m, w) in parse_frame(&frame)
+        for (m, w) in parse_frame(&frame, None)
             .iter()
             .zip(line["messages"].as_array().unwrap())
         {
@@ -504,7 +504,7 @@ fn deposits_and_retryables_are_built_as_python_and_the_node_do() {
         let name = case["parent"].as_str().unwrap();
         let json = format!(r#"{{"messages":[{}]}}"#, case["entry"]);
         let frame = frame_from_slice(json.as_bytes()).unwrap();
-        let msgs = parse_frame_on(&frame, case["chain_id"].as_u64());
+        let msgs = parse_frame(&frame, case["chain_id"].as_u64());
         let msg = &msgs[0];
         let want = case["txs"].as_array().unwrap();
         assert_eq!(msg.txs.len(), want.len(), "{name}");
@@ -531,9 +531,7 @@ fn a_parent_chain_payload_past_the_size_cap_is_refused() {
         let count = |entry: &Value| {
             let json = format!(r#"{{"messages":[{entry}]}}"#);
             let frame = frame_from_slice(json.as_bytes()).unwrap();
-            parse_frame_on(&frame, case["chain_id"].as_u64())[0]
-                .txs
-                .len()
+            parse_frame(&frame, case["chain_id"].as_u64())[0].txs.len()
         };
         assert_eq!(count(&entry), 1, "{seq}");
         let l2 = &mut entry["message"]["message"]["l2Msg"];

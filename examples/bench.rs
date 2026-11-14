@@ -51,7 +51,7 @@ fn main() {
     let messages: usize = frames.iter().map(|f| f.entries().len()).sum();
     let raws: Vec<Bytes> = frames
         .iter()
-        .flat_map(|f| parse_frame(f))
+        .flat_map(|f| parse_frame(f, None))
         .flat_map(|m| m.txs)
         .map(|t| t.raw)
         .collect();
@@ -100,7 +100,7 @@ fn main() {
     let frame_us = best_of(50, messages, || {
         for line in &lines {
             let frame = frame_from_slice(black_box(line).as_bytes()).unwrap();
-            black_box(parse_frame(&frame));
+            black_box(parse_frame(&frame, None));
         }
     });
     println!("{:<44}{frame_us:>10.3}", "frame JSON -> decoded txs");
@@ -125,7 +125,7 @@ fn main() {
     });
     println!("{:<44}{b64_us:>10.3}", "  of which base64 l2Msg");
     // Trade intents from the calldata of every transaction, on decoded messages.
-    let decoded: Vec<_> = frames.iter().flat_map(|f| parse_frame(f)).collect();
+    let decoded: Vec<_> = frames.iter().flat_map(|f| parse_frame(f, None)).collect();
     let intents_us = best_of(200, messages, || {
         for m in &decoded {
             for t in &m.txs {
@@ -193,7 +193,7 @@ fn main() {
             for e in frame.entries() {
                 let l2 = rhfeed::codec::l2_msg(e).unwrap();
                 if MAINNET_VERIFIER.accepts_with(e, l2.as_deref()) {
-                    black_box(rhfeed::codec::parse_entry_with(e, l2.as_ref()));
+                    black_box(rhfeed::codec::parse_entry_with(e, l2.as_ref(), None));
                 }
             }
         }
@@ -212,7 +212,7 @@ fn main() {
             for e in frame.entries() {
                 let l2 = rhfeed::codec::l2_msg(e).unwrap();
                 if MAINNET_VERIFIER.accepts_with(e, l2.as_deref()) {
-                    black_box(rhfeed::codec::parse_entry_with(e, l2.as_ref()));
+                    black_box(rhfeed::codec::parse_entry_with(e, l2.as_ref(), None));
                 }
             }
             started.elapsed().as_secs_f64() * 1e6
@@ -227,7 +227,7 @@ fn main() {
     let full_us = best_of(10, messages, || {
         for line in &lines {
             let frame = frame_from_slice(black_box(line).as_bytes()).unwrap();
-            for (e, m) in frame.entries().iter().zip(parse_frame(&frame)) {
+            for (e, m) in frame.entries().iter().zip(parse_frame(&frame, None)) {
                 black_box(recover_signer(e, MAINNET_CHAIN_ID));
                 for t in &m.txs {
                     black_box((t.hash(), t.to(), t.sender()));
@@ -242,7 +242,7 @@ fn main() {
     // Senders of one message's transactions: one at a time, then all at once.
     let messages_txs: Vec<Vec<Bytes>> = frames
         .iter()
-        .flat_map(|f| parse_frame(f))
+        .flat_map(|f| parse_frame(f, None))
         .map(|m| m.txs.into_iter().map(|t| t.raw).collect())
         .collect();
     let decoded = || -> Vec<Vec<rhfeed::Tx>> {
