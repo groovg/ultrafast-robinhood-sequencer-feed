@@ -202,6 +202,7 @@ async fn a_feed_of_another_chain_is_refused_when_verifying() {
             err.contains("chain 46630") && err.contains("chain 4663,"),
             "{err}"
         );
+        assert!(!err.contains("  ") && !err.contains('\n'), "{err:?}");
     }
 }
 

@@ -852,7 +852,8 @@ impl Source {
     fn check_chain(&self, announced: Option<u64>) -> Result<(), String> {
         match (&self.shared.verify, announced) {
             (Some(v), Some(chain)) if chain != v.chain_id => Err(format!(
-                "{} serves chain {chain}, and the verifier checks chain {}, so it would drop \n                 every message. Not retrying",
+                "{} serves chain {chain}, and the verifier checks chain {}, so it would drop \
+                 every message. Not retrying",
                 self.name, v.chain_id
             )),
             _ => Ok(()),
