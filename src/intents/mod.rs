@@ -24,6 +24,7 @@ mod uniswap;
 mod universal_router;
 mod zerox;
 
+use std::cell::Cell;
 use std::fmt::Write as _;
 use std::sync::LazyLock;
 
@@ -37,6 +38,10 @@ pub const MAX_DEPTH: usize = 8;
 
 /// The `to`, one per nesting level, one for a 0x target, and room to spare.
 const VIA_MAX: usize = 12;
+
+/// Calls and array elements one transaction may cost. Offsets in nested containers can
+/// all point at the same bytes, so without a cap a few KB fan out into millions of calls.
+pub const BUDGET: u32 = 4096;
 
 /// What an intent asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -78,9 +83,13 @@ impl Via {
         path: [[0; 20]; VIA_MAX],
     };
 
+    /// None past 3 addresses, which leaves room for every level of nesting.
     pub fn from_slice(path: &[[u8; 20]]) -> Option<Via> {
+        if path.len() > VIA_MAX - MAX_DEPTH - 1 {
+            return None;
+        }
         let mut via = Via::EMPTY;
-        via.path.get_mut(..path.len())?.copy_from_slice(path);
+        via.path[..path.len()].copy_from_slice(path);
         via.len = path.len() as u8;
         Some(via)
     }
@@ -125,6 +134,8 @@ pub struct Call<'a> {
     /// None means the transaction sender.
     pub actor: Option<[u8; 20]>,
     pub via: Via,
+    /// What is left of the transaction's `BUDGET`, shared by every call nested in it.
+    pub budget: &'a Cell<u32>,
 }
 
 impl<'a> Call<'a> {
@@ -141,7 +152,26 @@ impl<'a> Call<'a> {
             data,
             actor: actor.or(self.actor),
             via: self.via.with(to)?,
+            budget: self.budget,
         })
+    }
+}
+
+/// Take `n` steps from the budget, or empty it and fail, so the whole transaction says
+/// nothing.
+pub(crate) fn spend(budget: &Cell<u32>, n: usize) -> Result<()> {
+    match u32::try_from(n)
+        .ok()
+        .and_then(|n| budget.get().checked_sub(n))
+    {
+        Some(left) => {
+            budget.set(left);
+            Ok(())
+        }
+        None => {
+            budget.set(0);
+            Err(Malformed)
+        }
     }
 }
 
@@ -303,7 +333,7 @@ pub(crate) const PONS_BUY: u32 = 0xc1120e3d;
 
 /// Append `call`'s intents to `out`. One that doesn't fit its layout adds nothing.
 pub fn decode_call(call: &Call, depth: usize, out: &mut Vec<Intent>) {
-    if depth > MAX_DEPTH || call.data.len() < 4 {
+    if depth > MAX_DEPTH || call.data.len() < 4 || spend(call.budget, 1).is_err() {
         return;
     }
     let selector = u32::from_be_bytes(call.data[..4].try_into().unwrap());
@@ -358,12 +388,14 @@ pub fn decode(to: Option<[u8; 20]>, value: &[u8], data: &[u8]) -> Vec<Intent> {
     };
     let mut v = [0u8; 32];
     v[pad..].copy_from_slice(&value[skip..]);
+    let budget = Cell::new(BUDGET);
     let call = Call {
         to,
         value: v,
         data,
         actor: None,
         via: to.map_or(Via::EMPTY, |t| Via::EMPTY.with(t).unwrap()),
+        budget: &budget,
     };
     if let (Some(to), true, true) = (to, data.is_empty(), skip < value.len()) {
         return vec![Intent {
@@ -374,6 +406,9 @@ pub fn decode(to: Option<[u8; 20]>, value: &[u8], data: &[u8]) -> Vec<Intent> {
     }
     let mut out = Vec::new();
     decode_call(&call, 0, &mut out);
+    if budget.get() == 0 {
+        out.clear(); // a transaction built to fan out: say nothing rather than part of it
+    }
     out
 }
 

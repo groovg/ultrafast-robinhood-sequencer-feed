@@ -225,13 +225,14 @@ fn mutated_calldata_never_panics() {
             }
             data[at..at + 32].copy_from_slice(&word);
         }
-        let path: Vec<[u8; 20]> = (0..rng.below(13)).map(|_| [rng.next() as u8; 20]).collect();
+        let path: Vec<[u8; 20]> = (0..rng.below(4)).map(|_| [rng.next() as u8; 20]).collect();
         let call = Call {
             to: (rng.below(4) != 0).then(|| [rng.next() as u8; 20]),
             value: [rng.next() as u8; 32],
             data: &data,
             actor: (rng.below(2) == 0).then(|| [rng.next() as u8; 20]),
             via: Via::from_slice(&path).unwrap(),
+            budget: &std::cell::Cell::new(rhfeed::intents::BUDGET),
         };
         let mut out = Vec::new();
         decode_call(&call, rng.below(10), &mut out);

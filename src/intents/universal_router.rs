@@ -93,7 +93,7 @@ fn v4_single(call: &Call, p: &[u8], exact_in: bool) -> Result<Intent> {
 fn v4_multi(call: &Call, p: &[u8], exact_in: bool) -> Result<Option<Intent>> {
     let body = tuple_at(p, 0)?;
     let named = token(body, 0)?;
-    let path = tuple_array(body, 1)?;
+    let path = tuple_array(body, 1, call.budget)?;
     let (Some(head), Some(tail)) = (path.first(), path.last()) else {
         return Ok(None);
     };
@@ -114,7 +114,7 @@ fn v4_multi(call: &Call, p: &[u8], exact_in: bool) -> Result<Option<Intent>> {
 
 fn v4(call: &Call, p: &[u8], out: &mut Vec<Intent>) -> Result<()> {
     let actions = dynamic(p, 0)?;
-    let params = bytes_array(p, 1)?;
+    let params = bytes_array(p, 1, call.budget)?;
     if params.len() < actions.len() {
         return Err(Malformed);
     }
@@ -134,7 +134,7 @@ fn v4(call: &Call, p: &[u8], out: &mut Vec<Intent>) -> Result<()> {
 pub fn execute(call: &Call, out: &mut Vec<Intent>) -> Result<()> {
     let d = &call.data[4..];
     let commands = dynamic(d, 0)?;
-    let inputs = bytes_array(d, 1)?;
+    let inputs = bytes_array(d, 1, call.budget)?;
     if inputs.len() < commands.len() {
         return Err(Malformed);
     }

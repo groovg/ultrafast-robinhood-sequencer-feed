@@ -6,7 +6,7 @@ use super::{Call, Intent, Kind};
 
 pub fn swap(call: &Call, out: &mut Vec<Intent>) -> Result<()> {
     let d = &call.data[4..];
-    let steps = tuple_array(d, 0)?;
+    let steps = tuple_array(d, 0, call.budget)?;
     let (Some(first), Some(last)) = (steps.first(), steps.last()) else {
         return Ok(());
     };

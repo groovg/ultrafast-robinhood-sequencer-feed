@@ -125,7 +125,7 @@ pub fn v2(call: &Call, out: &mut Vec<Intent>, selector: u32) -> Result<()> {
 
 /// Same contract, same msg.value: multicall is a `delegatecall` to itself.
 pub fn multicall(call: &Call, depth: usize, out: &mut Vec<Intent>, blobs: usize) -> Result<()> {
-    for blob in bytes_array(&call.data[4..], blobs)?.iter() {
+    for blob in bytes_array(&call.data[4..], blobs, call.budget)?.iter() {
         decode_call(
             &Call {
                 data: blob,

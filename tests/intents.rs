@@ -1,11 +1,12 @@
 //! Intents against the Python version's, from `tests/golden_intents.jsonl`.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
 
 use serde_json::Value;
 
-use rhfeed::intents::{Call, Intent, Via, decode, decode_call};
+use rhfeed::intents::{BUDGET, Call, Intent, Via, decode, decode_call};
 use rhfeed::{codec::decimal, frame_from_slice, parse_frame};
 
 fn hex20(v: &Value) -> Option<[u8; 20]> {
@@ -100,6 +101,7 @@ fn intents_match_the_python_baseline() {
                 data: &data,
                 actor: hex20(&c["actor"]),
                 via: Via::from_slice(&via).unwrap(),
+                budget: &Cell::new(BUDGET),
             };
             let mut out = Vec::new();
             decode_call(&call, 0, &mut out);
@@ -136,6 +138,7 @@ fn intents_match_the_python_baseline() {
                     data: &data[..len],
                     actor: None,
                     via: Via::from_slice(&[to]).unwrap(),
+                    budget: &Cell::new(BUDGET),
                 };
                 let mut out = Vec::new();
                 decode_call(&call, 0, &mut out);
@@ -166,4 +169,51 @@ fn json_matches_the_python_shape() {
             r = rhfeed::checksum(&[0x22; 20]),
         )
     );
+}
+
+/// `multicall(bytes[])` whose `n` elements all point at the same `inner` bytes.
+fn aliased_multicall(inner: &[u8], n: usize) -> Vec<u8> {
+    let word = |v: usize| {
+        let mut w = [0u8; 32];
+        w[24..].copy_from_slice(&(v as u64).to_be_bytes());
+        w
+    };
+    let mut d = vec![0xac, 0x96, 0x50, 0xd8];
+    d.extend(word(32)); // the array starts right after this slot
+    d.extend(word(n));
+    for _ in 0..n {
+        d.extend(word(32 * n)); // every element: the one body after the offsets
+    }
+    d.extend(word(inner.len()));
+    d.extend(inner);
+    d.resize(4 + (d.len() - 4).next_multiple_of(32), 0);
+    d
+}
+
+#[test]
+fn a_transaction_built_to_fan_out_costs_a_bounded_amount_and_says_nothing() {
+    let to = [9u8; 20];
+    let mut transfer = vec![0xa9, 0x05, 0x9c, 0xbb];
+    transfer.extend([0u8; 12]);
+    transfer.extend([7u8; 20]);
+    transfer.extend([0u8; 31]);
+    transfer.push(5);
+    // Three real transfers in one multicall still decode.
+    assert_eq!(
+        decode(Some(to), &[], &aliased_multicall(&transfer, 3)).len(),
+        3
+    );
+    // Eight levels of six aliased elements: 6^8 = 1,679,616 transfers without a cap.
+    let mut bomb = transfer.clone();
+    for _ in 0..8 {
+        bomb = aliased_multicall(&bomb, 6);
+    }
+    let started = std::time::Instant::now();
+    assert!(decode(Some(to), &[], &bomb).is_empty());
+    assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    // Wide instead of deep: 2,000 elements at each of two levels.
+    let wide = aliased_multicall(&aliased_multicall(&transfer, 2000), 2000);
+    let started = std::time::Instant::now();
+    assert!(decode(Some(to), &[], &wide).is_empty());
+    assert!(started.elapsed() < std::time::Duration::from_millis(50));
 }

@@ -1,5 +1,9 @@
 //! Read ABI-encoded arguments slot by slot. Refuses the same bad inputs as `abi.py`.
 
+use std::cell::Cell;
+
+use super::spend;
+
 pub const WORD: usize = 32;
 pub const ZERO: [u8; 20] = [0; 20];
 /// What Uniswap, 0x and others use for native ETH where an ERC-20 address is expected.
@@ -128,12 +132,16 @@ fn checked(area: &[u8], n: usize, bytes: bool) -> Result<Dynamic<'_>> {
     Ok(array)
 }
 
-pub fn tuple_array(d: &[u8], i: usize) -> Result<Dynamic<'_>> {
+/// Dynamic tuples. Each element costs one step of `budget`, paid before any is read.
+pub fn tuple_array<'a>(d: &'a [u8], i: usize, budget: &Cell<u32>) -> Result<Dynamic<'a>> {
     let (area, n) = elements(d, i, 1)?;
+    spend(budget, n)?;
     checked(area, n, false)
 }
 
-pub fn bytes_array(d: &[u8], i: usize) -> Result<Dynamic<'_>> {
+/// `bytes[]`, paid for like `tuple_array`.
+pub fn bytes_array<'a>(d: &'a [u8], i: usize, budget: &Cell<u32>) -> Result<Dynamic<'a>> {
     let (area, n) = elements(d, i, 1)?;
+    spend(budget, n)?;
     checked(area, n, true)
 }

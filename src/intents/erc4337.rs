@@ -7,7 +7,7 @@ use super::abi::{
 use super::{Call, Intent, decode_call};
 
 pub fn handle_ops(call: &Call, depth: usize, out: &mut Vec<Intent>) -> Result<()> {
-    for op in tuple_array(&call.data[4..], 0)?.iter() {
+    for op in tuple_array(&call.data[4..], 0, call.budget)?.iter() {
         let wallet = address(op, 0)?;
         let inner = call.inner(wallet, [0; 32], dynamic(op, 3)?, Some(wallet))?;
         decode_call(&inner, depth + 1, out);
@@ -23,7 +23,7 @@ pub fn execute(call: &Call, depth: usize, out: &mut Vec<Intent>) -> Result<()> {
 }
 
 pub fn execute_batch(call: &Call, depth: usize, out: &mut Vec<Intent>) -> Result<()> {
-    for c in tuple_array(&call.data[4..], 0)?.iter() {
+    for c in tuple_array(&call.data[4..], 0, call.budget)?.iter() {
         let inner = call.inner(address(c, 0)?, uint(c, 1)?, dynamic(c, 2)?, None)?;
         decode_call(&inner, depth + 1, out);
     }
@@ -35,7 +35,7 @@ pub fn execute_batch_parallel(call: &Call, depth: usize, out: &mut Vec<Intent>) 
     let (targets, values, datas) = (
         static_array(d, 0, 1)?,
         static_array(d, 1, 1)?,
-        bytes_array(d, 2)?,
+        bytes_array(d, 2, call.budget)?,
     );
     if targets.len() != values.len() || values.len() != datas.len() {
         return Err(Malformed);
@@ -49,7 +49,7 @@ pub fn execute_batch_parallel(call: &Call, depth: usize, out: &mut Vec<Intent>) 
 
 pub fn execute_batch_no_values(call: &Call, depth: usize, out: &mut Vec<Intent>) -> Result<()> {
     let d = &call.data[4..];
-    let (targets, datas) = (static_array(d, 0, 1)?, bytes_array(d, 1)?);
+    let (targets, datas) = (static_array(d, 0, 1)?, bytes_array(d, 1, call.budget)?);
     if targets.len() != datas.len() {
         return Err(Malformed);
     }

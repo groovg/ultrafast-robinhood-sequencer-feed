@@ -27,7 +27,7 @@ fn walk(
     found: &mut Vec<Intent>,
 ) -> Result<Option<[u8; 20]>> {
     let mut executor_token = None;
-    for c in tuple_array(calls, 2)?.iter() {
+    for c in tuple_array(calls, 2, call.budget)?.iter() {
         let (target, value, data) = (address(c, 0)?, uint(c, 2)?, dynamic(c, 3)?);
         if data
             .get(..4)
