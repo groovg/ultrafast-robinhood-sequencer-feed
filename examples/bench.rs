@@ -1,11 +1,6 @@
-//! The Rust half of the Python vs Rust benchmark. `bench/bench.py` is the Python half and
-//! measures the same things the same way (best of N rounds).
+//! The Rust half of the benchmark; `bench/bench.py` is the Python half.
 //!
 //!     cargo run --release --example bench [capture.jsonl]
-//!     cargo run --release --example bench --features ufsecp [capture.jsonl]
-//!
-//! Each per-transaction row reads one more field than the row above it, so the
-//! difference between two rows is what that field costs.
 
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -19,11 +14,10 @@ use rhfeed::{
     keccak, parse_frame, recover_signer, signature_payload,
 };
 
-/// A digest, r, s and recovery id.
 type Sig = ([u8; 32], [u8; 32], [u8; 32], u8);
 type Recover = fn(&[u8; 32], &[u8; 32], &[u8; 32], u8) -> Option<[u8; 20]>;
 
-/// Microseconds per item, best round. Best rather than mean: noise only ever adds time.
+/// Microseconds per item, best round: noise only ever adds time.
 fn best_of(rounds: usize, items: usize, mut f: impl FnMut()) -> f64 {
     f(); // warm up: caches, and ufsecp's one-time precompute tables
     let mut best = f64::INFINITY;
@@ -104,7 +98,6 @@ fn main() {
         }
     });
     println!("{:<44}{frame_us:>10.3}", "frame JSON -> decoded txs");
-    // Where that goes: the JSON alone, then the base64 inside it.
     let sonic_us = best_of(50, messages, || {
         for line in &lines {
             black_box(frame_from_slice(black_box(line).as_bytes()).unwrap());
@@ -124,7 +117,6 @@ fn main() {
         }
     });
     println!("{:<44}{b64_us:>10.3}", "  of which base64 l2Msg");
-    // Trade intents from the calldata of every transaction, on decoded messages.
     let decoded: Vec<_> = frames.iter().flat_map(|f| parse_frame(f, None)).collect();
     let intents_us = best_of(200, messages, || {
         for m in &decoded {
@@ -137,9 +129,8 @@ fn main() {
         "{:<44}{intents_us:>10.3}",
         "intents, every tx (decode_intents)"
     );
-    // Before any of that, yawc inflates the frame (permessage-deflate). The feed's own
-    // compressed bytes aren't recorded, so recompress the capture the way the protocol
-    // does: one raw deflate stream over the whole connection, a sync flush per message.
+    // The capture holds inflated frames, so recompress them as permessage-deflate does:
+    // one raw stream, a sync flush per message.
     let packed: Vec<Vec<u8>> = {
         use flate2::{Compress, Compression, FlushCompress};
         let mut c = Compress::new(Compression::default(), false);
@@ -185,8 +176,7 @@ fn main() {
         "{:<44}{recover_us:>10.3}",
         "  recovering the signer instead"
     );
-    // What Feed does to every new live message before handing it over: the latency
-    // this crate adds on top of the network.
+    // What Feed does to every new live message before handing it over.
     let path_us = best_of(20, messages, || {
         for line in &lines {
             let frame = frame_from_slice(black_box(line).as_bytes()).unwrap();
@@ -199,9 +189,7 @@ fn main() {
         }
     });
     println!("{:<44}{path_us:>10.3}", "feed path: parse, verify, decode");
-    // The live feed sends a frame every ~100 ms, and in between the caches go cold, which
-    // a tight loop never shows. So: the same work with a 100 ms sleep before each message,
-    // median of 100 (takes 10 s).
+    // Caches go cold between live frames (~100 ms apart), which a tight loop never shows.
     let mut paced: Vec<f64> = lines
         .iter()
         .take(100)
@@ -239,7 +227,6 @@ fn main() {
         "{:<44}{full_us:>10.3}",
         "all of it: frame, signature, every sender"
     );
-    // Senders of one message's transactions: one at a time, then all at once.
     let messages_txs: Vec<Vec<Bytes>> = frames
         .iter()
         .flat_map(|f| parse_frame(f, None))
@@ -279,8 +266,7 @@ fn main() {
             rayon::current_num_threads()
         )
     );
-    // Again with a 20 ms pause before each message, which is when rayon's threads fall
-    // asleep. Median of 100 messages.
+    // A 20 ms pause lets rayon's threads fall asleep.
     let paced = |recover: &mut dyn FnMut(&[rhfeed::Tx])| {
         let mut us: Vec<f64> = decoded()
             .iter()
@@ -302,14 +288,13 @@ fn main() {
     );
     let mut pool = rhfeed::SenderPool::new(7);
     let pool_paced = paced(&mut |txs| pool.recover(txs));
-    // Its threads spin until it's dropped, and would slow down every row after this.
+    // Its spinning threads would slow down every later row.
     drop(pool);
     println!(
         "{:<44}{pool_paced:>10.3}",
         "every sender, SenderPool (7 threads), 20 ms"
     );
 
-    // The bare primitive, on the feed signatures' real digests.
     let sigs: Vec<Sig> = entries
         .iter()
         .map(|e| {

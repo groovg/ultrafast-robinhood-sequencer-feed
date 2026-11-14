@@ -1,13 +1,5 @@
-//! ERC-4337 bundles and the account calls inside them.
-//!
-//! The transaction sender is a bundler and tells you nothing. Each operation's `sender`
-//! is the wallet, and becomes `actor` for everything decoded under it. Its `callData` is
-//! a call on the wallet: `execute`, or one of the `executeBatch` shapes
-//! (Simple7702Account's tuple array, SimpleAccount v0.7's three parallel arrays, and the
-//! older two arrays without values). Those carry the calls the user wanted.
-//!
-//! v0.7 and v0.8 share the packed struct and the selector. v0.6 is unpacked, keyed
-//! differently, and not here.
+//! ERC-4337 bundles. Each operation's `sender` is the wallet and becomes `actor`.
+//! EntryPoint v0.7 and v0.8 share the packed struct; v0.6 isn't handled.
 
 use super::abi::{
     Malformed, Result, address, bytes_array, dynamic, static_array, tuple_array, uint,

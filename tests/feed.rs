@@ -1,5 +1,4 @@
-//! Runs `Feed` against real WebSocket servers on localhost. Covers what the unit tests
-//! can't: handshake headers, the backlog, reconnects, and two sources at once.
+//! `Feed` against local WebSocket servers.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -39,9 +38,8 @@ async fn server(scripts: Vec<Vec<Message>>) -> (String, mpsc::UnboundedReceiver<
     server_with(scripts, None).await
 }
 
-/// A feed server. Each accepted connection reports its requested sequence number, then
-/// gets the next script from `scripts` sent to it, frame by frame, and is closed. With
-/// `chain`, the handshake response announces that chain id, as Nitro relays do.
+/// Each connection reports its requested sequence number, gets the next script and is
+/// closed. With `chain`, the handshake announces that chain id.
 // The handshake callback's error type is tungstenite's, not ours to shrink.
 #[allow(clippy::result_large_err)]
 async fn server_with(
@@ -72,7 +70,6 @@ async fn server_with(
             )
             .await
             .unwrap();
-            // A test that does not care about the header has dropped the receiver.
             let _ = requested_tx.send(requested.lock().unwrap().clone());
             for msg in script {
                 // The client may have hung up, which some tests expect.
@@ -185,7 +182,6 @@ async fn a_feed_can_recover_the_senders_itself() {
     let mut feed = Feed::builder().source(url).senders(2).spawn();
     let msg = next(&mut feed).await;
     assert_eq!((msg.seq, msg.txs.len()), (8, 1));
-    // The test transaction has an empty signature, so it has no sender either way.
     assert_eq!(msg.txs[0].sender_bytes(), None);
 }
 
@@ -199,7 +195,6 @@ async fn a_feed_of_another_chain_is_refused_when_verifying() {
             .verify(rhfeed::MAINNET_VERIFIER.clone())
             .busy_poll(busy)
             .spawn();
-        // The only source stops for good, so the stream ends instead of retrying.
         let end = tokio::time::timeout(Duration::from_secs(5), feed.recv()).await;
         assert!(matches!(end, Ok(None)), "busy {busy}");
         let err = feed.stats().sources[0].error.clone().unwrap();

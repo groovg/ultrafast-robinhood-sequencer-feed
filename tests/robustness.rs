@@ -1,10 +1,5 @@
-//! The decoder reads untrusted bytes from the network, so no input may make it panic.
-//!
-//! We take real transactions, batches and frames from the recording, break them at
-//! random (flip bits, cut them short, add junk, rewrite length prefixes) and read every
-//! field, including the lazy ones. The random generator is seeded, so failures
-//! reproduce. Set `RHFEED_ROUNDS` for a longer run than CI does. 500,000 rounds in
-//! release mode passed on 2026-09-23.
+//! No input may make the decoder panic. Real data broken at random, seeded so failures
+//! reproduce. `RHFEED_ROUNDS` for a longer run.
 
 use std::path::Path;
 
@@ -16,7 +11,6 @@ use rhfeed::{
     parse_frame, recover_signer,
 };
 
-/// xorshift64*: small, fast, and good enough to pick bytes to break.
 struct Rng(u64);
 
 impl Rng {
@@ -95,7 +89,6 @@ fn capture() -> Vec<String> {
     .collect()
 }
 
-/// Every l2Msg in the capture, raw.
 fn l2_messages(lines: &[String]) -> Vec<Vec<u8>> {
     lines
         .iter()
@@ -184,8 +177,7 @@ fn random_bytes_never_panic() {
     }
 }
 
-/// Calldata from the capture and from the intent fixture, broken at random, with the
-/// ABI's offset and length words as the favourite targets, under random paths.
+/// ABI offset and length words are the favourite targets.
 #[test]
 fn mutated_calldata_never_panics() {
     use rhfeed::intents::{Call, Via, decode_call};

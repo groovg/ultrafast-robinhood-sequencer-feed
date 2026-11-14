@@ -1,16 +1,6 @@
-//! Uniswap Universal Router: `execute(commands, inputs[, deadline])`.
-//!
-//! One byte per command, one ABI-encoded blob per command. Only the swap commands are
-//! read; wraps, sweeps, permits and NFT commands are skipped by position. `V4_SWAP`
-//! nests another (actions, params) pair with the same shape.
-//!
-//! A bad input anywhere voids the whole `execute`. That matches the chain for a failing
-//! command without the allow-revert flag (the router reverts the whole call), at the
-//! cost of missing swaps next to a failed allow-revert command or an unknown layout.
-//!
-//! Constants from universal-router `Commands.sol` and v4-periphery `Actions.sol`, as the
-//! Python version read them on 2026-10-07. The command byte is masked with 0x7f; 0x80 is
-//! the allow-revert flag.
+//! Uniswap Universal Router: `execute(commands, inputs[, deadline])`. Only swap commands
+//! are read. A bad input voids the whole call, as the router reverts it unless the
+//! allow-revert flag (0x80) is set. Constants from `Commands.sol` and `Actions.sol`.
 
 use super::abi::{
     Malformed, Result, address, bytes_array, dynamic, static_array, token, tuple_array, tuple_at,

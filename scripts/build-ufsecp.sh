@@ -4,12 +4,10 @@
 #   scripts/build-ufsecp.sh [dir] [march]
 #   export UFSECP_LIB_DIR=<dir>/build
 #
-# dir defaults to ./ufsecp. march defaults to "native", which is fastest but only runs
-# on CPUs like the one that built it. Use x86-64-v3 for anything you ship (CI, Docker).
-# Linux and macOS. For Windows see the README.
+# march defaults to "native"; use x86-64-v3 for anything you ship. Linux and macOS.
 set -euo pipefail
 
-# The commit we test against. Bump it deliberately and rerun `cargo test --features ufsecp`.
+# Bump deliberately and rerun `cargo test --features ufsecp`.
 COMMIT=38b066beab3142d2c6d27df8380f3a618023f3ab
 
 dir=${1:-ufsecp}
@@ -21,8 +19,7 @@ fi
 git -C "$dir" fetch --quiet --depth 1 origin "$COMMIT"
 git -C "$dir" checkout --quiet "$COMMIT"
 
-# OpenMP is only used for batch operations, and would need its runtime linked.
-# LTO would leave LLVM bitcode in the .a files, which the Rust linker can't read.
+# No OpenMP (batch-only, needs its runtime). No LTO: the Rust linker can't read bitcode.
 cmake -S "$dir" -B "$dir/build" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \

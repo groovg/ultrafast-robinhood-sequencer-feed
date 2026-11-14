@@ -1,9 +1,5 @@
-//! Pons, the chain's busiest launchpad by fees. `0xc1120e3d` is its buy.
-//!
-//! No signature database knows the selector, so there is no ABI. The Python version's
-//! authors read the layout from captured calldata and confirmed it against two receipts
-//! on 2026-10-07. Always `value > 0`, which is the ETH spent. Calldata is exactly ten
-//! static words:
+//! Pons's buy, `0xc1120e3d`. No public ABI: the layout was read from calldata and checked
+//! against receipts. `value` is the ETH spent. Ten static words:
 //!
 //! ```text
 //! 0 router (a Universal Router deployment)   5 recipient
@@ -24,8 +20,7 @@ const V4_POOL_MANAGER: [u8; 20] = [
 
 pub fn buy(call: &Call, out: &mut Vec<Intent>) -> Result<()> {
     let d = &call.data[4..];
-    // Ten static words whose second is the V4 PoolManager: that pair is the
-    // fingerprint, since the selector alone could belong to anything.
+    // The selector alone could belong to anything; the PoolManager in word 1 confirms it.
     if d.len() != 10 * WORD || address(d, 1)? != V4_POOL_MANAGER {
         return Ok(());
     }

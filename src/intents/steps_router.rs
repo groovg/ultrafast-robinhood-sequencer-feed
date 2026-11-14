@@ -1,10 +1,5 @@
-//! An unnamed aggregator router: `swap(steps[], recipient, amountIn, amountOutMin[,
-//! deadline])`.
-//!
-//! Three deployments carry about a seventh of the chain's transactions. The source is
-//! not published, so the step layout was read from captured calls by the Python
-//! version's authors and confirmed against receipts on 2026-10-07: slot 1 of a step is
-//! the input token, slot 2 the output.
+//! An unnamed aggregator: `swap(steps[], recipient, amountIn, amountOutMin[, deadline])`.
+//! No published source; slot 1 of a step is the input token, slot 2 the output.
 
 use super::abi::{Result, token, tuple_array, uint};
 use super::{Call, Intent, Kind};

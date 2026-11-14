@@ -2,8 +2,7 @@
 
     uv run --project ../robinhood-chain-sequencer-feed python bench/bench.py [capture.jsonl]
 
-Same rows, same method (best of N rounds, one warm-up), same capture. Frames are parsed
-with orjson, as the consumer does.
+Same rows and method (best of N rounds); frames parsed with orjson, as the consumer does.
 """
 
 from __future__ import annotations
@@ -81,7 +80,6 @@ def main() -> None:
     print(f"{'feed signature check':<44}{best_of(5, len(entries), verify):>10.3f}")
 
     def feed_path():
-        # What the consumer does to a new live message with verification on.
         for line in lines:
             frame = loads(line)
             for e in frame.get("messages") or ():

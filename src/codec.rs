@@ -1,13 +1,4 @@
-//! Decode Nitro sequencer-feed frames into transactions. No I/O, just bytes in and
-//! values out.
-//!
-//! Ported from the Python version's `src/rhfeed/codec.py`, whose docstring explains the
-//! design. Two differences. If a field can't fit the type geth would parse it into (a
-//! nonce or gas over 64 bits, a blob or 7702 value over 256 bits, a `to` that isn't
-//! empty or 20 bytes), we keep only the hash and raw bytes, where Python passes the odd
-//! value through. Inside an l2Msg, an envelope is held to everything geth's decoder
-//! checks on its fields (types, canonical integers and lengths), where Python checks
-//! only the field count and trailing bytes.
+//! Decode Nitro sequencer-feed frames into transactions. No I/O.
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -22,9 +13,8 @@ use serde::Deserialize;
 /// arbostypes: the L1 message kind whose l2Msg holds sequenced transactions.
 pub const L1_L2_MESSAGE: i64 = 3;
 
-/// arbos/parse_l2.go: L2 message kinds. Only Batch and SignedTx carry the user
-/// transactions a consumer cares about. 0 and 1 are unsigned transactions an L1 sender
-/// posts through the delayed inbox; arbos runs them, but they are not surfaced.
+/// arbos/parse_l2.go: L2 message kinds. 0 and 1 are unsigned delayed-inbox transactions;
+/// arbos runs them, but they are not surfaced.
 pub const L2_UNSIGNED_USER_TX: u8 = 0;
 pub const L2_CONTRACT_TX: u8 = 1;
 pub const L2_BATCH: u8 = 3;
@@ -39,16 +29,10 @@ pub const MAX_L2_MESSAGE_SIZE: usize = 256 * 1024;
 const FILTER_PRECOMPILE: &str = "0x0000000000000000000000000000000000000074";
 const IS_FILTERED_SELECTOR: &str = "0x85c733a4";
 
-// --------------------------------------------------------------------------- //
-// helpers for building filters
-// --------------------------------------------------------------------------- //
-
-/// Standard base64 with padding, as Nitro writes it. SIMD: ~3x the `base64` crate.
 pub(crate) fn b64(s: &str) -> Option<Vec<u8>> {
     base64_simd::STANDARD.decode_to_vec(s).ok()
 }
 
-/// Keccak-256 through XKCP's assembly, ~1.2x tiny-keccak. The same crate alloy uses.
 pub fn keccak(data: &[u8]) -> [u8; 32] {
     Keccak256::digest(data).into()
 }
@@ -70,17 +54,17 @@ fn fixed<const N: usize>(value: &str, what: &str) -> Result<[u8; N], String> {
         .map_err(|_| format!("not a {N}-byte {what}: {value:?} is {len} bytes"))
 }
 
-/// 4-byte selector from its hex form, with or without the 0x.
+/// 4-byte selector from hex, with or without the 0x.
 pub fn sel(hex_selector: &str) -> Result<[u8; 4], String> {
     fixed(hex_selector, "selector")
 }
 
-/// 20 raw bytes from a hex address, for membership tests against `Tx::to_bytes`.
+/// 20 raw bytes from a hex address, to compare with `Tx::to_bytes`.
 pub fn addr(hex_address: &str) -> Result<[u8; 20], String> {
     fixed(hex_address, "address")
 }
 
-/// EIP-55 checksummed hex. Costs one keccak, which is why `Tx::to` is computed on demand.
+/// EIP-55 checksummed hex. Costs one keccak.
 pub fn checksum(address: &[u8]) -> String {
     let lower = hex::encode(address);
     let digest = keccak(lower.as_bytes());
@@ -97,14 +81,9 @@ pub fn checksum(address: &[u8]) -> String {
     out
 }
 
-// --------------------------------------------------------------------------- //
-// RLP: a scanner, not a parser
-// --------------------------------------------------------------------------- //
-
 /// (item_start, payload_start, payload_end). `item_start` keeps the length prefix.
 type Field = (usize, usize, usize);
 
-/// Big-endian length of a long-form prefix, bounds-checked against `buf`.
 fn long_len(buf: &[u8], start: usize, end: usize) -> Result<usize, &'static str> {
     let bytes = buf.get(start..end).ok_or("truncated RLP")?;
     Ok(bytes
@@ -112,27 +91,24 @@ fn long_len(buf: &[u8], start: usize, end: usize) -> Result<usize, &'static str>
         .fold(0usize, |acc, &b| acc << 8 | usize::from(b)))
 }
 
-/// Offsets of every item in the RLP list at the head of `buf`. Nested lists are skipped
-/// over by length, not descended into.
 #[cfg(test)]
 fn scan_list(buf: &[u8]) -> Result<Vec<Field>, &'static str> {
     scan(buf).map(|(fields, _)| fields)
 }
 
-/// What geth's decoder would object to in a list, noted while scanning it, so checking
-/// costs no second pass. One bit per item for the first 32.
+/// What geth's decoder would object to in a list, noted during the scan so checking needs
+/// no second pass. One bit per item for the first 32.
 #[derive(Clone, Copy, Default)]
 struct Shape {
-    /// Items that are lists, not strings.
     lists: u32,
-    /// Items whose payload starts with a zero byte: a non-canonical integer.
+    /// Payload starts with a zero byte: a non-canonical integer.
     zero_led: u32,
-    /// Every length prefix, the list's own included, is in its shortest form, and the
-    /// list ends where `buf` does.
+    /// Every length prefix is in its shortest form and the list ends where `buf` does.
     strict: bool,
 }
 
-/// `scan_list`, plus the list's `Shape`.
+/// Offsets of every item in the RLP list at the head of `buf`, without descending into
+/// nested lists.
 fn scan(buf: &[u8]) -> Result<(Vec<Field>, Shape), &'static str> {
     let &head = buf.first().ok_or("empty")?;
     if head < 0xC0 {
@@ -159,13 +135,11 @@ fn scan(buf: &[u8]) -> Result<(Vec<Field>, Shape), &'static str> {
     while i < end {
         let c = buf[i];
         let (s, e) = if c < 0x80 {
-            (i, i + 1) // the byte is its own payload
+            (i, i + 1)
         } else {
-            // Strings and lists share a layout, offset by 0x40: short form under 56
-            // bytes, long form above it with the length's length in the prefix.
             let short = usize::from(c - if c < 0xC0 { 0x80 } else { 0xC0 });
             if short < 56 {
-                // A byte under 0x80 has to encode itself, not sit in a 1-byte string.
+                // A byte under 0x80 must encode itself, not sit in a 1-byte string.
                 shape.strict &= c != 0x81 || buf.get(i + 1).is_none_or(|&b| b >= 0x80);
                 (i + 1, i + 1 + short)
             } else {
@@ -218,7 +192,6 @@ fn rlp_uint(value: u128) -> Vec<u8> {
     }
 }
 
-/// `prefix || rlp_list(content)`, built in one allocation.
 fn rlp_list(prefix: &[u8], content: &[&[u8]]) -> Vec<u8> {
     let len: usize = content.iter().map(|c| c.len()).sum();
     let mut out = Vec::with_capacity(prefix.len() + 9 + len);
@@ -234,7 +207,7 @@ fn be_uint<const N: usize>(bytes: &[u8]) -> Option<u128> {
     (bytes.len() <= N).then(|| bytes.iter().fold(0u128, |acc, &b| acc << 8 | u128::from(b)))
 }
 
-/// A big-endian unsigned integer of any length as a decimal string.
+/// A big-endian unsigned integer of any length, in decimal.
 pub fn decimal(be: &[u8]) -> String {
     let mut n = be.to_vec();
     let mut digits = Vec::new();
@@ -260,12 +233,8 @@ fn pad32(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
-// --------------------------------------------------------------------------- //
-// transactions
-// --------------------------------------------------------------------------- //
-
 /// Field positions per envelope type: (nonce, gas, to, value, data). The signature is
-/// always the final three fields, found by counting back from the end.
+/// the last three fields.
 fn layout(tx_type: u8) -> Option<[usize; 5]> {
     match tx_type {
         0 => Some([0, 2, 3, 4, 5]), // legacy: nonce gasPrice gas to value data v r s
@@ -275,10 +244,8 @@ fn layout(tx_type: u8) -> Option<[usize; 5]> {
     }
 }
 
-/// One signed transaction as the sequencer ordered it, without its outcome.
-///
-/// Cheap and eager: `tx_type`, `nonce`, `gas`, `value_be`, `to_bytes`, `selector`.
-/// Expensive and lazy: `hash` (cached), `to` (a keccak), `sender` (ECDSA, cached).
+/// One signed transaction as the sequencer ordered it, without its outcome. The public
+/// fields are free; `hash`, `to` and `sender` cost a keccak or an ECDSA recovery.
 pub struct Tx {
     pub raw: Bytes,
     pub tx_type: u8,
@@ -289,10 +256,9 @@ pub struct Tx {
     pub data_len: usize,
     value: (usize, usize),
     data: (usize, usize),
-    /// The calldata of a transaction arbos builds from a parent-chain message, which
-    /// isn't a slice of its envelope. None for a signed one.
+    /// Calldata of a transaction built from a parent-chain message, not in its envelope.
     input: Option<Box<[u8]>>,
-    /// Empty for an envelope this does not model; offsets are into `raw[body..]`.
+    /// Offsets into `raw[body..]`. Empty for an envelope this does not model.
     fields: Vec<Field>,
     body: usize,
     hash: OnceLock<[u8; 32]>,
@@ -324,8 +290,7 @@ fn model(body: &[u8], layout: [usize; 5], uint256_value: bool) -> Option<Modeled
         to => Some(to.try_into().ok()?),
     };
     let data = item(di);
-    // Blob and 7702 values are uint256 in geth. Older types use a big.Int, which can be
-    // longer: such a transaction decodes, so its siblings in an l2Msg still execute.
+    // Only blob and 7702 values are uint256 in geth; older types take a longer big.Int.
     if uint256_value && item(vi).len() > 32 {
         return None;
     }
@@ -347,7 +312,6 @@ impl Tx {
         &self.raw[self.body..]
     }
 
-    /// keccak of the envelope. Cached.
     pub fn hash(&self) -> &[u8; 32] {
         self.hash.get_or_init(|| keccak(&self.raw))
     }
@@ -361,7 +325,7 @@ impl Tx {
         self.to_bytes.as_ref().map(|t| checksum(t))
     }
 
-    /// Recovers the sender with ECDSA, by far the most expensive thing here. Cached.
+    /// ECDSA recovery, by far the most expensive call here. Cached.
     pub fn sender_bytes(&self) -> Option<[u8; 20]> {
         *self.sender.get_or_init(|| self.recover())
     }
@@ -370,17 +334,16 @@ impl Tx {
         self.sender_bytes().map(|s| checksum(&s))
     }
 
-    /// Value in wei, big-endian and minimal as RLP stores it (empty for zero).
+    /// Value in wei, minimal big-endian (empty for zero).
     pub fn value_be(&self) -> &[u8] {
         &self.body()[self.value.0..self.value.1]
     }
 
-    /// Value in wei as a decimal string, since it can be bigger than any integer type.
     pub fn value_dec(&self) -> String {
         decimal(self.value_be())
     }
 
-    /// The calldata. Empty for a plain transfer and for an envelope this does not model.
+    /// The calldata. Empty for an envelope this does not model.
     pub fn data(&self) -> &[u8] {
         match &self.input {
             Some(input) => input,
@@ -414,8 +377,7 @@ impl Tx {
         }
 
         let (parity, payload) = if self.tx_type == 0 {
-            // EIP-155 folds the chain id into v; pre-155 signatures use 27/28 and sign
-            // only the first six fields.
+            // EIP-155 folds the chain id into v; pre-155 uses 27/28 over six fields.
             let unsigned = &body[f[0].0..f[5].2];
             if v >= 35 {
                 let chain = rlp_uint((v - 35) >> 1);
@@ -429,7 +391,6 @@ impl Tx {
                 return None;
             }
         } else {
-            // Typed envelopes sign type || rlp(everything but the signature).
             if v > 1 {
                 return None;
             }
@@ -439,24 +400,17 @@ impl Tx {
     }
 }
 
-/// Recover the sender of every transaction in `txs` at once and cache it, so later
-/// `sender()` calls are free. The transactions are spread over all cores with rayon.
-///
-/// Between feed messages (~100 ms) rayon's threads fall asleep, and waking them costs
-/// most of the gain: a message's ~7 senders took ~225 µs after a 20 ms pause, against
-/// ~95 µs in a tight loop and ~300 µs one by one. `SenderPool` avoids that.
+/// Recover and cache every sender in `txs` on all cores (rayon). rayon's threads sleep
+/// between messages and waking them costs most of the gain; `SenderPool` avoids that.
 pub fn recover_senders<'a>(txs: impl IntoIterator<Item = &'a Tx>) {
     let txs: Vec<&Tx> = txs.into_iter().collect();
-    // Each Tx caches its sender in a OnceLock, which is safe to fill from any thread.
     txs.par_iter().for_each(|t| {
         t.sender_bytes();
     });
 }
 
-/// Threads that spin waiting for senders to recover, so they start at once, and keep
-/// their caches warm meanwhile. A message's ~7 senders took 64-68 µs after a 20 ms
-/// pause with 7 threads, against ~225 µs with `recover_senders`. Each thread keeps a
-/// core at 100% while the pool exists.
+/// Threads that spin waiting for senders to recover, so they start at once with warm
+/// caches. Each keeps a core at 100% while the pool exists.
 pub struct SenderPool {
     epoch: Arc<AtomicU64>,
     job: Arc<Mutex<Option<Arc<Job>>>>,
@@ -464,7 +418,6 @@ pub struct SenderPool {
     sample: Arc<Mutex<Option<Bytes>>>,
 }
 
-/// The transactions of one `SenderPool::recover` call, and who has taken which.
 struct Job {
     txs: Vec<*const Tx>,
     next: AtomicUsize,
@@ -500,8 +453,8 @@ impl Drop for Done<'_> {
     }
 }
 
-/// Finishes a job and waits for the other threads, on return or while unwinding: they
-/// hold pointers to transactions that are only borrowed for that call.
+/// Waits for the other threads even while unwinding: they hold pointers to transactions
+/// borrowed only for the call.
 struct Finish<'a>(&'a Job);
 
 impl Drop for Finish<'_> {
@@ -514,8 +467,7 @@ impl Drop for Finish<'_> {
 }
 
 impl SenderPool {
-    /// `threads` spinning threads. The calling thread works too, so a message is spread
-    /// over `threads + 1` cores.
+    /// `threads` spinning threads; the calling thread works too.
     pub fn new(threads: usize) -> Self {
         let pool = Self {
             epoch: Arc::default(),
@@ -534,8 +486,7 @@ impl SenderPool {
                     while !stop.load(Ordering::Relaxed) {
                         let now = epoch.load(Ordering::Acquire);
                         if now == seen {
-                            // Recover a sample every millisecond meanwhile, which keeps
-                            // the code and tables in cache for the next real message.
+                            // A sample every millisecond keeps code and tables in cache.
                             if Instant::now() >= next_warm {
                                 let raw = sample.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                 if let Some(tx) = raw.and_then(decode_transaction) {
@@ -558,7 +509,6 @@ impl SenderPool {
         pool
     }
 
-    /// `recover_senders` on the pool's threads.
     pub fn recover<'a>(&mut self, txs: impl IntoIterator<Item = &'a Tx>) {
         self.recover_while(txs, || ());
     }
@@ -608,18 +558,17 @@ impl std::fmt::Debug for Tx {
     }
 }
 
-/// One signed transaction envelope: legacy, 2930, 1559, blob or 7702.
+/// One signed envelope: legacy, 2930, 1559, blob or 7702. One that doesn't parse keeps
+/// only its hash and raw bytes.
 pub fn decode_transaction(raw: Bytes) -> Option<Tx> {
     decode_shaped(raw).map(|(tx, _)| tx)
 }
 
-/// `decode_transaction`, plus the envelope's `Shape` for `geth_accepts`.
 fn decode_shaped(raw: Bytes) -> Option<(Tx, Shape)> {
     let &head = raw.first()?;
     let typed = head < 0x80;
     let tx_type = if typed { head } else { 0 };
     let body = usize::from(typed);
-    // A type we don't handle, or one that doesn't parse: keep just the hash and raw bytes.
     let m = layout(tx_type).and_then(|l| model(&raw[body..], l, tx_type >= 3));
     let m = m.unwrap_or_default();
     let tx = Tx {
@@ -641,13 +590,9 @@ fn decode_shaped(raw: Bytes) -> Option<(Tx, Shape)> {
     Some((tx, m.shape))
 }
 
-/// Walk an l2Msg, flattening nested batches into the signed transactions inside.
-///
-/// Anything parseL2Message refuses, anywhere in the message, voids the whole l2Msg:
-/// the error goes up through every enclosing batch and the block producer runs the
-/// message with no transactions. So the result is then empty. That covers a batch past
-/// the depth cap, an empty entry, a kind arbos does not run, and an envelope geth's
-/// `UnmarshalBinary` refuses.
+/// The signed transactions in an l2Msg, nested batches flattened. Anything
+/// parseL2Message refuses anywhere voids the whole message, as in the block producer,
+/// so the result is then empty.
 pub fn decode_l2_message(payload: &Bytes) -> Vec<Tx> {
     let mut out = Vec::new();
     if payload.len() > MAX_L2_MESSAGE_SIZE || walk(payload, 0, &mut out).is_err() {
@@ -656,11 +601,9 @@ pub fn decode_l2_message(payload: &Bytes) -> Vec<Tx> {
     out
 }
 
-/// arbos refuses the l2Msg this came from.
 struct Rejected;
 
 fn walk(payload: &Bytes, depth: usize, out: &mut Vec<Tx>) -> Result<(), Rejected> {
-    // No kind byte: parseL2Message fails its first read.
     let &kind = payload.first().ok_or(Rejected)?;
     match kind {
         L2_SIGNED_TX => {
@@ -671,9 +614,8 @@ fn walk(payload: &Bytes, depth: usize, out: &mut Vec<Tx>) -> Result<(), Rejected
             out.push(tx);
         }
         L2_BATCH if depth < MAX_BATCH_DEPTH => {
-            // Repeated [8-byte big-endian length][nested L2 message]. As in
-            // util.BytestringFromReader, a truncated length or body ends the batch and
-            // keeps what came before. A zero length reads an empty message, refused above.
+            // [8-byte length][message], repeated. As in util.BytestringFromReader, a
+            // truncated entry ends the batch and keeps what came before.
             let mut offset = 1;
             while offset + 8 <= payload.len() {
                 let len = u64::from_be_bytes(payload[offset..offset + 8].try_into().unwrap());
@@ -687,8 +629,8 @@ fn walk(payload: &Bytes, depth: usize, out: &mut Vec<Tx>) -> Result<(), Rejected
             }
         }
         L2_UNSIGNED_USER_TX | L2_CONTRACT_TX => {
-            // parseUnsignedTx: 32-byte words for gas limit, max fee, nonce (kind 0 only),
-            // to and value, then calldata. Gas limit and nonce must fit a uint64.
+            // parseUnsignedTx: words for gas limit, max fee, nonce (kind 0), to, value.
+            // Gas limit and nonce must fit a uint64.
             let words = if kind == L2_UNSIGNED_USER_TX { 5 } else { 4 };
             let body = &payload[1..];
             let high_zero = |at: usize| body[at..at + 24].iter().all(|&b| b == 0);
@@ -699,25 +641,18 @@ fn walk(payload: &Bytes, depth: usize, out: &mut Vec<Tx>) -> Result<(), Rejected
                 return Err(Rejected);
             }
         }
-        // A batch past the cap, NonmutatingCall (2) and SignedCompressedTx (7), which are
-        // unimplemented, Heartbeat (6), refused since 2022, and any unknown kind.
+        // A batch past the cap, kinds 2 and 7 (unimplemented), 6 (heartbeat), unknown.
         _ => return Err(Rejected),
     }
     Ok(())
 }
 
-/// Whether geth's `UnmarshalBinary` decodes this envelope and arbos then takes it.
+/// Whether geth's `UnmarshalBinary` decodes this envelope and arbos takes it: each field
+/// matches its Go type (list or string, integers without a leading zero), prefixes are
+/// canonical and nothing follows the list. `model` already bounded nonce, gas, `to` and a
+/// 7702 value. parseL2Message refuses blob envelopes.
 ///
-/// `decode_transaction` keeps any envelope, for its hash. Inside an l2Msg one that geth
-/// refuses voids the whole message. Each field is checked against the Go type it decodes
-/// into: lists must be lists and everything else strings, integers can't have a leading
-/// zero (and 7702's are uint256), every length prefix must be in its shortest form, and
-/// nothing may follow the list. `scan` noted all of that in `shape` on its one pass, and
-/// `model` has held nonce and gas to 64 bits, `to` to 0 or 20 bytes, and a 7702 value to
-/// 256 bits. Blob envelopes decode, but parseL2Message refuses them.
-///
-/// shortcut: the items inside access and authorization lists aren't checked. The
-/// Python version checks only the field count and trailing bytes.
+/// shortcut: items inside access and authorization lists aren't checked.
 fn geth_accepts(tx: &Tx, shape: Shape) -> bool {
     // Field count, then one bit per field for lists and one for integers.
     let (count, lists, ints) = match tx.raw.first() {
@@ -727,8 +662,7 @@ fn geth_accepts(tx: &Tx, shape: Shape) -> bool {
         Some(1) => (11, 1 << 7, 0b111_0010_1111),
         // chainId nonce tip feeCap gas to value data accessList v r s
         Some(2) => (12, 1 << 8, 0b1110_0101_1111),
-        // the same, plus authorizationList, with every integer a uint256 and `to` a plain
-        // address, since a 7702 transaction can't create a contract
+        // + authorizationList; integers are uint256 and `to` can't be empty
         Some(4) => {
             let wide = |k: usize| INTS_7702 >> k & 1 != 0 && tx.fields[k].2 - tx.fields[k].1 > 32;
             if tx.fields.len() != 13 || (0..13).any(wide) || tx.to_bytes.is_none() {
@@ -741,21 +675,15 @@ fn geth_accepts(tx: &Tx, shape: Shape) -> bool {
     shape.strict && tx.fields.len() == count && shape.lists == lists && shape.zero_led & ints == 0
 }
 
-/// The integer fields of a 7702 envelope, one bit each.
 const INTS_7702: u32 = 0b1_1100_0101_1111;
 
-// --------------------------------------------------------------------------- //
-// transactions arbos builds from parent-chain messages
-// --------------------------------------------------------------------------- //
-
-/// arbostypes: the parent-chain kinds arbos turns into one transaction of a type of its
-/// own. Its hash covers the chain id, which the message doesn't carry.
+/// arbostypes: parent-chain kinds arbos turns into a transaction of its own type, whose
+/// hash covers the chain id.
 pub const L1_SUBMIT_RETRYABLE: i64 = 9;
 pub const L1_ETH_DEPOSIT: i64 = 12;
 pub const ARB_DEPOSIT_TX: u8 = 0x64;
 pub const ARB_SUBMIT_RETRYABLE_TX: u8 = 0x69;
-/// A submit-retryable transaction calls the ArbRetryableTx precompile with its own
-/// fields as `submitRetryable(...)` calldata (go-ethereum arb_types.go).
+/// The ArbRetryableTx precompile a submit-retryable calls (go-ethereum arb_types.go).
 const ARB_RETRYABLE_TX: [u8; 20] = {
     let mut a = [0; 20];
     a[19] = 0x6e;
@@ -763,7 +691,6 @@ const ARB_RETRYABLE_TX: [u8; 20] = {
 };
 const SUBMIT_RETRYABLE_SELECTOR: [u8; 4] = [0xc9, 0xf9, 0x5d, 0x32];
 
-/// RLP of a byte string.
 fn rlp_bytes(value: &[u8]) -> Vec<u8> {
     match value {
         [b] if *b < 0x80 => vec![*b],
@@ -776,26 +703,22 @@ fn rlp_bytes(value: &[u8]) -> Vec<u8> {
     }
 }
 
-/// RLP of a big-endian unsigned integer of any width.
 fn rlp_be(value: &[u8]) -> Vec<u8> {
     rlp_bytes(&value[value.iter().take_while(|&&b| b == 0).count()..])
 }
 
-/// A header field arbos reads as `size` raw bytes: a hex string of exactly that length.
 fn header_bytes<const N: usize>(value: Option<&Cow<str>>) -> Option<[u8; N]> {
     unhex(value?, "").ok()?.try_into().ok()
 }
 
-/// The transaction arbos builds from a SubmitRetryable or an EthDeposit message, as
-/// parseSubmitRetryableMessage and parseEthDepositMessage in arbos/parse_l2.go do (nitro
-/// v3.12.2). Its hash, sender, to, value, gas and input match `eth_getTransactionByHash`.
-/// A message arbos refuses gives None. A retryable's auto-redeem (type 0x68) isn't built:
-/// its fields depend on the block's base fee, which the feed doesn't carry.
+/// The transaction arbos builds from a SubmitRetryable or EthDeposit message
+/// (arbos/parse_l2.go, nitro v3.12.2), matching `eth_getTransactionByHash`. None if arbos
+/// refuses the message. The auto-redeem (0x68) needs the block's base fee, which the feed
+/// doesn't carry, so it isn't built.
 pub fn decode_parent_chain_message(header: &Header, payload: &[u8], chain_id: u64) -> Option<Tx> {
     if payload.len() > MAX_L2_MESSAGE_SIZE {
-        return None; // ParseL2Transactions refuses it before looking at the kind
+        return None;
     }
-    // A nil RequestId arrives as JSON null, and parse_l2.go refuses the message.
     let request_id = header_bytes::<32>(header.request_id.as_ref())?;
     let poster = header_bytes::<20>(header.sender.as_ref())?;
     let chain = rlp_uint(chain_id.into());
@@ -803,7 +726,6 @@ pub fn decode_parent_chain_message(header: &Header, payload: &[u8], chain_id: u6
     let address = |w: &[u8; 32]| -> [u8; 20] { w[12..].try_into().unwrap() };
     match header.kind? {
         L1_ETH_DEPOSIT => {
-            // A 20-byte address, then a 32-byte amount, both read with io.ReadFull.
             let (to, value) = (payload.get(..20)?, payload.get(20..52)?);
             let envelope = rlp_list(
                 &[ARB_DEPOSIT_TX],
@@ -815,8 +737,7 @@ pub fn decode_parent_chain_message(header: &Header, payload: &[u8], chain_id: u6
                     &rlp_be(value),
                 ],
             );
-            // The value is the envelope's last field, so its minimal big-endian bytes end
-            // where the envelope does. Offsets are into the body, after the type byte.
+            // The value is the envelope's last field. Offsets are into the body.
             let value_len = 32 - value.iter().take_while(|&&b| b == 0).count();
             let end = envelope.len() - 1;
             let value = (end - value_len, end);
@@ -840,15 +761,14 @@ pub fn decode_parent_chain_message(header: &Header, payload: &[u8], chain_id: u6
                 (word(4), word(5), word(6), word(7), word(8));
             if gas_limit[..24].iter().any(|&b| b != 0) || data_length[..24].iter().any(|&b| b != 0)
             {
-                return None; // the gas limit must fit a uint64, and so must the length
+                return None;
             }
             let gas = u64::from_be_bytes(gas_limit[24..].try_into().unwrap());
             let length = u64::from_be_bytes(data_length[24..].try_into().unwrap()) as usize;
             if length > MAX_L2_MESSAGE_SIZE {
                 return None;
             }
-            // A plain Read, not ReadFull: a short tail is zero-padded, and only none at
-            // all fails.
+            // A plain Read, not ReadFull: a short tail is zero-padded, an empty one fails.
             let tail = &payload[9 * 32..];
             if length > 0 && tail.is_empty() {
                 return None;
@@ -876,8 +796,7 @@ pub fn decode_parent_chain_message(header: &Header, payload: &[u8], chain_id: u6
                     &rlp_bytes(&retry_data),
                 ],
             );
-            // What eth_getTransactionByHash returns as `input`. Addresses are re-padded:
-            // arbos keeps only the low 20 bytes of each word.
+            // eth_getTransactionByHash's `input`, addresses re-padded from their low 20 bytes.
             let pad = |a: [u8; 20]| [[0u8; 12].as_slice(), &a].concat();
             let input = [
                 &SUBMIT_RETRYABLE_SELECTOR[..],
@@ -911,7 +830,7 @@ pub fn decode_parent_chain_message(header: &Header, payload: &[u8], chain_id: u6
     }
 }
 
-/// A transaction arbos builds, with no signature: its sender is the message's poster.
+/// Unsigned: the sender is the message's poster.
 fn built(
     tx_type: u8,
     envelope: Vec<u8>,
@@ -944,12 +863,7 @@ fn built(
     }
 }
 
-// --------------------------------------------------------------------------- //
-// frames
-// --------------------------------------------------------------------------- //
-
-/// serde borrows a bare `Cow<str>` field but copies one inside an `Option`, which for
-/// l2Msg meant copying ~10 KB per frame. This borrows unless the string has escapes.
+/// serde copies a `Cow<str>` inside an `Option`; this borrows unless the string has escapes.
 fn borrowed<'de: 'a, 'a, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<Cow<'a, str>>, D::Error> {
@@ -958,8 +872,7 @@ fn borrowed<'de: 'a, 'a, D: serde::Deserializer<'de>>(
     Ok(Option::<Borrowed>::deserialize(d)?.map(|b| b.0))
 }
 
-/// A relay frame, `{"version":1,"messages":[...]}`, borrowing its strings from the
-/// buffer it was parsed from. Every field is optional, like the Python version's `.get()` calls.
+/// A relay frame, `{"version":1,"messages":[...]}`, borrowing its strings from the input.
 #[derive(Deserialize)]
 pub struct Frame<'a> {
     #[serde(borrow)]
@@ -1011,10 +924,8 @@ pub struct Header<'a> {
     pub base_fee_l1: Option<u128>,
 }
 
-/// Each entry of a frame as JSON text of its own, for a frame that `frame_from_slice`
-/// refuses although it is JSON: one entry with a field of the wrong type fails the whole
-/// frame there. Parse each text with `sonic_rs::from_str` and drop the ones that fail.
-/// Slow, and meant only for that case. None if `json` isn't JSON with a messages array.
+/// Each entry as JSON text of its own, for a frame that `frame_from_slice` refuses because
+/// one entry has a field of the wrong type. Slow; only for that case.
 pub fn entry_texts(json: &[u8]) -> Option<Vec<String>> {
     use sonic_rs::{JsonContainerTrait, JsonValueTrait};
     let frame: sonic_rs::Value = sonic_rs::from_slice(json).ok()?;
@@ -1022,8 +933,7 @@ pub fn entry_texts(json: &[u8]) -> Option<Vec<String>> {
     Some(messages.iter().map(|e| e.to_string()).collect())
 }
 
-/// Parse one relay frame, borrowing its strings from `json`. Uses sonic-rs, which is
-/// about 1.3x faster than serde_json on these frames.
+/// Parse one relay frame, borrowing its strings from `json`.
 pub fn frame_from_slice(json: &[u8]) -> Result<Frame<'_>, sonic_rs::Error> {
     sonic_rs::from_slice(json)
 }
@@ -1044,9 +954,7 @@ impl<'a> Entry<'a> {
     }
 }
 
-/// One sequencer message. On this chain, `seq` equals the L2 block number. See
-/// `FeedMessage` in codec.py for what `block_hash`, `delayed_messages_read` and
-/// `l1_block_number` are good for.
+/// One sequencer message. On this chain, `seq` equals the L2 block number.
 #[derive(Debug)]
 pub struct FeedMessage {
     pub seq: i64,
@@ -1057,23 +965,22 @@ pub struct FeedMessage {
     pub block_hash: Option<String>,
     pub delayed_messages_read: u64,
     pub l1_block_number: u64,
-    /// Set on a message read out of the delayed inbox (its index there), None on one the
-    /// sequencer built.
+    /// The delayed-inbox index; None on a message the sequencer built.
     pub request_id: Option<String>,
-    /// Set by `Feed`; meaningless for a frame decoded straight off disk.
+    /// Set by `Feed`.
     pub live: bool,
-    /// Unix seconds when the first copy of this message arrived, from any source.
+    /// Unix seconds when the first copy arrived.
     pub received_at: f64,
-    /// This sequence number arrived before, carrying a different block hash.
+    /// This sequence number arrived before with a different block hash.
     pub reorg: bool,
-    /// Index into `Feed`'s sources of the one that delivered this message first.
+    /// Index of the source that delivered this message first.
     pub source: usize,
-    /// When each stage of `Feed` finished with this message. None off disk.
+    /// When each stage of `Feed` finished with this message.
     pub timing: Option<crate::consume::Timing>,
 }
 
 impl FeedMessage {
-    /// arbostypes: L1 message kinds. Anything but L2Message reached the chain through Ethereum.
+    /// arbostypes' name for the L1 message kind.
     pub fn l1_kind_name(&self) -> Cow<'static, str> {
         Cow::Borrowed(match self.l1_kind {
             L1_L2_MESSAGE => "L2Message",
@@ -1090,19 +997,15 @@ impl FeedMessage {
         })
     }
 
-    /// Entered through Ethereum, not the sequencer: every kind but L2Message, and an
-    /// L2Message an L1 sender posted to the delayed inbox. The sequencer leaves out a
-    /// transaction that fails to apply. A delayed message keeps whatever was posted, and
-    /// the block producer skips, with no receipt, a transaction whose signature, nonce or
-    /// balance doesn't hold. Treat these `txs` as claims, not as what will execute.
+    /// Entered through Ethereum, not the sequencer. Nobody checked these `txs`: a node
+    /// skips one whose signature, nonce or balance doesn't hold, without a receipt.
     pub fn from_parent_chain(&self) -> bool {
         self.request_id.is_some() || self.l1_kind != L1_L2_MESSAGE
     }
 }
 
-/// Every message in a frame, transactions decoded. One frame can carry several. With
-/// `chain_id`, SubmitRetryable and EthDeposit messages carry the transaction arbos builds
-/// from them, whose hash covers the chain id.
+/// Every message in a frame, transactions decoded. With `chain_id`, SubmitRetryable and
+/// EthDeposit messages carry the transaction arbos builds from them.
 pub fn parse_frame(frame: &Frame, chain_id: Option<u64>) -> Vec<FeedMessage> {
     frame
         .entries()
@@ -1111,9 +1014,8 @@ pub fn parse_frame(frame: &Frame, chain_id: Option<u64>) -> Vec<FeedMessage> {
         .collect()
 }
 
-/// An entry's l2Msg, base64-decoded. Decode it once and pass it to both verification and
-/// decoding.
-/// `Ok(None)` when absent or empty.
+/// An entry's l2Msg, base64-decoded once for both verification and decoding. `Ok(None)`
+/// when absent or empty.
 pub fn l2_msg(entry: &Entry) -> Result<Option<Bytes>, base64_simd::Error> {
     match entry.incoming().and_then(|i| i.l2_msg.as_deref()) {
         Some(l2) if !l2.is_empty() => Ok(Some(base64_simd::STANDARD.decode_to_vec(l2)?.into())),
@@ -1121,14 +1023,12 @@ pub fn l2_msg(entry: &Entry) -> Result<Option<Bytes>, base64_simd::Error> {
     }
 }
 
-/// One entry of a frame, with its l2Msg already decoded by `l2_msg`. Transactions are
-/// decoded only if `l2` is given, which is how the consumer skips decoding the backlog.
-/// `chain_id` as in `parse_frame`.
+/// One entry, with its l2Msg from `l2_msg`. Transactions are decoded only if `l2` is
+/// given. `chain_id` as in `parse_frame`.
 pub fn parse_entry_with(entry: &Entry, l2: Option<&Bytes>, chain_id: Option<u64>) -> FeedMessage {
     let header = entry.header();
     let kind = header.and_then(|h| h.kind).unwrap_or(-1);
-    // Only an L2Message carries signed transactions. Other kinds lay out l2Msg their own
-    // way (an EthDeposit is an address and an amount), as arbos reads them.
+    // Only an L2Message holds signed transactions; arbos reads other kinds their own way.
     let txs = match (l2, header, chain_id) {
         (Some(l2), _, _) if kind == L1_L2_MESSAGE => decode_l2_message(l2),
         (Some(l2), Some(h), Some(chain)) => decode_parent_chain_message(h, l2, chain)
@@ -1160,13 +1060,9 @@ pub fn parse_entry_with(entry: &Entry, l2: Option<&Bytes>, chain_id: Option<u64>
     }
 }
 
-// --------------------------------------------------------------------------- //
-// compliance filtering
-// --------------------------------------------------------------------------- //
-
-/// eth_call body asking the filter precompile whether a hash is blocked. The hash is
-/// checked here because a malformed one still encodes into a well-formed call that the
-/// node would answer about the wrong slot. See `is_filtered_call` in codec.py.
+/// eth_call body asking the compliance filter precompile whether a transaction is
+/// blocked. A malformed hash would still make a well-formed call about the wrong slot,
+/// so it's checked.
 pub fn is_filtered_call(tx_hash: &str) -> Result<sonic_rs::Value, String> {
     let raw: [u8; 32] = fixed(tx_hash, "transaction hash")?;
     Ok(sonic_rs::json!({
@@ -1322,8 +1218,7 @@ mod tests {
 
     #[test]
     fn only_an_l2_message_is_decoded_into_transactions() {
-        // A signed-transaction marker (0x04) and a legacy envelope of nine empty fields,
-        // under two kinds.
+        // SignedTx marker and a legacy envelope of nine empty fields.
         let l2 = Bytes::from([[4u8, 0xc9].as_slice(), &[0x80; 9]].concat());
         let json = |kind: i64| {
             format!(

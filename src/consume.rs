@@ -13,29 +13,9 @@
 //! # }
 //! ```
 //!
-//! Each source gets its own connection and its own task, which reads, parses, verifies
-//! and decodes. A slow source or a slow consumer doesn't hold up the others. Every
-//! sequence number is delivered once, from the source that had it first. Later copies
-//! are counted per source along with how late they were (`Stats::sources`), so you can
-//! see which endpoint is fastest from where you are.
-//!
-//! The rest works like the Python version's `consume.py`:
-//!
-//! - Backlog: a new connection first gets replayed the relay's backlog. We count those
-//!   messages but don't decode or deliver them. A message counts as live once its
-//!   sequencer timestamp is only a few seconds old.
-//! - Reconnects: we ask for the last sequence number we saw, not the one after it. If
-//!   you ask for a number past the end, Nitro can't find it and sends the whole backlog.
-//! - Reorgs: Nitro has no reorg message. The new block just arrives again under a
-//!   sequence number we've already seen, with a different block hash. We deliver it with
-//!   `reorg` set and move the watermark back. With several sources, a slower one may
-//!   still send the old blocks afterwards. Those match a hash we remember and get dropped.
-//! - Verification happens before the watermark moves, so a forged frame can't make a
-//!   reconnect skip real messages. A copy of a message we already delivered (same
-//!   sequence number, same block hash) is dropped without checking it again. The block
-//!   hash is part of the signed data and the first copy was already checked.
-//! - Problems are logged: which source can't connect, which one is connected but silent.
-//!   A connection that sends nothing at all for 15 s, not even a ping, is replaced.
+//! One task per source; each sequence number is delivered once, from the first source to
+//! have it. Nitro has no reorg message: a block arrives again under a known sequence
+//! number with a new hash, and is delivered with `reorg` set.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -61,71 +41,58 @@ use crate::codec::{
 };
 use crate::verify::{MAINNET_CHAIN_ID, Verifier};
 
-/// Where a local Nitro relay listens by default (see README.md for running one).
+/// Where a local Nitro relay listens by default.
 pub const LOCAL_RELAY: &str = "ws://127.0.0.1:9642";
 
 /// Robinhood's public endpoints. At most two connections per IP.
 pub const MAINNET_FEED: &str = "wss://feed.mainnet.chain.robinhood.com";
 pub const TESTNET_FEED: &str = "wss://feed.testnet.chain.robinhood.com";
-/// eth_chainId on Robinhood Chain testnet.
 pub const TESTNET_CHAIN_ID: u64 = 46630;
 
 const FEED_CLIENT_VERSION: &str = "Arbitrum-Feed-Client-Version";
 const REQUESTED_SEQ: &str = "Arbitrum-Requested-Sequence-Number";
 const CHAIN_ID: &str = "Arbitrum-Chain-Id";
 
-/// A message stamped this recently by the sequencer is live.
+/// Seconds old a sequencer timestamp can be for the message to count as live.
 const LIVE_THRESHOLD: f64 = 5.0;
-/// Fallback for a skewed clock: the backlog is finite, so stop waiting for it.
+/// Fallback for a skewed clock: the backlog is finite.
 const MAX_BACKLOG: Duration = Duration::from_secs(120);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
-/// A source that was first on fewer than 1 in `SLOW_SHARE` of its last `SLOW_WINDOW`
-/// live messages gets a new connection. Measured in Virginia: most connections split
-/// the wins about evenly, but now and then one lands on a path that's ~9 ms slower and
-/// stays there.
+/// A source first on fewer than 1 in `SLOW_SHARE` of its last `SLOW_WINDOW` live messages
+/// gets a new connection: now and then one lands on a path that stays ~9 ms slower.
 const SLOW_WINDOW: u32 = 500;
 const SLOW_SHARE: u32 = 10;
-/// Warn after this long connected with no frames.
 const STALL_WARNING: Duration = Duration::from_secs(30);
-/// Reconnect after this long without any frame at all. Nitro servers ping every 5 s by
-/// default and the public feed every 2 s, so this means the connection is dead.
+/// Nitro pings every 5 s by default and the public feed every 2 s, so silence this long
+/// means the connection is dead.
 const SILENCE_LIMIT: Duration = Duration::from_secs(15);
-/// How often a waiting source checks for a stall or silence, so either is caught soon
-/// after it crosses its threshold.
 const POLL_INTERVAL: Duration = Duration::from_millis(2500);
-/// With `busy_poll`, how long a source waits for a frame before running the last one
-/// through the path again to keep it in cache.
+/// With `busy_poll`, rerun the last frame after this long idle to keep it in cache.
 const WARM_INTERVAL: Duration = Duration::from_millis(1);
-/// How many recent block hashes to keep for reorg and duplicate detection (~2 minutes).
+/// Recent block hashes kept for reorg and duplicate detection (~2 minutes).
 const REORG_WINDOW: i64 = 1024;
 
 type Socket = WebSocket<Stamped<MaybeTlsStream<Stamped<TcpStream>>>>;
 
-/// When a message's frame finished each stage of `Feed`. The difference between two
-/// neighbouring fields is what that stage took. Add your own `Instant::now()` after
-/// `recv()` to see the hand-off. `rhfeed --timing` prints percentiles of all of them.
+/// When a message's frame finished each stage of `Feed`; the gap between neighbouring
+/// fields is what that stage took.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
-    /// First socket read with bytes of this frame. If an earlier read already brought
-    /// the whole frame, the same as `last_read`.
+    /// First socket read with bytes of this frame.
     pub first_read: Instant,
-    /// Last socket read the frame needed. Before this, the frame was still arriving.
+    /// Last socket read the frame needed.
     pub last_read: Instant,
-    /// TLS has decrypted the frame's last bytes.
     pub decrypted: Instant,
-    /// The WebSocket layer returned the whole frame, inflated.
+    /// The WebSocket layer returned the frame, inflated.
     pub inflated: Instant,
     pub parsed: Instant,
-    /// Signature checked (equal to `parsed` without a verifier). With
-    /// `FeedBuilder::senders`, also every sender recovered, and `decoded` is the same.
+    /// With `FeedBuilder::senders`, also every sender recovered.
     pub verified: Instant,
     pub decoded: Instant,
     /// Just before the message went into the channel.
     pub sent: Instant,
 }
 
-/// When reads on a stream returned bytes: the first since the last `take` and the most
-/// recent. Written from inside yawc by `Stamped`, read by the source once per frame.
 #[derive(Default)]
 struct ReadTimes(Mutex<(Option<Instant>, Option<Instant>)>);
 
@@ -144,13 +111,11 @@ impl ReadTimes {
     }
 }
 
-/// A stream that notes when its reads return bytes. One sits under TLS and one above
-/// it, which separates waiting for the network from decrypting.
+/// A stream that notes when its reads return bytes, under and over TLS.
 struct Stamped<S> {
     inner: S,
     times: Arc<ReadTimes>,
-    /// Collects the first bytes read, up to the end of the HTTP response head, because
-    /// yawc doesn't hand the handshake response back. None once that's done.
+    /// The HTTP response head, since yawc doesn't hand the handshake response back.
     head: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
@@ -182,8 +147,7 @@ fn head_end(head: &[u8]) -> Option<usize> {
     head.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-/// The chain a feed announces in its handshake response. Nitro relays and Conduit's feeds
-/// do, Robinhood's public feeds don't. Decimal or 0x hex, the first value that parses.
+/// The chain id a Nitro relay or Conduit feed announces; Robinhood's public feeds don't.
 fn announced_chain_id(head: &[u8]) -> Option<u64> {
     let text = std::str::from_utf8(&head[..head_end(head)?]).ok()?;
     text.split("\r\n").skip(1).find_map(|line| {
@@ -220,9 +184,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Stamped<S> {
     }
 }
 
-/// The same TLS setup yawc uses on its own: webpki roots, HTTP/1.1 by ALPN, the process
-/// default crypto provider if one is installed and ring otherwise. We build it
-/// ourselves so the socket underneath can be `Stamped`.
+/// yawc's own TLS setup, built here so the socket under it can be `Stamped`.
 static TLS: LazyLock<TlsConnector> = LazyLock::new(|| {
     let roots = RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
@@ -244,22 +206,19 @@ pub struct Stats {
     pub backlog_messages: u64,
     pub live_messages: u64,
     pub duplicate_messages: u64,
-    /// Dropped without a good signature from an allowed signer.
     pub unverified_messages: u64,
-    /// Dropped because a field had the wrong JSON type, which Nitro can't read either.
+    /// Dropped for a field of the wrong JSON type, which Nitro can't read either.
     pub malformed_messages: u64,
     pub reorgs: u64,
     pub sources: Vec<SourceStats>,
 }
 
-/// Per-source counters: who delivered first, and how far behind the rest were.
 #[derive(Debug, Default, Clone)]
 pub struct SourceStats {
-    /// The source URL as it is safe to log (see `redact`).
+    /// Without anything after the host, which may hold an access key.
     pub url: String,
     pub connected: bool,
-    /// Why this source stopped for good, if it did. Today only for a feed that
-    /// announces a different chain than the verifier checks.
+    /// Why this source stopped for good, if it did.
     pub error: Option<String>,
     pub reconnects: u64,
     /// Messages this source delivered before any other.
@@ -268,12 +227,12 @@ pub struct SourceStats {
     pub late: u64,
     pub lag_total: Duration,
     pub lag_max: Duration,
-    /// Times this source's connection was replaced for being slower than the others.
+    /// Times the connection was replaced for losing nearly every race.
     pub replaced: u64,
 }
 
 impl SourceStats {
-    /// Mean delay behind the first copy, over this source's late copies.
+    /// Mean delay behind the first copy.
     pub fn lag_mean(&self) -> Option<Duration> {
         (self.late > 0).then(|| self.lag_total / self.late as u32)
     }
@@ -285,9 +244,8 @@ fn unix_now() -> f64 {
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
-/// A feed URL as it is safe to log: scheme, host and port. Third-party feeds take the
-/// access key in the path, the query or `user:pass@`, so anything after the host is cut.
-/// A URL with nothing after the host, like Robinhood's feeds, comes back unchanged.
+/// Scheme, host and port: third-party feeds take the access key in the path, the query
+/// or `user:pass@`.
 fn redact(url: &str) -> Cow<'_, str> {
     let start = url.find("://").map_or(0, |i| i + 3);
     let rest = &url[start..];
@@ -300,10 +258,6 @@ fn redact(url: &str) -> Cow<'_, str> {
     }
     Cow::Owned(format!("{}{host}/…", &url[..start]))
 }
-
-// --------------------------------------------------------------------------- //
-// the shared state every source reports into
-// --------------------------------------------------------------------------- //
 
 struct Seen {
     hash: Option<String>,
@@ -322,17 +276,15 @@ struct State {
     stats: Stats,
     warned_unverified: bool,
     warned_malformed: bool,
-    /// Per source: (first, late) live messages since its window last reset.
+    /// Per source: (first, late) live messages in the current window.
     recent: Vec<(u32, u32)>,
-    /// Per source: it should drop its connection and open a new one.
     replace: Vec<bool>,
 }
 
 impl State {
     fn classify(&self, seq: i64, hash: Option<&str>) -> Verdict {
         match self.seen.get(&seq) {
-            // Same number, different block: a reorg if it rewinds, or the replacement
-            // for a block an earlier reorg already rewound past.
+            // Different block: a reorg, or the replacement for a block already rewound past.
             Some(prev) if hash.is_some() && prev.hash.is_some() && prev.hash.as_deref() != hash => {
                 if seq > self.highest_seq {
                     Verdict::New
@@ -340,8 +292,7 @@ impl State {
                     Verdict::Reorg
                 }
             }
-            // Same block, or a hash missing on one side. If we can't tell, we treat it
-            // as a duplicate rather than rewinding on a guess.
+            // Same block, or can't tell: don't rewind on a guess.
             Some(_) => Verdict::Duplicate,
             None if seq > self.highest_seq => Verdict::New,
             None => Verdict::Duplicate,
@@ -350,8 +301,7 @@ impl State {
 
     fn late_copy(&mut self, source: usize, seq: i64, live: bool, now: Instant) {
         self.stats.duplicate_messages += 1;
-        // Only live copies say anything about latency: a replayed backlog is late by
-        // however long the connection was down.
+        // A replayed backlog copy says nothing about latency.
         if let (true, Some(first)) = (live, self.seen.get(&seq)) {
             let lag = now.saturating_duration_since(first.at);
             let s = &mut self.stats.sources[source];
@@ -363,7 +313,6 @@ impl State {
         }
     }
 
-    /// Mark `source` for a new connection if it has been losing nearly every race.
     fn check_slow(&mut self, source: usize) {
         let (first, late) = self.recent[source];
         if first + late < SLOW_WINDOW {
@@ -393,10 +342,8 @@ impl State {
 
 struct Shared {
     verify: Option<Verifier>,
-    /// With `FeedBuilder::senders`.
     senders: Option<Mutex<SenderPool>>,
     state: Mutex<State>,
-    /// When `warm` last ran.
     warmed: Mutex<Instant>,
 }
 
@@ -429,19 +376,15 @@ impl Shared {
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
-        // The lock only guards counters and a map, so a poisoned lock is still usable.
+        // Only counters and a map: a poisoned lock is still usable.
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Every message in `frame` this source is first to deliver, verified, with `live`
-    /// set and transactions decoded when live. The lock is never held across
-    /// verification or decoding, so sources do that work in parallel.
+    /// Every message in `frame` this source is first to deliver, verified, decoded when
+    /// live. The lock is never held across verification or decoding.
     ///
-    /// Until the connection is `live`, each entry is judged on its own timestamp. A relay
-    /// replays its backlog in frames of hundreds of messages, so the frame's last entry
-    /// says nothing about the ones before it. Only an entry that passes verification can
-    /// end the backlog: a forged one with a fresh timestamp must not promote the older,
-    /// real entries behind it.
+    /// Until the connection is live, each entry is judged on its own timestamp (a relay
+    /// replays its backlog in big frames), and only a verified entry can end the backlog.
     fn ingest(
         &self,
         source: usize,
@@ -468,8 +411,6 @@ impl Shared {
                 }
             }
             let live = live_now;
-            // Decode l2Msg once and use it for both the signature and the transactions.
-            // A backlog message that isn't being verified needs neither.
             let l2 = if live || self.verify.is_some() {
                 l2_msg(entry)
             } else {
@@ -487,8 +428,7 @@ impl Shared {
                 None
             };
             let mut msg = match (&self.senders, live) {
-                // Decode first, so the pool recovers the senders while this thread
-                // checks the signature.
+                // Decode first, so the pool recovers senders during the signature check.
                 (Some(pool), true) => {
                     let msg = parse_entry_with(entry, decodable, chain_id);
                     let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
@@ -556,8 +496,7 @@ impl Shared {
         out
     }
 
-    /// Whether it's time for another warm-up. Once per interval between all sources,
-    /// since a frame that arrives during one waits for it.
+    /// Once per interval across all sources: a frame arriving during a warm-up waits.
     fn may_warm(&self) -> bool {
         let mut warmed = self.warmed.lock().unwrap_or_else(|e| e.into_inner());
         if warmed.elapsed() < WARM_INTERVAL {
@@ -567,8 +506,7 @@ impl Shared {
         true
     }
 
-    /// Run a frame through parsing, the signature check and decoding, and throw the
-    /// result away. Keeps that code and its tables in cache for the next real frame.
+    /// Run a frame through the whole path and drop the result, to keep it in cache.
     fn warm(&self, payload: &[u8]) {
         let Ok(frame) = frame_from_slice(payload) else {
             return;
@@ -582,13 +520,13 @@ impl Shared {
         }
     }
 
-    /// Drop an unverified message without moving the watermark. Otherwise one
-    /// injected frame could make the next reconnect skip the real messages behind it.
+    /// Drop without moving the watermark, or one forged frame could make the next
+    /// reconnect skip real messages.
     fn reject(&self, entry: &Entry, seq: i64) {
         {
             let mut st = self.lock();
             st.stats.unverified_messages += 1;
-            // Log only the first one. With a wrong chain id every message fails.
+            // Only the first: with a wrong chain id every message fails.
             if std::mem::replace(&mut st.warned_unverified, true) {
                 return;
             }
@@ -614,7 +552,7 @@ impl Shared {
     }
 }
 
-/// A recent frame for `busy_poll` to rerun while it waits, as JSON and deflated.
+/// A recent frame, as JSON and deflated, for `busy_poll` to rerun while it waits.
 #[derive(Default)]
 struct Warm {
     json: Vec<u8>,
@@ -624,12 +562,11 @@ struct Warm {
 }
 
 impl Warm {
-    /// Keep `payload` for the next warm-ups. Call it after delivering the message.
     fn keep(&mut self, payload: &[u8]) {
         self.json.clear();
         self.json.extend_from_slice(payload);
         if self.deflated.is_empty() {
-            // Only once: deflating takes ~0.1 ms, and any frame warms the inflater.
+            // Once: deflating takes ~0.1 ms, and any frame warms the inflater.
             let mut deflate = Compress::new(Compression::default(), false);
             self.deflated.reserve(payload.len() + 1024);
             if deflate
@@ -642,7 +579,6 @@ impl Warm {
         }
     }
 
-    /// Inflate, parse, check and decode the kept frame, and throw the results away.
     fn run(&mut self, shared: &Shared) {
         if self.json.is_empty() || !shared.may_warm() {
             return;
@@ -654,12 +590,8 @@ impl Warm {
     }
 }
 
-// --------------------------------------------------------------------------- //
-// the public handle
-// --------------------------------------------------------------------------- //
-
-/// A running feed: one task per source, merged into one stream of live messages.
-/// Dropping it stops every source.
+/// A running feed: every source merged into one stream of live messages. Dropping it
+/// stops every source.
 pub struct Feed {
     rx: mpsc::Receiver<FeedMessage>,
     shared: Arc<Shared>,
@@ -680,16 +612,10 @@ impl Feed {
         }
     }
 
-    /// The next live message, from whichever source had it first. `None` only if every
-    /// source task has stopped, which they do not do on their own.
+    /// The next live message. `None` once every source has stopped for good.
     ///
-    /// Call this from a task you `tokio::spawn`, not straight from `#[tokio::main]`'s
-    /// body. The body runs on its own thread, so every message has to wake that thread
-    /// (~14 us on our machine). A spawned task is woken on the worker that just received
-    /// the message (~4 us).
-    ///
-    /// With `busy_poll` this spins instead of waiting to be woken, yielding to other
-    /// tasks between tries, so the thread it runs on stays busy too.
+    /// Call it from a task you `tokio::spawn`: waking `#[tokio::main]`'s own thread costs
+    /// ~10 µs more per message. With `busy_poll` it spins, yielding between tries.
     pub async fn recv(&mut self) -> Option<FeedMessage> {
         if !self.busy {
             return self.rx.recv().await;
@@ -725,8 +651,7 @@ impl FeedBuilder {
         self
     }
 
-    /// Drop messages without a good signature from an allowed signer. Costs one ECDSA
-    /// check per new message (see `Verifier`); late copies are not re-checked.
+    /// Drop messages without a good signature from an allowed signer.
     pub fn verify(mut self, verifier: Verifier) -> Self {
         self.verify = Some(verifier);
         self
@@ -738,41 +663,35 @@ impl FeedBuilder {
         self
     }
 
-    /// Messages buffered for a consumer that is behind. When full, sources stop
-    /// reading until it catches up, and say so.
+    /// Messages buffered for a consumer that is behind. When full, sources wait.
     pub fn capacity(mut self, messages: usize) -> Self {
         self.capacity = messages;
         self
     }
 
-    /// Run the sources on a thread of their own that never sleeps: it keeps polling the
-    /// sockets instead of waiting for the OS to wake it. A frame is then picked up as
-    /// soon as it arrives, and the caches stay warm between frames. It costs one core
-    /// at 100%.
-    ///
-    /// `recv()` then spins as well, so the task that calls it keeps its thread busy.
+    /// Run the sources on a thread that never sleeps, so frames are picked up at once
+    /// and caches stay warm. Costs one core at 100%, and `recv()` spins too.
     pub fn busy_poll(mut self, on: bool) -> Self {
         self.busy_poll = on;
         self
     }
 
-    /// The chain id to build SubmitRetryable and EthDeposit transactions with, whose
-    /// hashes cover it. Without it, each source uses what its feed announces, Robinhood's
-    /// chain id for its own feeds, or the verifier's.
+    /// The chain id for SubmitRetryable and EthDeposit transactions. Without it, each
+    /// source uses what its feed announces, Robinhood's for its own feeds, or the
+    /// verifier's.
     pub fn chain_id(mut self, chain_id: u64) -> Self {
         self.chain_id = Some(chain_id);
         self
     }
 
-    /// Recover every transaction's sender before handing a message over, on a
-    /// `SenderPool` of `threads` spinning threads, while the source checks the feed
-    /// signature. `tx.sender()` is then free. Each thread keeps a core at 100%.
+    /// Recover every sender on `threads` spinning threads during the signature check, so
+    /// `tx.sender()` is free on arrival. Each thread keeps a core at 100%.
     pub fn senders(mut self, threads: usize) -> Self {
         self.senders = threads;
         self
     }
 
-    /// Start every source on the current tokio runtime, or on a thread of its own with
+    /// Start every source on the current tokio runtime, or on its own thread with
     /// `busy_poll`. Panics with no sources.
     pub fn spawn(self) -> Feed {
         assert!(!self.sources.is_empty(), "a feed needs at least one source");
@@ -811,7 +730,6 @@ impl FeedBuilder {
     }
 }
 
-/// Run `sources` on this thread until the `Feed` is dropped, without ever parking it.
 fn busy_poll(sources: Vec<Source>, tx: mpsc::Sender<FeedMessage>) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -819,9 +737,8 @@ fn busy_poll(sources: Vec<Source>, tx: mpsc::Sender<FeedMessage>) {
         .expect("cannot build a tokio runtime");
     runtime.block_on(async move {
         let mut tasks: JoinSet<()> = sources.into_iter().map(Source::run).collect();
-        // While a task has yielded, the scheduler checks the sockets with a zero timeout
-        // instead of parking the thread until one is ready. Stops when the `Feed` is
-        // dropped, or when every source has stopped for good, so `recv()` sees the end.
+        // While a task has yielded, the scheduler polls the sockets with a zero timeout
+        // instead of parking the thread.
         while !tx.is_closed() && !tasks.is_empty() {
             while tasks.try_join_next().is_some() {}
             tokio::task::yield_now().await;
@@ -829,29 +746,22 @@ fn busy_poll(sources: Vec<Source>, tx: mpsc::Sender<FeedMessage>) {
     });
 }
 
-// --------------------------------------------------------------------------- //
-// one source
-// --------------------------------------------------------------------------- //
-
 struct Source {
     index: usize,
     url: String,
-    /// `url` as it is safe to log, see `redact`.
+    /// `url`, redacted for logs.
     name: String,
     shared: Arc<Shared>,
     tx: mpsc::Sender<FeedMessage>,
     reconnect_delay: Duration,
-    /// Set with `FeedBuilder::chain_id`, otherwise found on each connection.
     chain_id: Option<u64>,
-    /// Rerun the last frame whenever idle for `WARM_INTERVAL` (with `busy_poll`).
     warm: bool,
 }
 
-/// Why a connection ended.
 enum End {
-    /// The `Feed` was dropped; stop for good.
+    /// The `Feed` was dropped.
     Stopped,
-    /// This connection keeps losing to the others; open a new one right away.
+    /// Keeps losing to the other sources: reconnect right away.
     Slow,
     Failed(String),
 }
@@ -866,9 +776,7 @@ impl Source {
                 Err(err) => err,
                 Ok((ws, times, chain_id)) => {
                     if let Err(wrong) = self.check_chain(chain_id) {
-                        // Every message would fail verification, and reconnecting can't
-                        // change that. Nitro's own client treats it as fatal too. Dropping
-                        // the socket aborts the connection without a close handshake.
+                        // Fatal, as in Nitro's own client: reconnecting can't fix it.
                         error!("{wrong}");
                         self.shared.lock().stats.sources[self.index].error = Some(wrong);
                         return;
@@ -901,8 +809,7 @@ impl Source {
             failures += 1;
             self.shared.lock().stats.sources[self.index].reconnects += 1;
             if err.contains("429") {
-                // The public feed allows two connections per IP and answers the rest with
-                // 429. Retrying quickly would just hit the limit again.
+                // Over the two connections per IP; retrying fast would hit it again.
                 delay = MAX_RECONNECT_DELAY;
                 warn!(
                     "{} refused the connection as rate-limited (HTTP 429): the public feed allows \
@@ -913,8 +820,7 @@ impl Source {
                 tokio::time::sleep(delay).await;
                 continue;
             }
-            // Always log the failure. Otherwise a feed that can't be reached just looks
-            // like a quiet feed.
+            // Always logged, or an unreachable feed looks like a quiet one.
             warn!(
                 "cannot read {} ({err}), retrying in {:.1}s{}",
                 self.name,
@@ -934,9 +840,7 @@ impl Source {
         self.shared.lock().stats.sources[self.index].connected = connected;
     }
 
-    /// The chain id deposits and retryables are built with: the one set on the builder,
-    /// else what the feed announced, else Robinhood's for its own feeds, else the
-    /// verifier's. None leaves those messages without transactions.
+    /// Builder, then announced, then Robinhood's own feeds, then the verifier.
     fn chain_for(&self, announced: Option<u64>) -> Option<u64> {
         self.chain_id.or(announced).or(match self.url.as_str() {
             MAINNET_FEED => Some(MAINNET_CHAIN_ID),
@@ -945,8 +849,6 @@ impl Source {
         })
     }
 
-    /// Refuse a feed that announces a chain other than the verifier's. A feed that
-    /// announces none is read as before.
     fn check_chain(&self, announced: Option<u64>) -> Result<(), String> {
         match (&self.shared.verify, announced) {
             (Some(v), Some(chain)) if chain != v.chain_id => Err(format!(
@@ -957,8 +859,7 @@ impl Source {
         }
     }
 
-    /// A WebSocket over TLS over TCP, with the reads on both sides of TLS `Stamped`.
-    /// Returns the stamps of the (TCP, TLS) reads and the chain id the feed announced.
+    /// Returns the (TCP, TLS) read stamps and the chain id the feed announced.
     async fn connect(&self) -> Result<(Socket, [Arc<ReadTimes>; 2], Option<u64>), String> {
         let url: url::Url = self.url.parse().map_err(|e| format!("bad URL: {e}"))?;
         let host = url.host_str().ok_or("URL without a host")?.to_owned();
@@ -966,6 +867,8 @@ impl Source {
         let mut request = HttpRequestBuilder::new().header(FEED_CLIENT_VERSION, "2");
         let highest = self.shared.lock().highest_seq;
         if highest >= 0 {
+            // The last one seen, not the next: Nitro sends its whole backlog for a number
+            // past the end.
             request = request.header(REQUESTED_SEQ, highest.to_string());
         }
         let err = |e: std::io::Error| e.to_string();
@@ -998,8 +901,7 @@ impl Source {
             times: Arc::clone(&times[1]),
             head: Some(Arc::clone(&head)),
         };
-        // Since 2026-09-17 the public feed refuses a handshake that does not offer
-        // permessage-deflate. A local relay serves uncompressed and ignores the offer.
+        // The public feed refuses a handshake without permessage-deflate.
         let options = Options::default()
             .with_limits(1 << 24, 1 << 25)
             .with_low_latency_compression();
@@ -1042,7 +944,7 @@ impl Source {
                     }
                     let idle = last_frame.elapsed();
                     if idle >= STALL_WARNING && !stall_warned {
-                        stall_warned = true; // once per stall, not once per poll
+                        stall_warned = true;
                         warn!(
                             "no frames from {} for {:.0}s. Connected, but nothing is \
                              arriving. For a relay, usually its own upstream is down",
@@ -1075,9 +977,8 @@ impl Source {
                     let Some(t) = entry_texts(frame.payload()) else {
                         return End::Failed(format!("unreadable frame: {err}"));
                     };
-                    // JSON, but an entry has a field of the wrong type. Nitro can't read it
-                    // either. Reconnecting would only get the same frame again, so keep
-                    // the entries that parse.
+                    // An entry with a mistyped field. Reconnecting would only bring the
+                    // same frame again, so keep the entries that parse.
                     texts = t;
                     let entries: Vec<Entry> = texts
                         .iter()
@@ -1111,7 +1012,6 @@ impl Source {
                 sent: at,
             };
             let was_live = live;
-            // Fallback for a skewed clock: the backlog is finite, so stop waiting for it.
             live |= started.elapsed() > MAX_BACKLOG;
             let msgs = self.shared.ingest(
                 self.index,
@@ -1129,7 +1029,6 @@ impl Source {
                         self.name, first.seq
                     );
                 } else if !live && last_narrated.elapsed() >= POLL_INTERVAL {
-                    // Frames are arriving but none are recent yet, so we're still in the backlog.
                     last_narrated = now;
                     info!("{}: draining backlog, none current yet", self.name);
                 }

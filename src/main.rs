@@ -1,6 +1,4 @@
-//! The `rhfeed` command: stream decoded transactions from the feed. It takes the same
-//! flags and prints the same output as the Python version's `cli.py`, so you can diff
-//! the two.
+//! The `rhfeed` command. Flags and output match the Python version's `cli.py`.
 
 use std::collections::HashSet;
 use std::process::exit;
@@ -15,8 +13,7 @@ use rhfeed::{
     decode_intents, sel,
 };
 
-/// How many characters of an address to print. Hashes are printed in full because
-/// people paste them into explorers. Full addresses would make the lines too long.
+/// Addresses are shortened; hashes stay whole for pasting into explorers.
 const ADDR_WIDTH: usize = 10;
 
 /// Stream decoded transactions from Robinhood Chain's sequencer feed.
@@ -66,10 +63,7 @@ struct Args {
     busy_poll: bool,
 }
 
-/// The filters, cheapest first. `to` and `selector` are just set lookups. Then the
-/// calldata is decoded for `actor`, and `sender` goes last because it needs an ECDSA
-/// recovery. `actor` needs the sender only when some intent names no actor, and keeps
-/// only the followed actors' intents: one bundle can carry several wallets' trades.
+/// The filters, cheapest first; `sender` needs an ECDSA recovery, so it goes last.
 struct Filter {
     to: Option<HashSet<[u8; 20]>>,
     selector: Option<HashSet<[u8; 4]>>,
@@ -105,12 +99,10 @@ impl Filter {
         self.to.is_some() || self.selector.is_some() || self.wants_sender()
     }
 
-    /// Both `sender` and `actor` show who sent each transaction.
     fn wants_sender(&self) -> bool {
         self.sender.is_some() || self.actor.is_some()
     }
 
-    /// The filters that need no ECDSA: `to` and `selector`.
     fn cheap(&self, tx: &Tx) -> bool {
         self.to
             .as_ref()
@@ -121,9 +113,7 @@ impl Filter {
                 .is_none_or(|s| tx.selector.is_some_and(|v| s.contains(&v)))
     }
 
-    /// Whether `finish` will need this transaction's sender: always for `sender`; for
-    /// `actor` when an intent names no actor or names a followed one, since a kept
-    /// transaction shows its sender.
+    /// Whether `finish` will need the sender: a kept transaction shows it.
     fn needs_sender(&self, intents: &[Intent]) -> bool {
         self.sender.is_some()
             || self.actor.as_ref().is_some_and(|follow| {
@@ -134,9 +124,7 @@ impl Filter {
             })
     }
 
-    /// The `actor` and `sender` filters. Run `recover_senders` on the transactions
-    /// `needs_sender` picks first, so this reads cached senders instead of recovering
-    /// them one at a time.
+    /// The `actor` and `sender` filters, on senders `recover_senders` already cached.
     fn finish(&self, tx: &Tx, intents: &mut Vec<Intent>) -> bool {
         if let Some(follow) = &self.actor {
             match actors_intents(std::mem::take(intents), || tx.sender_bytes(), follow) {
@@ -150,9 +138,8 @@ impl Filter {
     }
 }
 
-/// The intents of a followed actor, or None if the transaction has none. An intent with
-/// no decoded actor, or a call with nothing decoded at all, is the sender's own, so the
-/// sender is asked for only then.
+/// The followed actors' intents, or None. An intent with no actor, or a call with no
+/// intent, is the sender's own: one bundle can carry several wallets' trades.
 fn actors_intents(
     intents: Vec<Intent>,
     sender: impl FnOnce() -> Option<[u8; 20]>,
@@ -180,7 +167,7 @@ struct JsonTx<'a> {
     hash: String,
     tx_type: u8,
     to: Option<String>,
-    /// Written as a raw JSON number like the Python version does, since wei can exceed u64.
+    /// A raw JSON number, as wei can exceed u64.
     value: RawNumber,
     nonce: u64,
     gas: u64,
@@ -229,7 +216,7 @@ fn json_line(msg: &FeedMessage, txs: &[(&Tx, Vec<Intent>)], show_sender: bool) -
     sonic_rs::to_string(&line).unwrap()
 }
 
-/// Logs go to stderr with a `#` prefix, so they stay visible when stdout is redirected.
+/// Logs go to stderr with a `#` prefix.
 struct StderrLog;
 
 impl log::Log for StderrLog {
@@ -246,8 +233,7 @@ impl log::Log for StderrLog {
 
 #[tokio::main]
 async fn main() {
-    // Consume in a task rather than on main's own thread. A message then wakes it on the
-    // worker that received the message, ~4 us, instead of waking another thread, ~14 us.
+    // A spawned task wakes on the worker that got the message, ~10 µs sooner.
     tokio::spawn(run()).await.unwrap();
 }
 
@@ -269,8 +255,7 @@ async fn run() {
         .collect();
     let verify = !args.no_verify;
     if verify && urls.contains(&TESTNET_FEED) {
-        // The chain id is part of the signed data, so every testnet message would fail
-        // and it would look like the feed is dead.
+        // The chain id is signed, so every testnet message would fail.
         eprintln!(
             "rhfeed: verification only knows mainnet's chain id and signer, and the chain id \
              is signed, so every testnet message would be dropped. Pass --no-verify, or build a \
@@ -296,12 +281,9 @@ async fn run() {
     if verify {
         builder = builder.verify(MAINNET_VERIFIER.clone());
     }
-    // Recovering a sender costs about 15 times more than all other fields together, so
-    // we only show senders when --sender or --actor already made us recover them.
+    // Senders cost an ECDSA recovery each, so only show them when a filter needs them.
     let show_sender = keep.wants_sender();
-    // With --busy-poll, the feed recovers the senders itself while it checks the
-    // signature, on spinning threads: as many as a typical message has transactions
-    // (7), leaving cores for the rest.
+    // As many spinning threads as a typical message has transactions (7).
     let pooled = args.busy_poll && show_sender;
     if pooled {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -341,7 +323,6 @@ async fn run() {
                 .collect();
             if show_sender {
                 if !pooled {
-                    // The senders this message needs, all at once, spread over the cores.
                     let needed = txs.iter().filter(|(_, i)| keep.needs_sender(i));
                     rhfeed::recover_senders(needed.map(|(t, _)| *t));
                 }
@@ -380,8 +361,7 @@ async fn run() {
             }
         }
     };
-    // A timer instead of checking the time per message, so --seconds works even when
-    // nothing arrives.
+    // A timer, so --seconds also works when nothing arrives.
     let deadline = async {
         match seconds {
             Some(d) => tokio::time::sleep(d).await,
@@ -400,7 +380,7 @@ async fn run() {
     }
     let s = feed.stats();
     let counted = if keep.active() { "matched" } else { "seen" };
-    // Print the count even when it's zero, so you can see the check ran.
+    // Even when zero, so you can see the check ran.
     let checked = if verify {
         format!(", {} unverified dropped", s.unverified_messages)
     } else {
@@ -418,7 +398,6 @@ async fn run() {
         s.sources.iter().map(|src| src.reconnects).sum::<u64>()
     );
     if s.sources.len() > 1 {
-        // Shows which source was fastest from this machine.
         for src in &s.sources {
             let lag = src.lag_mean().map_or("-".into(), |m| {
                 format!("{:.1} ms mean, {:.1} ms max", ms(m), ms(src.lag_max))

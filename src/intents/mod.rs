@@ -11,20 +11,8 @@
 //! # }
 //! ```
 //!
-//! One match on the selector. A selector in the table is decoded by a function that
-//! reads fixed slots; any other selector costs that match and nothing else, with no
-//! allocation. Containers (a 4337 bundle, a router's `multicall`, a Relay fill) build
-//! inner calls and dispatch them through the same match, so one transaction can yield
-//! several intents, each with the contracts it was found under (`via`) and the party it
-//! is for (`actor`).
-//!
-//! `actor` is not the transaction sender. In a `handleOps` bundle the sender is a
-//! bundler and the user is `op.sender`; in a Relay fill the sender is a solver and the
-//! wallet delivered to is the actor. `None` means the transaction sender, left
-//! unresolved because recovering it is an ECDSA recovery the caller may not need.
-//!
-//! Ported from the Python version's `intents.py` and `decoders/`, and held to it by
-//! `tests/intents.rs`.
+//! `actor` is not the transaction sender: in a 4337 bundle it is the user inside, in a
+//! Relay fill the wallet delivered to. `None` means the sender, left unrecovered.
 
 mod abi;
 mod erc20;
@@ -44,31 +32,24 @@ use serde::ser::{Serialize, SerializeStruct, Serializer};
 use crate::codec::{Tx, addr, checksum, decimal};
 use abi::{Malformed, Result};
 
-/// Containers nest: handleOps, executeBatch, a Relay router, AllowanceHolder, Settler is
-/// five deep on mainnet today. Eight leaves room and still stops a payload that nests
-/// itself forever.
+/// Five deep is seen on mainnet; eight leaves room and stops a self-nesting payload.
 pub const MAX_DEPTH: usize = 8;
 
-/// Longest `via` a call can carry: the transaction's `to`, one per nesting level, and
-/// one more for a 0x target, with room for a caller's longer starting path.
+/// The `to`, one per nesting level, one for a 0x target, and room to spare.
 const VIA_MAX: usize = 12;
 
 /// What an intent asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
-    /// `token_in`/`amount_in` sold, `token_out`/`amount_out` bought, `recipient` gets
-    /// the output.
+    /// `token_in` sold, `token_out` bought, `recipient` gets the output.
     Swap,
-    /// `token_in`/`amount_in` moved to `recipient`; `payer` set when it is not the
-    /// actor. A plain ETH transfer (no calldata, value > 0) has `token_in` None.
+    /// `token_in` moved to `recipient`; `payer` set when not the actor.
     Transfer,
     /// `token_in` approved to `recipient` for `amount_in`.
     Approve,
-    /// A solver delivers `token_out` to `recipient` (the actor); `payer` is the solver
-    /// treasury.
+    /// A solver delivers `token_out` to `recipient` (the actor).
     RelayFill,
-    /// The actor sells `token_in`; `token_out` goes to Relay as credit and is paid out
-    /// elsewhere.
+    /// The actor sells `token_in` for Relay credit paid out elsewhere.
     RelaySell,
 }
 
@@ -84,8 +65,7 @@ impl Kind {
     }
 }
 
-/// Contracts walked to reach a call, outermost first. Kept inline, so walking into a
-/// nested call copies a few hundred bytes instead of allocating.
+/// Contracts walked to reach a call, outermost first. Inline, so nesting doesn't allocate.
 #[derive(Clone, Copy)]
 pub struct Via {
     len: u8,
@@ -98,7 +78,6 @@ impl Via {
         path: [[0; 20]; VIA_MAX],
     };
 
-    /// None if the path is longer than a call can carry.
     pub fn from_slice(path: &[[u8; 20]]) -> Option<Via> {
         let mut via = Via::EMPTY;
         via.path.get_mut(..path.len())?.copy_from_slice(path);
@@ -137,20 +116,18 @@ impl std::fmt::Debug for Via {
     }
 }
 
-/// One call to decode: the top-level transaction, or a call nested inside one.
+/// The top-level transaction, or a call nested inside one.
 #[derive(Clone, Copy)]
 pub struct Call<'a> {
     pub to: Option<[u8; 20]>,
-    /// msg.value, big-endian.
     pub value: [u8; 32],
     pub data: &'a [u8],
-    /// The party this call is for. None means the transaction sender.
+    /// None means the transaction sender.
     pub actor: Option<[u8; 20]>,
     pub via: Via,
 }
 
 impl<'a> Call<'a> {
-    /// A call nested inside this one: same actor unless given, `via` extended by `to`.
     fn inner(
         &self,
         to: [u8; 20],
@@ -168,11 +145,9 @@ impl<'a> Call<'a> {
     }
 }
 
-/// What a call asks for, not what it got: the feed carries no outcome. `actor` is what
-/// the calldata claims, and only a receipt confirms it.
-///
-/// Amounts are big-endian uint256. `amount_in` is exact and `amount_out` a minimum when
-/// `exact_in`; the other way round otherwise. A token of None is native ETH.
+/// What a call asks for, not what it got. Amounts are big-endian uint256: `amount_in`
+/// exact and `amount_out` a minimum when `exact_in`, the other way round otherwise. A
+/// token of None is native ETH.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Intent {
     pub kind: Kind,
@@ -185,7 +160,7 @@ pub struct Intent {
     pub amount_out: Option<[u8; 32]>,
     pub exact_in: bool,
     pub recipient: Option<[u8; 20]>,
-    /// Relay's order id, the word it appends after the ABI body.
+    /// The word Relay appends after the ABI body.
     pub order_id: Option<[u8; 32]>,
 }
 
@@ -206,8 +181,7 @@ impl Intent {
         }
     }
 
-    /// One line: kind, in, out, where to, through what. Amounts are raw. The same line
-    /// the Python CLI prints.
+    /// The one-line summary the Python CLI prints.
     pub fn describe(&self) -> String {
         let mut out = format!("{:<12}", self.kind.as_str());
         if self.token_in.is_some() || self.amount_in.is_some() {
@@ -250,8 +224,7 @@ fn token_label(token: Option<[u8; 20]>, has_amount: bool) -> String {
     }
 }
 
-/// The JSON shape of the Python version's `Intent.as_dict()`: checksummed addresses,
-/// amounts as plain JSON numbers however big.
+/// The Python version's `Intent.as_dict()`: amounts as plain JSON numbers however big.
 impl Serialize for Intent {
     fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         let a = |v: &Option<[u8; 20]>| v.as_ref().map(|v| checksum(v));
@@ -277,14 +250,9 @@ impl Serialize for Intent {
     }
 }
 
-// --------------------------------------------------------------------------- //
-// the table
-// --------------------------------------------------------------------------- //
-
 macro_rules! selectors {
     ($($name:ident = $hex:literal, $sig:literal;)*) => {
         $(pub(crate) const $name: u32 = $hex;)*
-        /// Every selector in the table with the signature it was computed from.
         #[cfg(test)]
         const SIGNATURES: &[(u32, &str)] = &[$(($hex, $sig)),*];
     };
@@ -333,8 +301,7 @@ selectors! {
 /// Pons's buy. No signature database knows it; see `pons.rs`.
 pub(crate) const PONS_BUY: u32 = 0xc1120e3d;
 
-/// Decode `call` and append its intents to `out`. A call that doesn't fit its own
-/// layout adds nothing: say nothing rather than something wrong.
+/// Append `call`'s intents to `out`. One that doesn't fit its layout adds nothing.
 pub fn decode_call(call: &Call, depth: usize, out: &mut Vec<Intent>) {
     if depth > MAX_DEPTH || call.data.len() < 4 {
         return;
@@ -383,8 +350,7 @@ pub fn decode_call(call: &Call, depth: usize, out: &mut Vec<Intent>) {
     }
 }
 
-/// Every intent in a call made from these parts. What `decode_intents` does with a
-/// transaction's own fields. `value` is big-endian, of any length.
+/// `decode_intents` on loose parts. `value` is big-endian, of any length.
 pub fn decode(to: Option<[u8; 20]>, value: &[u8], data: &[u8]) -> Vec<Intent> {
     let skip = value.iter().take_while(|&&b| b == 0).count();
     let Some(pad) = 32usize.checked_sub(value.len() - skip) else {
@@ -400,7 +366,6 @@ pub fn decode(to: Option<[u8; 20]>, value: &[u8], data: &[u8]) -> Vec<Intent> {
         via: to.map_or(Via::EMPTY, |t| Via::EMPTY.with(t).unwrap()),
     };
     if let (Some(to), true, true) = (to, data.is_empty(), skip < value.len()) {
-        // No calldata, so no selector to dispatch on: a plain ETH transfer.
         return vec![Intent {
             amount_in: Some(v),
             recipient: Some(to),
@@ -412,19 +377,12 @@ pub fn decode(to: Option<[u8; 20]>, value: &[u8], data: &[u8]) -> Vec<Intent> {
     out
 }
 
-/// Every intent in one transaction. A transaction with no match costs a selector match
-/// and allocates nothing.
+/// Every intent in one transaction. One with no known selector allocates nothing.
 pub fn decode_intents(tx: &Tx) -> Vec<Intent> {
     decode(tx.to_bytes, tx.value_be(), tx.data())
 }
 
-// --------------------------------------------------------------------------- //
-// labels
-// --------------------------------------------------------------------------- //
-
-/// Names for the contracts `via` walks through. Display only; nothing dispatches on
-/// these. Verified on Robinhood Chain mainnet 2026-09-09 by the Python version's
-/// authors; they go stale, which is cosmetic.
+/// Display names for `via`. Nothing dispatches on them.
 const LABELS: &[(&str, &str)] = &[
     (
         "0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108",

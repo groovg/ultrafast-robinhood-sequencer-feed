@@ -1,9 +1,4 @@
-//! Checks the Rust decoder against the Python version, field by field.
-//!
-//! `golden.jsonl` holds what the Python code decodes from `tests/fixtures/frames.jsonl`,
-//! plus transactions signed from its test templates. `golden.py` writes it. The Python
-//! code is itself tested against eth-account, eth_utils and rlp, so matching it here
-//! means matching those too. Regenerate the file after changing the Python decoder:
+//! The decoder against the Python version's output, field by field. Regenerate with:
 //!
 //!     uv run --project ../robinhood-chain-sequencer-feed --extra dev python tests/golden.py > tests/golden.jsonl
 
@@ -31,7 +26,6 @@ fn golden() -> Vec<Value> {
         .collect()
 }
 
-/// The capture's non-empty lines, which golden.jsonl refers to by index.
 fn frames() -> Vec<String> {
     std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/frames.jsonl"),
@@ -119,7 +113,6 @@ fn recovering_senders_in_bulk_matches_python() {
             .iter()
             .zip(line["messages"].as_array().unwrap())
         {
-            // Both ways of recovering them in bulk, taking turns.
             if m.seq % 2 == 0 {
                 recover_senders(&m.txs);
             } else {
@@ -196,13 +189,11 @@ fn an_l2msg_past_the_size_cap_is_ignored() {
     assert!(decode_l2_message(&batch(unsigned(pad + 1))).is_empty());
 }
 
-/// geth refuses what Python lets through. Each case breaks one rule in the first
-/// transaction of a two-entry batch, so the second one must be voided with it.
+/// Rules geth enforces and Python doesn't, each broken in the first entry of a batch.
 #[test]
 fn an_envelope_geth_refuses_voids_its_siblings() {
     let raw = signed_l2_msg()[1..].to_vec(); // 0x02 || list of 12 fields
     let body = &raw[1..];
-    // Re-encode the 12 fields with one of them replaced.
     let fields = rlp_items(body);
     let with = |k: usize, item: &[u8]| {
         let mut items = fields.clone();
@@ -240,7 +231,6 @@ fn an_envelope_geth_refuses_voids_its_siblings() {
     assert_eq!(decode_l2_message(&Bytes::from(same)).len(), 1);
 }
 
-/// Every top-level item of an RLP list, prefix included.
 fn rlp_items(list: &[u8]) -> Vec<Vec<u8>> {
     let (mut i, end) = match list[0] {
         h @ 0xc0..=0xf7 => (1, 1 + usize::from(h - 0xc0)),
@@ -321,10 +311,6 @@ fn batch_nesting_stops_exactly_at_the_arbos_cap() {
     // Untrusted input must not be able to exhaust the stack.
     assert!(decode_l2_message(&nest(signed_l2_msg(), 10_000)).is_empty());
 }
-
-// --------------------------------------------------------------------------- //
-// feed signatures, against a message taken off mainnet
-// --------------------------------------------------------------------------- //
 
 fn with(field: &str, value: Value) -> String {
     let mut v: Value = serde_json::from_str(&verified_message()).unwrap();
@@ -444,10 +430,6 @@ fn an_unusable_signature_is_not_accepted() {
     }
 }
 
-// --------------------------------------------------------------------------- //
-// backends agree
-// --------------------------------------------------------------------------- //
-
 /// Every signature in the capture and the fixtures, through both backends directly.
 #[cfg(feature = "ufsecp")]
 #[test]
@@ -471,8 +453,6 @@ fn ufsecp_and_libsecp256k1_recover_the_same_addresses() {
     check(&digest, &[0xff; 32], &[1; 32]);
     check(&digest, &[1; 32], &[0xff; 32]);
     check(&digest, &[0; 32], &[1; 32]);
-    // Real feed signatures. Transaction senders go through ufsecp in the golden tests
-    // above whenever this feature is on, and are held to Python's answers there.
     for line in frames() {
         let frame = frame_from_slice(line.as_bytes()).unwrap();
         for e in frame.entries() {
@@ -489,10 +469,6 @@ fn ufsecp_and_libsecp256k1_recover_the_same_addresses() {
     }
     assert!(n >= 4);
 }
-
-// --------------------------------------------------------------------------- //
-// transactions arbos builds from parent-chain messages
-// --------------------------------------------------------------------------- //
 
 #[test]
 fn deposits_and_retryables_are_built_as_python_and_the_node_do() {

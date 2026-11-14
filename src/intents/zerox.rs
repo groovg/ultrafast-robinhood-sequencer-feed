@@ -1,8 +1,5 @@
-//! 0x Protocol v2: AllowanceHolder.exec hands tokens to a Settler, which runs the route.
-//!
-//! `exec` names what is sold. Settler's leading slippage tuple names who receives,
-//! which token, and the minimum, unless it is all zeros, which tells Settler to skip the
-//! check and tells us nothing. The route itself is not read.
+//! 0x v2: `exec` names what is sold; Settler's slippage tuple names the recipient, token
+//! and minimum, unless all zeros (no check). The route isn't read.
 
 use super::abi::{Result, ZERO, address, dynamic, token, uint};
 use super::{Call, Intent, Kind, SETTLER_EXECUTE};

@@ -1,8 +1,4 @@
-//! Field-by-field parity with the Python baseline's intent decoders.
-//!
-//! `tests/golden_intents.jsonl` is written by `tests/golden_intents.py` from the
-//! baseline: every call its own test suite decodes, every transaction in
-//! `tests/fixtures/frames.jsonl`, and every prefix of their calldata.
+//! Intents against the Python version's, from `tests/golden_intents.jsonl`.
 
 use std::collections::HashMap;
 use std::path::Path;

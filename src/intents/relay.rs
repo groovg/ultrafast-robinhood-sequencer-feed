@@ -1,31 +1,17 @@
-//! Relay's router: a solver's fill and a wallet's sell, one intent each.
-//!
-//! A buy is paid on Solana and filled here by a solver spending its own money through
-//! `permit2TransferAndMulticall`; the wallet appears only as `refundTo`. A sell runs
-//! inside the wallet's own 4337 operation through `transferAndMulticall`, and the
-//! proceeds go to Relay, not back to the wallet.
-//!
-//! Both carry a `calls` array of [approve, AllowanceHolder.exec, executor sweep or
-//! deposit]. The swap inside is decoded through the table, but its output is folded
-//! into the one Relay intent rather than returned beside it, so a consumer counting
-//! trades sees one.
-//!
-//! The executor's calls are unverified contracts read by shape: four dynamic arrays,
-//! the first of them `address[] tokens`. The Python version's authors confirmed against
-//! receipts on 2026-10-07 that a fill's sweep names the delivered token, a sell's
-//! deposit names what Relay receives, and the word Relay appends after the ABI body of
-//! both router calls is the order id.
+//! Relay's router: a solver's fill (the wallet is only `refundTo`) and a wallet's sell
+//! (proceeds go to Relay). The inner swap folds into the one Relay intent, so a consumer
+//! counting trades sees one. Executor calls are unverified contracts read by shape: the
+//! first `address[]` names the token.
 
 use super::abi::{
     Result, WORD, address, dynamic, small, static_array, tuple_array, tuple_at, uint, word,
 };
 use super::{Call, Intent, Kind, decode_call};
 
-/// Executor entry points seen under the router. Read by shape, never dispatched.
+/// Executor entry points, read by shape, never dispatched.
 const EXECUTOR_SWEEP: [u8; 4] = [0x9b, 0xb4, 0x37, 0x18];
 const EXECUTOR_DEPOSIT: [u8; 4] = [0x73, 0xb7, 0xbb, 0x2f];
 
-/// First address of the first array in an executor call.
 fn first_token(executor_data: &[u8]) -> Result<Option<[u8; 20]>> {
     match static_array(&executor_data[4..], 0, 1)?.next() {
         Some(t) => Ok(Some(address(t, 0)?)),
@@ -55,9 +41,7 @@ fn walk(
     Ok(executor_token)
 }
 
-/// The word Relay appends after the ABI body, or None when there is none. `last_slot`
-/// holds the offset of the final dynamic argument; the body ends where that argument's
-/// padded bytes end.
+/// The word after the ABI body, which ends with the last dynamic argument at `last_slot`.
 fn trailing_word(d: &[u8], last_slot: usize) -> Result<Option<[u8; 32]>> {
     let off = small(word(d, last_slot)?).unwrap_or(usize::MAX);
     let n = word(d.get(off..).unwrap_or_default(), 0)?;
@@ -70,7 +54,6 @@ fn trailing_word(d: &[u8], last_slot: usize) -> Result<Option<[u8; 32]>> {
         .map(|end| d[end..].try_into().unwrap()))
 }
 
-/// Output named by an inner swap's slippage check, when there was one.
 fn swap_out(found: &[Intent]) -> (Option<[u8; 20]>, Option<[u8; 32]>) {
     found
         .iter()

@@ -1,10 +1,5 @@
-//! Read Robinhood Chain's sequencer feed and decode it quickly.
-//!
-//! Ported from Chainstack's Python package `rhfeed`
-//! (github.com/chainstacklabs/robinhood-chain-sequencer-feed). The Python module
-//! docstrings explain the design in more detail (why RLP is scanned instead of parsed,
-//! why `hash` and `sender` are computed lazily, what the feed signature covers, how
-//! reorgs show up). The code here follows them closely.
+//! Read Robinhood Chain's sequencer feed and decode it quickly. Ported from Chainstack's
+//! Python `rhfeed` (github.com/chainstacklabs/robinhood-chain-sequencer-feed).
 
 pub mod codec;
 pub mod consume;

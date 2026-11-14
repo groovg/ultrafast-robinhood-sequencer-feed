@@ -1,28 +1,9 @@
-//! Follow some wallets and print a signal as soon as the sequencer orders a trade of
-//! theirs that we can decode. The decode half of a copy-trading bot: what to do with a
-//! signal is up to you.
+//! Print a JSON line when the sequencer orders a trade (swap, Relay fill or sell) by a
+//! followed wallet. The trade can still revert, and `actor` is only what the calldata
+//! claims: anyone can name a wallet you follow.
 //!
 //!     cargo run --release --example copy_trade -- 0xabc... 0xdef...
-//!     cargo run --release --example copy_trade -- --busy 0xabc...
-//!
-//! A trade is a swap, a Relay fill or a Relay sell. A followed wallet's transaction that
-//! decodes to no trade (nothing at all, or only an approve or a transfer) prints
-//! nothing.
-//!
-//! The wallet is the intent's `actor` when the calldata names one: the user inside a
-//! 4337 bundle, or the wallet a Relay fill delivers to. That is a set lookup. Only a
-//! trade whose calldata names no one (a plain wallet trading through a router) needs its
-//! sender recovered to tell whose it is, and each signal recovers its sender for the
-//! `sender` field.
-//!
-//! `--busy` trades CPU for latency: the feed is read by a thread that never sleeps,
-//! messages are picked up by spinning, and the feed recovers the senders on 7 spinning
-//! threads while it checks the signature (`FeedBuilder::senders`). That's 9 cores at
-//! 100%, and a message's senders are known about 250 µs sooner.
-//!
-//! One JSON line per signal on stdout. The transaction has been ordered but not
-//! executed yet, so it can still revert. And `actor` is only what the calldata claims:
-//! anyone can send a transaction naming a wallet you follow. The receipt confirms it.
+//!     cargo run --release --example copy_trade -- --busy 0xabc...   # 9 cores at 100%
 
 use std::collections::HashSet;
 
@@ -37,10 +18,9 @@ struct Signal<'a> {
     seen_at: f64,
     hash: String,
     intent: &'a Intent,
-    /// Who signed, so you can see when the claimed actor differs.
+    /// Who signed, to compare with the claimed actor.
     sender: Option<String>,
-    /// Posted on Ethereum, not ordered by the sequencer: nobody checked its signature,
-    /// nonce or balance, and a node skips it without a receipt if one doesn't hold.
+    /// Posted on Ethereum: nobody checked it, and a node may skip it without a receipt.
     from_parent_chain: bool,
 }
 
@@ -62,12 +42,10 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // If the wallets you follow only trade through known routers, list them here. It
-    // checks the transaction's `to`, which is right for plain wallets and wrong for
-    // 4337 bundles and Relay fills, where `to` is the EntryPoint or the Relay router.
+    // Routers your wallets trade through, if known. Wrong for 4337 bundles and Relay
+    // fills, whose `to` is the EntryPoint or the Relay router.
     let contracts: HashSet<[u8; 20]> = HashSet::new();
 
-    // Two connections: each message comes from whichever gets it first.
     let mut feed = Feed::builder()
         .source(MAINNET_FEED)
         .source(MAINNET_FEED)
@@ -76,10 +54,9 @@ async fn main() {
         .senders(if busy { 7 } else { 0 })
         .spawn();
 
-    // Read from a spawned task, not main's own thread: see Feed::recv.
+    // A spawned task, not main's own thread: see Feed::recv.
     tokio::spawn(async move {
         while let Some(msg) = feed.recv().await {
-            // Every trade in the message, with the transaction it came from.
             let trades: Vec<_> = msg
                 .txs
                 .iter()
@@ -90,8 +67,7 @@ async fn main() {
                 .filter(|(_, i)| is_trade(i))
                 .filter(|(_, i)| i.actor.is_none_or(|a| follow.contains(&a)))
                 .collect();
-            // The senders still needed, all at once, spread over the cores. With --busy
-            // the feed has recovered them already.
+            // With --busy the feed has recovered them already.
             if !busy {
                 recover_senders(trades.iter().map(|(t, _)| *t));
             }

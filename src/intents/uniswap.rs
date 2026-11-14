@@ -19,7 +19,6 @@ pub fn v3_path_ends(path: &[u8]) -> (Option<[u8; 20]>, Option<[u8; 20]>) {
     )
 }
 
-/// Puts the two amounts of a swap in their places: exact first when `exact_in`.
 pub fn amounts(intent: &mut Intent, first: [u8; 32], second: [u8; 32], exact_in: bool) {
     (intent.amount_in, intent.amount_out) = if exact_in {
         (Some(first), Some(second))
@@ -29,8 +28,7 @@ pub fn amounts(intent: &mut Intent, first: [u8; 32], second: [u8; 32], exact_in:
     intent.exact_in = exact_in;
 }
 
-/// `*Single` structs are static, so the tuple sits inline right after the selector.
-/// `slots` are (recipient, first amount, second amount).
+/// `*Single` structs are static and sit inline. `slots`: recipient, first, second amount.
 pub fn single(call: &Call, out: &mut Vec<Intent>, slots: [usize; 3], exact_in: bool) -> Result<()> {
     let d = &call.data[4..];
     let [recipient, first, second] = slots;

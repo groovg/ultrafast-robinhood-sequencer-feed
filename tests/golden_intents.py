@@ -2,14 +2,8 @@
 
     uv run --project ../robinhood-chain-sequencer-feed --extra dev python tests/golden_intents.py > tests/golden_intents.jsonl
 
-Run it with the baseline checked out next to this repository (or at $RHFEED_BASELINE).
-
-Inputs come from two places. The baseline's own test suite runs with `decode_call` and
-`decode_intents` wrapped, so every call its tests decode is recorded, edge cases
-included. Then each recorded input is decoded again with the real decoder table (some
-tests swap in a scratch one) and written out. On top of that, one line per transaction
-in `tests/fixtures/frames.jsonl`, keyed by hash, so the Rust side also checks its own
-path from frame to calldata.
+Every call the baseline's own test suite decodes (recorded by wrapping `decode_call` and
+`decode_intents`, then decoded again with the real table), plus every frame transaction.
 """
 
 from __future__ import annotations
@@ -37,8 +31,7 @@ DECODE_CALL = intents.decode_call
 DECODE_INTENTS = intents.decode_intents
 calls: set = set()
 txs: set = set()
-# Every prefix of every captured transaction: ~76,000 calls. The prefix lines below
-# cover them compactly, so this test's own calls aren't recorded one by one.
+# ~76,000 prefix calls, covered compactly by the prefix lines instead.
 PREFIX_TEST = "test_truncated_calldata_never_raises"
 
 
@@ -90,8 +83,7 @@ def sort_key(t: tuple):
 
 
 def main() -> None:
-    # Patched before pytest collects the test modules, so their `from ... import` lines
-    # pick up the recording versions.
+    # Before collection, so the tests' `from ... import` lines get the recording versions.
     intents.decode_call = recording_call
     intents.decode_intents = rhfeed.decode_intents = rhfeed.cli.decode_intents = recording_intents
     with contextlib.redirect_stdout(sys.stderr):
@@ -104,7 +96,6 @@ def main() -> None:
         if line.strip():
             for msg in parse_frame(json.loads(line)):
                 frame_txs.extend(msg.txs)
-    # Inputs the frame lines below already cover, so the fixture doesn't carry their calldata.
     covered = {(t.to_bytes, t.value, bytes(t.data)) for t in frame_txs}
 
     skipped = 0
@@ -129,10 +120,8 @@ def main() -> None:
         print(json.dumps({"tx": tx, "intents": [intent_record(i) for i in out]}))
     for t in frame_txs:
         print(json.dumps({"hash": t.hash, "intents": [intent_record(i) for i in DECODE_INTENTS(t)]}))
-    # What the baseline's prefix test feeds decode_call. Only the prefixes that decode to
-    # something are written, as runs [first length, last length, intents] with the same
-    # result; every other prefix must decode to nothing. A deploy (no `to`) is left out:
-    # its via there is an empty address.
+    # Runs [first length, last length, intents] of prefixes that decode to something; every
+    # other prefix must decode to nothing. Deploys are left out (empty `to` in via).
     for t in frame_txs:
         if t.to_bytes is None:
             continue

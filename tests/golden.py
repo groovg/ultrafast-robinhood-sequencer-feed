@@ -2,15 +2,9 @@
 
     uv run --project ../robinhood-chain-sequencer-feed --extra dev python tests/golden.py > tests/golden.jsonl
 
-Run it with the baseline checked out next to this repository (or at $RHFEED_BASELINE):
-
-    git clone https://github.com/chainstacklabs/robinhood-chain-sequencer-feed ../robinhood-chain-sequencer-feed
-
-Three kinds of line: one per frame in `tests/fixtures/frames.jsonl` (real traffic), keyed by
-its index among the non-empty lines; one per envelope signed from the baseline's
-`tests/test_codec.py` templates (every layout the decoder models, plus a pre-EIP-155 legacy
-signature, which the capture does not contain); and one per l2Msg from the baseline's tests
-of what arbos refuses, with the hashes of the transactions it yields.
+With the baseline checked out next to this repository (or at $RHFEED_BASELINE). Lines: every
+frame of `tests/fixtures/frames.jsonl`, envelopes signed from the baseline's templates, its
+l2Msg refusal cases, and its parent-chain entries.
 """
 
 from __future__ import annotations
@@ -32,7 +26,6 @@ from rhfeed import decode_l2_message, decode_transaction, parse_frame  # noqa: E
 
 
 def tx_record(tx, raw: bool = False) -> dict:
-    # Raw bytes only where the Rust side has nothing else to decode from.
     return ({"raw": tx.raw.hex()} if raw else {}) | {
         "hash": tx.hash,
         "tx_type": tx.tx_type,
@@ -85,10 +78,7 @@ def main() -> None:
 
 
 def parent_chain_entries():
-    """The baseline's SubmitRetryable and EthDeposit entries, whose built transactions were
-    checked against each chain's eth_getTransactionByHash, and its malformed variants. Only
-    variants our typed frame can parse: a header field of the wrong JSON type fails the
-    whole entry there, which tests/feed.rs covers."""
+    """The baseline's parent-chain entries and the malformed variants our typed frame parses."""
     import test_parent_chain as t
 
     for seq, node in sorted(t.NODE.items()):
@@ -117,8 +107,7 @@ def parent_chain_entries():
 
 
 def l2_messages():
-    """Batches from the baseline's tests: a signed transaction beside each entry they
-    parametrize, plus the sibling, empty-entry, truncated-tail and 7702 cases."""
+    """A signed transaction beside each entry the baseline's refusal tests parametrize."""
     t = test_codec
     first = t._signed_l2_msg(0)
     for test in (
