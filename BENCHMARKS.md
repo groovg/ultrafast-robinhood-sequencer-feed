@@ -63,13 +63,13 @@ libsecp256k1 columns were measured together in November 2026, Python at its comm
 - What's left in the feed path is mostly cryptography: about 13 µs of keccak over the
   signed data (~10 KB on average) and about 9 µs for the ECDSA check.
 - Every feed message is signed by the same key. `FixedKey` verifies against that key
-  with precomputed tables (~330 KB each for the key and the generator) instead of
+  with precomputed tables (~270 KB each for the key and the generator) instead of
   recovering the signer. [libsecp256k1](https://github.com/bitcoin-core/secp256k1) can
-  only precompute for the generator, so `FixedKey` is built on
-  [k256](https://crates.io/crates/k256)'s field arithmetic, with libsecp256k1's point
-  addition formulas (8 multiplications and 3 squarings, against about 12
-  multiplications for k256's own). Those took it from 12.2 to 9.3 µs. About 1.9 µs of
-  the rest is inverting s. A test checks it against libsecp256k1's verify.
+  only precompute for the generator, so `FixedKey` is a small C file on libsecp256k1's
+  field, scalar and group code (`csrc/`). It replaced a Rust version on
+  [k256](https://crates.io/crates/k256)'s field arithmetic: 9.25 to 7.56 µs with
+  clang-cl. MSVC has no 128-bit integer and makes it 12.6 µs, so the Windows build uses
+  clang-cl when it finds it. A test checks it against libsecp256k1's verify.
 - A verifier recovers the first message from a new signer and checks the later ones
   against its key. The mainnet key is built in.
 - Senders still need recovery, one key each.

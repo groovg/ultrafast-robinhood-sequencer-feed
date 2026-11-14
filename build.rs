@@ -36,8 +36,36 @@ fn link_static(dir: &Path, files: &[&str]) {
     println!("cargo:rustc-link-lib=static={name}");
 }
 
+/// clang-cl on PATH or where the LLVM installer puts it.
+fn clang_cl() -> Option<PathBuf> {
+    let on_path = std::process::Command::new("clang-cl")
+        .arg("--version")
+        .output();
+    if on_path.is_ok_and(|o| o.status.success()) {
+        return Some("clang-cl".into());
+    }
+    let default = PathBuf::from(r"C:\Program Files\LLVM\bin\clang-cl.exe");
+    default.exists().then_some(default)
+}
+
 fn main() {
-    // Only the `ufsecp` feature links anything native on top of what the crates bring.
+    println!("cargo:rerun-if-changed=csrc");
+    let mut fixedkey = cc::Build::new();
+    fixedkey
+        .file("csrc/fixedkey.c")
+        .include("csrc/secp256k1")
+        .warnings(false);
+    // MSVC has no 128-bit integer, which makes libsecp256k1's field code slower than the
+    // Rust it replaces (12.6 vs 9.3 µs per verify, against 7.6 with clang-cl).
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        if let Some(clang) = clang_cl() {
+            fixedkey.compiler(clang);
+        } else {
+            println!("cargo:warning=clang-cl not found, FixedKey built with MSVC is slower");
+        }
+    }
+    fixedkey.compile("rhfeed_fixedkey");
+
     println!("cargo:rerun-if-env-changed=UFSECP_LIB_DIR");
     println!("cargo:rerun-if-env-changed=CLANG_RT_DIR");
     if std::env::var_os("CARGO_FEATURE_UFSECP").is_none() {

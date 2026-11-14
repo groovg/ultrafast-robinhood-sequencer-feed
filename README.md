@@ -198,8 +198,8 @@ let mut feed = rhfeed::Feed::builder()
 
 ## Faster sender recovery with UltrafastSecp256k1
 
-Feed signatures are checked against the known key with precomputed tables, built on
-[k256](https://crates.io/crates/k256). Transaction senders still need an ECDSA
+Feed signatures are checked against the known key with precomputed tables, in C on
+libsecp256k1's own field and group code (`csrc/`). Transaction senders still need an ECDSA
 recovery each. By default that's [libsecp256k1](https://github.com/bitcoin-core/secp256k1)
 through the [`secp256k1`](https://crates.io/crates/secp256k1) crate, the same C library
 the Python version calls through [coincurve](https://github.com/ofek/coincurve).
@@ -272,6 +272,7 @@ on, and connect to the feed directly if you care about reorgs.
 | `src/intents/` | reading calldata into trade intents, one module per protocol |
 | `src/verify.rs` | checking the sequencer's signature |
 | `src/secp.rs` | ECDSA: recovery (libsecp256k1 or UltrafastSecp256k1) and the known-key check |
+| `csrc/` | the known-key check in C, on libsecp256k1's field and group headers (vendored, MIT) |
 | `src/consume.rs` | `Feed`: connections, reconnects, dedup, reorgs, timing, busy polling |
 | `src/main.rs` | the `rhfeed` command |
 | `tests/golden.rs` | checks the decoder against the Python version's output in `tests/golden.jsonl` |
