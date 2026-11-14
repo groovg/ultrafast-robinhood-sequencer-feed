@@ -30,6 +30,8 @@ def main():
     places = dict(arg.split("=", 1) for arg in sys.argv[1:])
     arrivals = {name: load(path) for name, path in places.items()}
     common = set.intersection(*(set(a) for a in arrivals.values()))
+    if not common:
+        sys.exit("no sequence number appears in every file")
     print(f"{len(common)} messages seen in all {len(places)} places\n")
     print(f"{'place':<16}{'first':>8}{'median behind':>16}{'p90':>10}{'p99':>10}")
     for name, a in arrivals.items():

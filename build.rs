@@ -27,6 +27,8 @@ fn link_static(dir: &Path, files: &[&str]) {
         .unwrap_or(file)
         .trim_end_matches(".lib")
         .trim_end_matches(".a");
+    // Relink when the library is rebuilt in place.
+    println!("cargo:rerun-if-changed={}", path.display());
     println!(
         "cargo:rustc-link-search=native={}",
         path.parent().unwrap().display()
