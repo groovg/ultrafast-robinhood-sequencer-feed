@@ -412,7 +412,7 @@ fn changing_any_signed_field_breaks_verification() {
 
 #[test]
 fn an_unusable_signature_is_not_accepted() {
-    let b64 = |b: &[u8]| base64_turbo::STANDARD.encode(b);
+    let b64 = base64;
     for sig in [
         Value::Null,
         "".into(),
@@ -457,7 +457,7 @@ fn ufsecp_and_libsecp256k1_recover_the_same_addresses() {
         let frame = frame_from_slice(line.as_bytes()).unwrap();
         for e in frame.entries() {
             if let Some(sig) = e.signature_v2.as_deref() {
-                let sig = base64_turbo::STANDARD.decode(sig).unwrap();
+                let sig = rhfeed::codec::b64(sig).unwrap();
                 let digest = rhfeed::keccak(&signature_payload(e, MAINNET_CHAIN_ID).unwrap());
                 check(
                     &digest,
@@ -511,9 +511,9 @@ fn a_parent_chain_payload_past_the_size_cap_is_refused() {
         };
         assert_eq!(count(&entry), 1, "{seq}");
         let l2 = &mut entry["message"]["message"]["l2Msg"];
-        let mut payload = base64_turbo::STANDARD.decode(l2.as_str().unwrap()).unwrap();
+        let mut payload = rhfeed::codec::b64(l2.as_str().unwrap()).unwrap();
         payload.resize(MAX_L2_MESSAGE_SIZE + 1, 0);
-        *l2 = Value::String(base64_turbo::STANDARD.encode(&payload));
+        *l2 = Value::String(base64(&payload));
         assert_eq!(count(&entry), 0, "{seq}");
     }
 }
@@ -549,4 +549,21 @@ fn a_7702_envelope_without_to_or_with_a_wide_integer_is_refused() {
     let long = [vec![L2_SIGNED_TX, 0xf8, 9], vec![0x80; 9]].concat();
     assert_eq!(decode_l2_message(&Bytes::from(short)).len(), 1);
     assert!(decode_l2_message(&Bytes::from(long)).is_empty());
+}
+
+fn base64(b: &[u8]) -> String {
+    use simdutf::Base64Options;
+    // SAFETY: `out` is as long as simdutf says the encoding of `b` is.
+    unsafe {
+        let mut out =
+            vec![0u8; simdutf::base64_length_from_binary(b.len(), Base64Options::Default)];
+        let n = simdutf::binary_to_base64(
+            b.as_ptr(),
+            b.len(),
+            out.as_mut_ptr(),
+            Base64Options::Default,
+        );
+        out.truncate(n);
+        String::from_utf8(out).unwrap()
+    }
 }

@@ -6,7 +6,7 @@ description = "Decode an Arbitrum Orbit sequencer feed, fast enough to act on it
 license = "Apache-2.0"
 
 [dependencies]
-base64-turbo = "0.6"
+simdutf = "0.7"
 bytes = "1"
 clap = { version = "4", features = ["derive"], optional = true }
 hex = "0.4"

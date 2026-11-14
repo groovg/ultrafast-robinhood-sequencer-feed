@@ -84,10 +84,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
-name = "base64-turbo"
-version = "0.6.0"
+name = "bitflags"
+version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "488211f02b1944ca9d57949a7bac44db4c19953e6078aff0c7048d02b212993e"
+checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "block-buffer"
@@ -1070,7 +1070,6 @@ checksum = "663ba70707f96e871406fe10d68128412e619b06d1d47cb91c3a4c6501176240"
 name = "rhfeed"
 version = "0.3.0"
 dependencies = [
- "base64-turbo",
  "bytes",
  "cc",
  "clap",
@@ -1083,6 +1082,7 @@ dependencies = [
  "secp256k1",
  "serde",
  "serde_json",
+ "simdutf",
  "sonic-rs",
  "tokio",
  "tokio-rustls",
@@ -1297,6 +1297,16 @@ name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
+name = "simdutf"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f542752c7335a9174e7bb81112c3ca1415a7a6b6ec2c3e840aca347a30f9141"
+dependencies = [
+ "bitflags",
+ "cc",
+]
 
 [[package]]
 name = "simdutf8"

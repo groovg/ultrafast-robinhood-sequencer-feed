@@ -29,8 +29,30 @@ pub const MAX_L2_MESSAGE_SIZE: usize = 256 * 1024;
 const FILTER_PRECOMPILE: &str = "0x0000000000000000000000000000000000000074";
 const IS_FILTERED_SELECTOR: &str = "0x85c733a4";
 
-pub(crate) fn b64(s: &str) -> Option<Vec<u8>> {
-    base64_turbo::STANDARD.decode(s).ok()
+/// Standard base64 with padding, as Nitro writes it. simdutf was the fastest decoder on
+/// x86 and on ARM, where it beat base64-simd and base64-turbo by 1.5 to 1.8x.
+pub fn b64(s: &str) -> Option<Vec<u8>> {
+    use simdutf::{Base64Options, ErrorCode, LastChunkHandlingOptions};
+    // SAFETY: `out` has room for the longest output simdutf says `s` can decode to, and
+    // its length is set to what was written.
+    unsafe {
+        let mut out = Vec::with_capacity(simdutf::maximal_binary_length_from_base64(
+            s.as_ptr(),
+            s.len(),
+        ));
+        let r = simdutf::base64_to_binary(
+            s.as_ptr(),
+            s.len(),
+            out.as_mut_ptr(),
+            Base64Options::Default,
+            LastChunkHandlingOptions::Strict,
+        );
+        if !matches!(r.error, ErrorCode::Success) {
+            return None;
+        }
+        out.set_len(r.count);
+        Some(out)
+    }
 }
 
 pub fn keccak(data: &[u8]) -> [u8; 32] {
@@ -1014,11 +1036,15 @@ pub fn parse_frame(frame: &Frame, chain_id: Option<u64>) -> Vec<FeedMessage> {
         .collect()
 }
 
+/// An l2Msg that isn't valid base64.
+#[derive(Debug)]
+pub struct InvalidBase64;
+
 /// An entry's l2Msg, base64-decoded once for both verification and decoding. `Ok(None)`
 /// when absent or empty.
-pub fn l2_msg(entry: &Entry) -> Result<Option<Bytes>, base64_turbo::Error> {
+pub fn l2_msg(entry: &Entry) -> Result<Option<Bytes>, InvalidBase64> {
     match entry.incoming().and_then(|i| i.l2_msg.as_deref()) {
-        Some(l2) if !l2.is_empty() => Ok(Some(base64_turbo::STANDARD.decode(l2)?.into())),
+        Some(l2) if !l2.is_empty() => Ok(Some(b64(l2).ok_or(InvalidBase64)?.into())),
         _ => Ok(None),
     }
 }
