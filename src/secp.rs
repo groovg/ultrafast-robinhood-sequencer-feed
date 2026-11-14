@@ -88,8 +88,10 @@ pub mod ufsecp {
         // Never destroyed: it lives as long as the thread that uses it.
         static CTX: *mut c_void = {
             let mut ctx = std::ptr::null_mut();
-            unsafe { ufsecp_ctx_create(&mut ctx) };
-            ctx
+            match unsafe { ufsecp_ctx_create(&mut ctx) } {
+                0 => ctx,
+                _ => std::ptr::null_mut(),
+            }
         };
     }
 
@@ -101,6 +103,9 @@ pub mod ufsecp {
         }
         let mut out = [0u8; 20];
         let rc = CTX.with(|&ctx| unsafe {
+            if ctx.is_null() {
+                return -1; // no context: recovery fails rather than crashing in C
+            }
             if recid < 2 {
                 ufsecp_eth_ecrecover(
                     ctx,
@@ -152,7 +157,9 @@ unsafe extern "C" {
 /// 1..128 times a point times 2^(8·row) for 33 rows (~270 KB): a multiplication is then
 /// one addition per row and no doublings, which is what makes a known key cheap.
 fn table(compressed: &[u8; 33]) -> Option<Box<[u64]>> {
-    let mut t = vec![0u64; unsafe { rhfeed_fixedkey_table_size() } / 8].into_boxed_slice();
+    let size = unsafe { rhfeed_fixedkey_table_size() };
+    assert_eq!(size % 8, 0, "the C table must fit u64s exactly");
+    let mut t = vec![0u64; size / 8].into_boxed_slice();
     (unsafe { rhfeed_fixedkey_build(t.as_mut_ptr(), compressed.as_ptr()) } == 1).then_some(t)
 }
 
