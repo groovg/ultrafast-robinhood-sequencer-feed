@@ -57,8 +57,7 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use yawc::{HttpRequestBuilder, MaybeTlsStream, OpCode, Options, WebSocket};
 
 use crate::codec::{
-    Entry, FeedMessage, Frame, SenderPool, entry_texts, frame_from_slice, l2_msg, parse_entry_on,
-    parse_entry_with,
+    Entry, FeedMessage, Frame, SenderPool, entry_texts, frame_from_slice, l2_msg, parse_entry_with,
 };
 use crate::verify::{MAINNET_CHAIN_ID, Verifier};
 
@@ -245,7 +244,10 @@ pub struct Stats {
     pub backlog_messages: u64,
     pub live_messages: u64,
     pub duplicate_messages: u64,
+    /// Dropped without a good signature from an allowed signer.
     pub unverified_messages: u64,
+    /// Dropped because a field had the wrong JSON type, which Nitro can't read either.
+    pub malformed_messages: u64,
     pub reorgs: u64,
     pub sources: Vec<SourceStats>,
 }
@@ -319,6 +321,7 @@ struct State {
     seen: HashMap<i64, Seen>,
     stats: Stats,
     warned_unverified: bool,
+    warned_malformed: bool,
     /// Per source: (first, late) live messages since its window last reset.
     recent: Vec<(u32, u32)>,
     /// Per source: it should drop its connection and open a new one.
@@ -417,6 +420,7 @@ impl Shared {
                     ..Stats::default()
                 },
                 warned_unverified: false,
+                warned_malformed: false,
                 recent: vec![(0, 0); urls.len()],
                 replace: vec![false; urls.len()],
             }),
@@ -486,7 +490,7 @@ impl Shared {
                 // Decode first, so the pool recovers the senders while this thread
                 // checks the signature.
                 (Some(pool), true) => {
-                    let msg = parse_entry_on(entry, decodable, chain_id);
+                    let msg = parse_entry_with(entry, decodable, chain_id);
                     let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
                     let good = pool.recover_while(&msg.txs, accepted);
                     timing.verified = Instant::now();
@@ -503,7 +507,7 @@ impl Shared {
                         continue;
                     }
                     timing.verified = Instant::now();
-                    let msg = parse_entry_on(entry, decodable, chain_id);
+                    let msg = parse_entry_with(entry, decodable, chain_id);
                     timing.decoded = Instant::now();
                     msg
                 }
@@ -574,7 +578,7 @@ impl Shared {
             if let Some(v) = &self.verify {
                 std::hint::black_box(v.accepts_with(entry, l2.as_deref()));
             }
-            std::hint::black_box(parse_entry_with(entry, l2.as_ref()));
+            std::hint::black_box(parse_entry_with(entry, l2.as_ref(), None));
         }
     }
 
@@ -1079,12 +1083,17 @@ impl Source {
                         .iter()
                         .filter_map(|t| sonic_rs::from_str(t).ok())
                         .collect();
-                    warn!(
-                        "{}: dropped {} of {} messages in a frame ({err})",
-                        self.name,
-                        texts.len() - entries.len(),
-                        texts.len()
-                    );
+                    let dropped = (texts.len() - entries.len()) as u64;
+                    let mut st = self.shared.lock();
+                    st.stats.malformed_messages += dropped;
+                    if dropped > 0 && !std::mem::replace(&mut st.warned_malformed, true) {
+                        warn!(
+                            "{}: dropped a message with a field of the wrong type ({err}). \
+                             Further ones are counted in stats.malformed_messages",
+                            self.name
+                        );
+                    }
+                    drop(st);
                     Frame {
                         messages: Some(entries),
                     }

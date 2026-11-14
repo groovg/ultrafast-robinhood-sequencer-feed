@@ -282,6 +282,12 @@ async fn run() {
         eprintln!("rhfeed: {err}");
         exit(1);
     });
+    let seconds = args.seconds.map(|s| {
+        Duration::try_from_secs_f64(s).unwrap_or_else(|_| {
+            eprintln!("rhfeed: --seconds needs a number of seconds of 0 or more, not {s}");
+            exit(1);
+        })
+    });
 
     let mut builder = urls
         .iter()
@@ -377,8 +383,8 @@ async fn run() {
     // A timer instead of checking the time per message, so --seconds works even when
     // nothing arrives.
     let deadline = async {
-        match args.seconds {
-            Some(s) => tokio::time::sleep(Duration::from_secs_f64(s)).await,
+        match seconds {
+            Some(d) => tokio::time::sleep(d).await,
             None => std::future::pending().await,
         }
     };
@@ -399,6 +405,10 @@ async fn run() {
         format!(", {} unverified dropped", s.unverified_messages)
     } else {
         String::new()
+    };
+    let checked = match s.malformed_messages {
+        0 => checked,
+        n => format!("{checked}, {n} malformed dropped"),
     };
     eprintln!(
         "# {shown} transactions {counted} | {} live messages, {} backlog skipped{checked}, \

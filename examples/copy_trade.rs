@@ -39,6 +39,9 @@ struct Signal<'a> {
     intent: &'a Intent,
     /// Who signed, so you can see when the claimed actor differs.
     sender: Option<String>,
+    /// Posted on Ethereum, not ordered by the sequencer: nobody checked its signature,
+    /// nonce or balance, and a node skips it without a receipt if one doesn't hold.
+    from_parent_chain: bool,
 }
 
 fn is_trade(i: &Intent) -> bool {
@@ -106,6 +109,7 @@ async fn main() {
                     hash: tx.hash_hex(),
                     intent,
                     sender: tx.sender(),
+                    from_parent_chain: msg.from_parent_chain(),
                 };
                 println!("{}", sonic_rs::to_string(&signal).unwrap());
             }

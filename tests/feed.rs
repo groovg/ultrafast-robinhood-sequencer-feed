@@ -262,4 +262,5 @@ async fn an_entry_with_a_mistyped_field_is_dropped_and_the_rest_kept() {
     let mut feed = Feed::builder().source(url).spawn();
     // Failing the frame would reconnect, and this server has nothing more to send.
     assert_eq!(next(&mut feed).await.seq, 2);
+    assert_eq!(feed.stats().malformed_messages, 1);
 }
