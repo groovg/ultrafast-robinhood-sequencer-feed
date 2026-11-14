@@ -14,6 +14,10 @@ libsecp256k1 columns were measured together in November 2026, Python at its comm
 ## At a glance
 
 - Feed path in a tight loop: 26.6 µs, against 175 µs for the Python version.
+- Side by side on three AWS machines, with old and new versions of both projects in
+  interleaved rounds: our feed path is 3.4 to 4.1 times faster than Python's, decoding
+  8 to 13 times, trade intents 40 to 48 times. See
+  [Old and new side by side](#old-and-new-side-by-side).
 - Live on the desktop, from the last socket read to `recv()`: 95 µs at the median, or
   61 µs with `busy_poll`.
 - Live on a Linux VM: 203 µs, or 97 µs with `busy_poll`. Before our first read, the
@@ -46,14 +50,12 @@ libsecp256k1 columns were measured together in November 2026, Python at its comm
 | verify against the known key (`FixedKey`) | | 9.2 | **9.1** |
 | transactions/s on one core, sender included | 12.8k | 28.7k | **42.1k** |
 
-- Python's feed path went from 111.6 to 175 µs between its commits `95c96f0` and
-  `d6a9e4e`. Part of that is its decoder doing more work (33 to 59 µs), part is the
-  environment: its ECDSA recovery, which its changes don't touch, also measured slower
-  (39.3 to 54.6 µs).
-- Decoding got about 0.2 µs slower per message on our side, at the edge of the noise.
-  An l2Msg is now held to what arbos and geth accept, field by field, and a message
-  that arbos would refuse in any part carries no transactions. The feed path didn't
-  move.
+- Python measured 175 µs here against 111.6 µs in September. That's the desktop, not its
+  code: on one AWS machine its September and November versions are within 2% of each
+  other, and here its ECDSA recovery, which its changes don't touch, went from 39.3 to
+  54.6 µs as well.
+- The Rust decode row (3.0 µs) is from before we moved the l2Msg envelope check into the
+  RLP scan. On AWS that move took the check from 0.33 to 0.05 µs per message.
 - Trade intents (`decode_intents` on every transaction of a message) take 0.52 µs,
   about 50 times less than Python. A transaction whose selector no decoder knows costs
   one match and allocates nothing. Both versions agree on all 4,075 transactions of
@@ -236,6 +238,53 @@ fires isn't included. p50 in µs:
   busy polling, interrupt to TCP took 6 µs instead of 13. No change on the others.
 - Interrupt moderation (`adaptive-rx`, on by default) made no difference at the feed's
   rate: a ping every 10 ms took 62 µs either way.
+
+### Old and new side by side
+
+On 2026-11-14 we ran every benchmark again on the same three instance types, c7a and c8g
+in us-east-1 and c7i in us-east-2, so that nothing else on the machine moved the
+numbers. Each machine built the old and new versions of both projects and ran them in
+three interleaved rounds, so any drift hits all of them alike. The table has the best
+round. For most Rust rows the three rounds were within 0.1 µs of each other.
+
+"Before" is this repository at `4977ca9` and Python at `95c96f0`. "Now" is Python at
+`d6a9e4e`, and ours at `f695a25` on c7a and `112740f` on c8g and c7i: those two ran
+before we moved the l2Msg envelope check into the RLP scan, which saves them about
+0.25 µs of decoding. µs per message, plain `cargo build --release`:
+
+| | c7a | c8g | c7i |
+|---|---:|---:|---:|
+| feed path, Python before / now | 164.2 / 166.2 | 158.8 / 160.0 | 158.1 / 160.5 |
+| feed path, Rust before / now | 44.0 / 44.1 | 46.1 / 46.5 | 39.0 / 39.4 |
+| frame JSON to decoded txs, Python before / now | 56.3 / 59.5 | 53.9 / 55.1 | 52.4 / 53.5 |
+| frame JSON to decoded txs, Rust before / now | 4.33 / 4.47 | 6.55 / 6.81 | 4.13 / 4.41 |
+| trade intents, every tx, Python / Rust | 32.8 / 0.69 | 35.0 / 0.87 | 30.9 / 0.70 |
+| signature check, Python / Rust | 105.2 / 40.7 | 103.6 / 41.7 | 94.3 / 36.2 |
+| ECDSA recover: coincurve / libsecp256k1 / ufsecp | 48.9 / 38.1 / 37.2 | 50.8 / 38.5 / 38.8 | 37.2 / 31.5 / 30.4 |
+| transactions/s on one core, sender included, Python / Rust | 14.0k / 23.6k | 13.7k / 23.4k | 16.6k / 28.3k |
+
+- The feed path gap is smaller than on the desktop because the signature check makes up
+  most of it on both sides, and these server cores hash and verify more slowly.
+- Python's old and new versions are within 2% of each other. Its new decoder checks more
+  and costs 1 to 3 µs more per message.
+- Our l2Msg envelope check first cost 0.33 µs per message on c7a (4.33 to 4.66 µs),
+  0.26 on c8g and 0.28 on c7i. It walked every field a second time. Noting what it needs
+  during the RLP scan brought it to 0.05 µs on c7a, and the feed path back to the old
+  code's (44.0 and 44.1 µs, against 44.3 before the change).
+- With `target-cpu=native` the feed path was 43.3 µs on c7a, 46.0 on c8g and 38.9 on
+  c7i (all before the scan change).
+- Every test passed on all three machines, with libsecp256k1 and with ufsecp.
+
+Live, from the last socket read to `recv()`, 2 minutes each way, µs p50 / p99:
+
+| | c7a | c8g | c7i |
+|---|---:|---:|---:|
+| normal | 77.9 / 224 | 75.8 / 468 | 115.0 / 480 |
+| busy poll | 52.8 / 302 | 39.0 / 184 | 38.2 / 178 |
+
+The runs happened at different times, and the feed carried between 6,800 and 21,500
+transactions in one of them, so compare these loosely. c8g's normal run fell on the
+busiest stretch, which is why it's slower than the 42 µs it had on 2026-10-06.
 
 ## Senders for copy trading
 
