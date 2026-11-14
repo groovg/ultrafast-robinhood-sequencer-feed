@@ -77,7 +77,7 @@ libsecp256k1 columns were measured together in November 2026, Python at its comm
   the fastest here. The [`secp256k1`](https://crates.io/crates/secp256k1) crate 0.33
   took recovery from 34.9 to 32.0 µs with MSVC.
 - The parts that aren't cryptography got 10 to 30 times faster than Python. Some of that
-  is Rust itself. The rest is [base64-simd](https://crates.io/crates/base64-simd) (3.3x
+  is Rust itself. The rest is [base64-turbo](https://crates.io/crates/base64-turbo) (10x
   the `base64` crate), [keccak-asm](https://github.com/DaniPopes/keccak-asm) (1.2x
   [tiny-keccak](https://crates.io/crates/tiny-keccak)) and
   [sonic-rs](https://github.com/cloudwego/sonic-rs) (1.3x serde_json).

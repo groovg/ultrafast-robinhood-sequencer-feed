@@ -30,7 +30,7 @@ const FILTER_PRECOMPILE: &str = "0x0000000000000000000000000000000000000074";
 const IS_FILTERED_SELECTOR: &str = "0x85c733a4";
 
 pub(crate) fn b64(s: &str) -> Option<Vec<u8>> {
-    base64_simd::STANDARD.decode_to_vec(s).ok()
+    base64_turbo::STANDARD.decode(s).ok()
 }
 
 pub fn keccak(data: &[u8]) -> [u8; 32] {
@@ -1016,9 +1016,9 @@ pub fn parse_frame(frame: &Frame, chain_id: Option<u64>) -> Vec<FeedMessage> {
 
 /// An entry's l2Msg, base64-decoded once for both verification and decoding. `Ok(None)`
 /// when absent or empty.
-pub fn l2_msg(entry: &Entry) -> Result<Option<Bytes>, base64_simd::Error> {
+pub fn l2_msg(entry: &Entry) -> Result<Option<Bytes>, base64_turbo::Error> {
     match entry.incoming().and_then(|i| i.l2_msg.as_deref()) {
-        Some(l2) if !l2.is_empty() => Ok(Some(base64_simd::STANDARD.decode_to_vec(l2)?.into())),
+        Some(l2) if !l2.is_empty() => Ok(Some(base64_turbo::STANDARD.decode(l2)?.into())),
         _ => Ok(None),
     }
 }

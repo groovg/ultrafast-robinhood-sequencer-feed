@@ -412,7 +412,7 @@ fn changing_any_signed_field_breaks_verification() {
 
 #[test]
 fn an_unusable_signature_is_not_accepted() {
-    let b64 = |b: &[u8]| base64_simd::STANDARD.encode_to_string(b);
+    let b64 = |b: &[u8]| base64_turbo::STANDARD.encode(b);
     for sig in [
         Value::Null,
         "".into(),
@@ -457,7 +457,7 @@ fn ufsecp_and_libsecp256k1_recover_the_same_addresses() {
         let frame = frame_from_slice(line.as_bytes()).unwrap();
         for e in frame.entries() {
             if let Some(sig) = e.signature_v2.as_deref() {
-                let sig = base64_simd::STANDARD.decode_to_vec(sig).unwrap();
+                let sig = base64_turbo::STANDARD.decode(sig).unwrap();
                 let digest = rhfeed::keccak(&signature_payload(e, MAINNET_CHAIN_ID).unwrap());
                 check(
                     &digest,
@@ -511,11 +511,11 @@ fn a_parent_chain_payload_past_the_size_cap_is_refused() {
         };
         assert_eq!(count(&entry), 1, "{seq}");
         let l2 = &mut entry["message"]["message"]["l2Msg"];
-        let mut payload = base64_simd::STANDARD
-            .decode_to_vec(l2.as_str().unwrap())
+        let mut payload = base64_turbo::STANDARD
+            .decode(l2.as_str().unwrap())
             .unwrap();
         payload.resize(MAX_L2_MESSAGE_SIZE + 1, 0);
-        *l2 = Value::String(base64_simd::STANDARD.encode_to_string(&payload));
+        *l2 = Value::String(base64_turbo::STANDARD.encode(&payload));
         assert_eq!(count(&entry), 0, "{seq}");
     }
 }

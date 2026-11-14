@@ -111,7 +111,7 @@ fn main() {
         for f in &frames {
             for e in f.entries() {
                 if let Some(m) = e.incoming().and_then(|i| i.l2_msg.as_deref()) {
-                    black_box(base64_simd::STANDARD.decode_to_vec(m).unwrap());
+                    black_box(base64_turbo::STANDARD.decode(m).unwrap());
                 }
             }
         }
@@ -298,8 +298,8 @@ fn main() {
     let sigs: Vec<Sig> = entries
         .iter()
         .map(|e| {
-            let sig = base64_simd::STANDARD
-                .decode_to_vec(e.signature_v2.as_deref().unwrap())
+            let sig = base64_turbo::STANDARD
+                .decode(e.signature_v2.as_deref().unwrap())
                 .unwrap();
             let digest = keccak(&signature_payload(e, MAINNET_CHAIN_ID).unwrap());
             (

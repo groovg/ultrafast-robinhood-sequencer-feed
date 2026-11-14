@@ -101,7 +101,7 @@ fn l2_messages(lines: &[String]) -> Vec<Vec<u8>> {
                     e.incoming()?
                         .l2_msg
                         .as_deref()
-                        .map(|m| base64_simd::STANDARD.decode_to_vec(m).unwrap())
+                        .map(|m| base64_turbo::STANDARD.decode(m).unwrap())
                 })
                 .collect::<Vec<_>>()
         })
