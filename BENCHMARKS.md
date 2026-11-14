@@ -8,16 +8,16 @@ Unless a section says otherwise, the machine is an AMD Ryzen 9 9950X3D desktop o
 Windows 11, and the recording is 60 seconds of Robinhood Chain mainnet from 2026-09-23
 (596 frames, 594 messages, 4,075 transactions). Each number is the best of several
 rounds after a warm-up, and differences under about 0.3 µs are noise. The Python and
-libsecp256k1 columns were measured together in November 2026, Python at its commit
-`d6a9e4e`. The ufsecp column is from 2026-10-06.
+libsecp256k1 columns were measured in November 2026, Python at its commit `d6a9e4e`. The
+ufsecp column is from 2026-10-06. The AWS sections are the cleaner comparison: nobody
+uses those machines while they run.
 
 ## At a glance
 
-- Feed path in a tight loop: 26.6 µs, against 175 µs for the Python version.
-- Side by side on three AWS machines, with old and new versions of both projects in
-  interleaved rounds: our feed path is 3.4 to 4.1 times faster than Python's, decoding
-  8 to 13 times, trade intents 40 to 48 times. See
-  [Old and new side by side](#old-and-new-side-by-side).
+- Feed path in a tight loop on the desktop: 25.4 µs, against 175 µs for the Python version.
+- Side by side on three AWS machines, with every version in interleaved rounds: our feed
+  path is 36.6 to 43.3 µs, 3.7 to 4.4 times faster than Python's, decoding 9 to 17 times,
+  trade intents 36 to 47 times. See [Old and new side by side](#old-and-new-side-by-side).
 - Live on the desktop, from the last socket read to `recv()`: 95 µs at the median, or
   61 µs with `busy_poll`.
 - Live on a Linux VM: 203 µs, or 97 µs with `busy_poll`. Before our first read, the
@@ -33,11 +33,11 @@ libsecp256k1 columns were measured together in November 2026, Python at its comm
 
 | | Python | Rust + libsecp256k1 | Rust + ufsecp (clang-cl) |
 |---|---:|---:|---:|
-| **feed path, µs per message** | 175.1 | 26.6 | **26.0** |
+| **feed path, µs per message** | 175.1 | **25.4** | 26.0 |
 | **per message, µs** | | | |
-| frame JSON to decoded txs | 59.3 | 3.0 | 2.7 |
+| frame JSON to decoded txs | 59.3 | 2.5 | 2.7 |
 | trade intents, every tx | 25.3 | 0.52 | |
-| signature check | 111.1 | 24.3 | **24.0** |
+| signature check | 111.1 | **22.4** | 24.0 |
 | signature check by recovering the signer | 111.1 | 47.2 | 35.9 |
 | frame + signature + every sender | 819 | 312 | **217** |
 | **per transaction, µs** | | | |
@@ -47,15 +47,13 @@ libsecp256k1 columns were measured together in November 2026, Python at its comm
 | + sender | 64.6 | 37.3 | **26.0** |
 | **ECDSA, µs** | | | |
 | recover to address | 54.6 | 32.6 | **21.0** |
-| verify against the known key (`FixedKey`) | | 9.2 | **9.1** |
+| verify against the known key (`FixedKey`) | | **7.6** | 9.1 |
 | transactions/s on one core, sender included | 12.8k | 28.7k | **42.1k** |
 
 - Python measured 175 µs here against 111.6 µs in September. That's the desktop, not its
   code: on one AWS machine its September and November versions are within 2% of each
   other, and here its ECDSA recovery, which its changes don't touch, went from 39.3 to
   54.6 µs as well.
-- The Rust decode row (3.0 µs) is from before we moved the l2Msg envelope check into the
-  RLP scan. On AWS that move took the check from 0.33 to 0.05 µs per message.
 - Trade intents (`decode_intents` on every transaction of a message) take 0.52 µs,
   about 50 times less than Python. A transaction whose selector no decoder knows costs
   one match and allocates nothing. Both versions agree on all 4,075 transactions of
@@ -77,8 +75,8 @@ libsecp256k1 columns were measured together in November 2026, Python at its comm
   the fastest here. The [`secp256k1`](https://crates.io/crates/secp256k1) crate 0.33
   took recovery from 34.9 to 32.0 µs with MSVC.
 - The parts that aren't cryptography got 10 to 30 times faster than Python. Some of that
-  is Rust itself. The rest is [base64-turbo](https://crates.io/crates/base64-turbo) (10x
-  the `base64` crate), [keccak-asm](https://github.com/DaniPopes/keccak-asm) (1.2x
+  is Rust itself. The rest is [simdutf](https://github.com/simdutf/simdutf) for base64
+  (2.7x base64-simd here, 1.5x on Graviton), [keccak-asm](https://github.com/DaniPopes/keccak-asm) (1.2x
   [tiny-keccak](https://crates.io/crates/tiny-keccak)) and
   [sonic-rs](https://github.com/cloudwego/sonic-rs) (1.3x serde_json).
 - A tight loop keeps everything in the CPU caches, and the live feed doesn't. Compare
@@ -241,50 +239,76 @@ fires isn't included. p50 in µs:
 
 ### Old and new side by side
 
-On 2026-11-14 we ran every benchmark again on the same three instance types, c7a and c8g
-in us-east-1 and c7i in us-east-2, so that nothing else on the machine moved the
-numbers. Each machine built the old and new versions of both projects and ran them in
-three interleaved rounds, so any drift hits all of them alike. The table has the best
-round. For most Rust rows the three rounds were within 0.1 µs of each other.
+On 2026-11-14 we ran every benchmark on the same three instance types, c7a and c8g in
+us-east-1 and c7i in us-east-2, so that nothing else on the machine moved the numbers.
+Each machine built every version and ran them in three interleaved rounds, so any drift
+hits all of them alike. The tables have the best round. For most Rust rows the rounds
+were within 0.1 µs of each other, on c7i (two threads per core) within about 0.5 µs.
 
-"Before" is this repository at `4977ca9` and Python at `95c96f0`. "Now" is Python at
-`d6a9e4e`, and ours at `f695a25` on c7a and `112740f` on c8g and c7i: those two ran
-before we moved the l2Msg envelope check into the RLP scan, which saves them about
-0.25 µs of decoding. µs per message, plain `cargo build --release`:
+"Before" is this repository at `4977ca9` and Python at `95c96f0`. "Now" is ours at
+`4c63a28` and Python at `d6a9e4e`. µs per message, plain `cargo build --release`:
 
 | | c7a | c8g | c7i |
 |---|---:|---:|---:|
+| feed path, Rust before / now | 44.0 / **40.4** | 46.5 / **43.3** | 39.8 / **36.6** |
 | feed path, Python before / now | 164.2 / 166.2 | 158.8 / 160.0 | 158.1 / 160.5 |
-| feed path, Rust before / now | 44.0 / 44.1 | 46.1 / 46.5 | 39.0 / 39.4 |
-| frame JSON to decoded txs, Python before / now | 56.3 / 59.5 | 53.9 / 55.1 | 52.4 / 53.5 |
-| frame JSON to decoded txs, Rust before / now | 4.33 / 4.47 | 6.55 / 6.81 | 4.13 / 4.41 |
-| trade intents, every tx, Python / Rust | 32.8 / 0.69 | 35.0 / 0.87 | 30.9 / 0.70 |
-| signature check, Python / Rust | 105.2 / 40.7 | 103.6 / 41.7 | 94.3 / 36.2 |
-| ECDSA recover: coincurve / libsecp256k1 / ufsecp | 48.9 / 38.1 / 37.2 | 50.8 / 38.5 / 38.8 | 37.2 / 31.5 / 30.4 |
-| transactions/s on one core, sender included, Python / Rust | 14.0k / 23.6k | 13.7k / 23.4k | 16.6k / 28.3k |
+| frame JSON to decoded txs, Rust before / now | 4.33 / 3.56 | 6.66 / 5.84 | 4.11 / 3.37 |
+| frame JSON to decoded txs, Python now | 59.5 | 55.1 | 53.5 |
+| signature check, Rust before / now | 40.8 / 37.1 | 41.9 / 39.0 | 36.9 / 33.2 |
+| `FixedKey`, before (k256) / now (C) | 16.5 / 13.9 | 16.7 / 14.6 | 13.4 / 11.0 |
+| trade intents, every tx, Python / Rust | 32.8 / 0.70 | 35.0 / 0.96 | 30.9 / 0.69 |
+| ECDSA recover: coincurve / libsecp256k1 | 48.9 / 38.0 | 50.8 / 38.5 | 37.2 / 32.4 |
+| transactions/s on one core, sender included, Python / Rust | 14.0k / 23.6k | 13.7k / 23.4k | 16.6k / 27.4k |
 
-- The feed path gap is smaller than on the desktop because the signature check makes up
-  most of it on both sides, and these server cores hash and verify more slowly.
-- Python's old and new versions are within 2% of each other. Its new decoder checks more
-  and costs 1 to 3 µs more per message.
-- Our l2Msg envelope check first cost 0.33 µs per message on c7a (4.33 to 4.66 µs),
-  0.26 on c8g and 0.28 on c7i. It walked every field a second time. Noting what it needs
-  during the RLP scan brought it to 0.05 µs on c7a, and the feed path back to the old
-  code's (44.0 and 44.1 µs, against 44.3 before the change).
-- With `target-cpu=native` the feed path was 43.3 µs on c7a, 46.0 on c8g and 38.9 on
-  c7i (all before the scan change).
+- Our feed path is 3.7 to 4.4 times faster than Python's, decoding 9 to 17 times, trade
+  intents 36 to 47 times. The gap is smaller than on the desktop because the signature
+  check is most of the work on both sides, and these server cores hash more slowly.
+- What made "now" faster than "before": `FixedKey` in C on libsecp256k1's own field and
+  group code (2.2 to 2.5 µs) and simdutf for base64 (0.9 µs on x86, 0.8 on c8g). The
+  l2Msg envelope check added since costs 0.05 µs.
+- base64 decoders on the l2Msg of every message, µs:
+
+  | | c7a | c8g | c7i |
+  |---|---:|---:|---:|
+  | base64-simd (before) | 1.32 | 2.76 | 1.33 |
+  | base64-turbo | 0.39 | 3.22 | 0.56 |
+  | simdutf (now) | 0.38 | 1.79 | 0.53 |
+
+- Python's September and November versions are within 2% of each other. Its new decoder
+  checks more and costs 1 to 3 µs more per message.
 - Every test passed on all three machines, with libsecp256k1 and with ufsecp.
 
-Live, from the last socket read to `recv()`, 2 minutes each way, µs p50 / p99:
+Build variants of the same code (`65e0e85`, measured the same way), feed path, µs:
 
 | | c7a | c8g | c7i |
 |---|---:|---:|---:|
-| normal | 77.9 / 224 | 75.8 / 468 | 115.0 / 480 |
-| busy poll | 52.8 / 302 | 39.0 / 184 | 38.2 / 178 |
+| plain `cargo build --release` | 40.3 | 44.6 | 37.2 |
+| `-C target-cpu=native` | 38.8 | 44.5 | 36.1 |
+| PGO (trained on `tests/fixtures/frames.jsonl`) | 40.2 | 44.2 | 37.2 |
+| mimalloc as the global allocator | 40.1 | 44.9 | 37.3 |
+| Rust 1.99.1 instead of 1.100.0 | 40.4 | 44.6 | 37.4 |
+| with 100 ms between messages (p50), plain / PGO | 63.1 / 59.0 | 41.9 / 40.6 | 92.3 / 76.5 |
 
-The runs happened at different times, and the feed carried between 6,800 and 21,500
-transactions in one of them, so compare these loosely. c8g's normal run fell on the
-busiest stretch, which is why it's slower than the 42 µs it had on 2026-10-06.
+- `target-cpu=native` is worth 1.1 to 1.5 µs on x86 and nothing on Graviton.
+- mimalloc and the compiler version change nothing here.
+- PGO doesn't help a tight loop, where everything is in cache. With caches gone cold
+  between messages, as on the live feed, it cut the median by 16 µs on c7i and 4 µs on
+  c7a. Not set up in our builds yet.
+- Inflating a frame from a stream compressed with context takeover, as the feed sends
+  it: zlib-rs 14.5 µs on c7a, 15.3 on c8g, 16.4 on c7i. ISA-L had to load the 32 KB
+  window as a dictionary for every frame and took 17.3, 29.1 and 18.3. We stay on
+  zlib-rs.
+
+Live, from the last socket read to `recv()`, 2 minutes each way, µs p50 / p99, at the
+end of the day with the final code:
+
+| | c7a | c8g | c7i |
+|---|---:|---:|---:|
+| normal | 86.6 / 477 | 48.9 / 492 | 128.5 / 517 |
+| busy poll | 68.0 / 307 | 64.7 / 329 | 69.7 / 310 |
+
+The feed carried 17,000 to 30,000 transactions in each of these runs, against 6,800 to
+21,500 earlier that day, and the runs happened at different times. Compare them loosely.
 
 ## Senders for copy trading
 
