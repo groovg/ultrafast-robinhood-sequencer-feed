@@ -511,9 +511,7 @@ fn a_parent_chain_payload_past_the_size_cap_is_refused() {
         };
         assert_eq!(count(&entry), 1, "{seq}");
         let l2 = &mut entry["message"]["message"]["l2Msg"];
-        let mut payload = base64_turbo::STANDARD
-            .decode(l2.as_str().unwrap())
-            .unwrap();
+        let mut payload = base64_turbo::STANDARD.decode(l2.as_str().unwrap()).unwrap();
         payload.resize(MAX_L2_MESSAGE_SIZE + 1, 0);
         *l2 = Value::String(base64_turbo::STANDARD.encode(&payload));
         assert_eq!(count(&entry), 0, "{seq}");
