@@ -11,8 +11,9 @@ COPY scripts scripts
 ARG MARCH=x86-64-v3
 RUN scripts/build-ufsecp.sh /ufsecp "$MARCH"
 COPY . .
+# Profile-guided: faster where caches go cold between messages (BENCHMARKS.md).
 RUN UFSECP_LIB_DIR=/ufsecp/build RUSTFLAGS="-C target-cpu=$MARCH" \
-    cargo build --release --locked --features ufsecp
+    scripts/pgo-build.sh --features ufsecp
 
 FROM debian:trixie-slim
 RUN apt-get update \

@@ -1,0 +1,2 @@
+# Vendored libsecp256k1 headers: not ours, so not in the language stats.
+csrc/secp256k1/** linguist-vendored

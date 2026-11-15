@@ -293,7 +293,7 @@ Build variants of the same code (`65e0e85`, measured the same way), feed path, �
 - mimalloc and the compiler version change nothing here.
 - PGO doesn't help a tight loop, where everything is in cache. With caches gone cold
   between messages, as on the live feed, it cut the median by 16 µs on c7i and 4 µs on
-  c7a. Not set up in our builds yet.
+  c7a. `scripts/pgo-build.sh` does it, and the Docker image is built with it.
 - Inflating a frame from a stream compressed with context takeover, as the feed sends
   it: zlib-rs 14.5 µs on c7a, 15.3 on c8g, 16.4 on c7i. ISA-L had to load the 32 KB
   window as a dictionary for every frame and took 17.3, 29.1 and 18.3. We stay on
