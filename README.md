@@ -33,6 +33,9 @@ docker run --rm rhfeed --feed mainnet --feed mainnet
 
 For the machine you'll run it on, build with `RUSTFLAGS="-C target-cpu=native"`. That
 makes JSON parsing about 30% faster and lets keccak use AVX-512 where the CPU has it.
+`scripts/pgo-build.sh` builds with a profile from a benchmark run on top of that, which
+cuts the median where caches go cold between messages, as on the live feed, by up to
+16 µs. The Docker image is built that way.
 
 Speed numbers are in [BENCHMARKS.md](BENCHMARKS.md), along with measurements of where
 the feed arrives first. In short: the network costs milliseconds and our decoding costs
