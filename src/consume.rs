@@ -37,7 +37,8 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use yawc::{HttpRequestBuilder, MaybeTlsStream, OpCode, Options, WebSocket};
 
 use crate::codec::{
-    Entry, FeedMessage, Frame, SenderPool, entry_texts, frame_from_slice, l2_msg, parse_entry_with,
+    Entry, FeedMessage, Frame, SenderPool, Timing, entry_texts, frame_from_slice, l2_msg,
+    parse_entry_with,
 };
 use crate::verify::{MAINNET_CHAIN_ID, Verifier};
 
@@ -73,25 +74,6 @@ const WARM_INTERVAL: Duration = Duration::from_millis(1);
 const REORG_WINDOW: i64 = 1024;
 
 type Socket = WebSocket<Stamped<MaybeTlsStream<Stamped<TcpStream>>>>;
-
-/// When a message's frame finished each stage of `Feed`; the gap between neighbouring
-/// fields is what that stage took.
-#[derive(Debug, Clone, Copy)]
-pub struct Timing {
-    /// First socket read with bytes of this frame.
-    pub first_read: Instant,
-    /// Last socket read the frame needed.
-    pub last_read: Instant,
-    pub decrypted: Instant,
-    /// The WebSocket layer returned the frame, inflated.
-    pub inflated: Instant,
-    pub parsed: Instant,
-    /// With `FeedBuilder::senders`, also every sender recovered.
-    pub verified: Instant,
-    pub decoded: Instant,
-    /// Just before the message went into the channel.
-    pub sent: Instant,
-}
 
 #[derive(Default)]
 struct ReadTimes(Mutex<(Option<Instant>, Option<Instant>)>);
@@ -375,6 +357,10 @@ impl Shared {
         }
     }
 
+    fn verifier_chain(&self) -> Option<u64> {
+        self.verify.as_ref().map(|v| v.chain_id)
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         // Only counters and a map: a poisoned lock is still usable.
         self.state.lock().unwrap_or_else(|e| e.into_inner())
@@ -532,22 +518,10 @@ impl Shared {
             }
         }
         let Some(verify) = &self.verify else { return };
-        let mut expected: Vec<String> = verify
-            .signers
-            .iter()
-            .map(|s| format!("0x{}", hex::encode(s)))
-            .collect();
-        expected.sort();
         warn!(
-            "dropping unverified message at seq {seq}: {}, expected one of {}. \
-             Further ones are counted in stats.unverified_messages but not logged. \
-             Check the verifier's chain id ({}) and signer set before suspecting the feed",
-            crate::verify::recover_signer(entry, verify.chain_id).map_or(
-                "no usable signature".into(),
-                |s| format!("signed by 0x{}", hex::encode(s))
-            ),
-            expected.join(", "),
-            verify.chain_id,
+            "dropping unverified message at seq {seq}: {}. Further ones are counted in \
+             stats.unverified_messages but not logged",
+            verify.why_rejected(entry),
         );
     }
 }
@@ -845,16 +819,16 @@ impl Source {
         self.chain_id.or(announced).or(match self.url.as_str() {
             MAINNET_FEED => Some(MAINNET_CHAIN_ID),
             TESTNET_FEED => Some(TESTNET_CHAIN_ID),
-            _ => self.shared.verify.as_ref().map(|v| v.chain_id),
+            _ => self.shared.verifier_chain(),
         })
     }
 
     fn check_chain(&self, announced: Option<u64>) -> Result<(), String> {
-        match (&self.shared.verify, announced) {
-            (Some(v), Some(chain)) if chain != v.chain_id => Err(format!(
+        match (self.shared.verifier_chain(), announced) {
+            (Some(checked), Some(chain)) if chain != checked => Err(format!(
                 "{} serves chain {chain}, and the verifier checks chain {}, so it would drop \
                  every message. Not retrying",
-                self.name, v.chain_id
+                self.name, checked
             )),
             _ => Ok(()),
         }

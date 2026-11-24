@@ -175,6 +175,26 @@ impl Verifier {
         true
     }
 
+    /// Why `accepts` refused `entry`, for a log line: who signed it and who may.
+    pub fn why_rejected(&self, entry: &Entry) -> String {
+        let mut expected: Vec<String> = self
+            .signers
+            .iter()
+            .map(|s| format!("0x{}", hex::encode(s)))
+            .collect();
+        expected.sort();
+        let signed = recover_signer(entry, self.chain_id)
+            .map_or("no usable signature".into(), |s| {
+                format!("signed by 0x{}", hex::encode(s))
+            });
+        format!(
+            "{signed}, expected one of {} on chain {}. Check the chain id and signer set \
+             before suspecting the feed",
+            expected.join(", "),
+            self.chain_id
+        )
+    }
+
     fn remember(&self, key: FixedKey) {
         let mut keys = self.keys.write().unwrap_or_else(|e| e.into_inner());
         if !keys.iter().any(|k| k.address == key.address) {

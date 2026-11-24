@@ -976,6 +976,25 @@ impl<'a> Entry<'a> {
     }
 }
 
+/// When a message's frame finished each stage of `Feed`; the gap between neighbouring
+/// fields is what that stage took.
+#[derive(Debug, Clone, Copy)]
+pub struct Timing {
+    /// First socket read with bytes of this frame.
+    pub first_read: Instant,
+    /// Last socket read the frame needed.
+    pub last_read: Instant,
+    pub decrypted: Instant,
+    /// The WebSocket layer returned the frame, inflated.
+    pub inflated: Instant,
+    pub parsed: Instant,
+    /// With `FeedBuilder::senders`, also every sender recovered.
+    pub verified: Instant,
+    pub decoded: Instant,
+    /// Just before the message went into the channel.
+    pub sent: Instant,
+}
+
 /// One sequencer message. On this chain, `seq` equals the L2 block number.
 #[derive(Debug)]
 pub struct FeedMessage {
@@ -998,7 +1017,7 @@ pub struct FeedMessage {
     /// Index of the source that delivered this message first.
     pub source: usize,
     /// When each stage of `Feed` finished with this message.
-    pub timing: Option<crate::consume::Timing>,
+    pub timing: Option<Timing>,
 }
 
 impl FeedMessage {

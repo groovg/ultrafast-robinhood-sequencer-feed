@@ -11,7 +11,7 @@
 use std::ffi::c_int;
 use std::sync::LazyLock;
 
-use crate::codec::keccak;
+use keccak_asm::Keccak256;
 
 /// 20-byte address that produced (r, s, recid) over `digest`, or None if there is none.
 pub fn recover(digest: &[u8; 32], r: &[u8; 32], s: &[u8; 32], recid: u8) -> Option<[u8; 20]> {
@@ -23,7 +23,7 @@ pub fn recover(digest: &[u8; 32], r: &[u8; 32], s: &[u8; 32], recid: u8) -> Opti
 
 /// The address of an uncompressed public key without its 0x04 prefix.
 pub(crate) fn address(pubkey64: &[u8]) -> [u8; 20] {
-    keccak(pubkey64)[12..].try_into().unwrap()
+    Keccak256::digest(pubkey64)[12..].try_into().unwrap()
 }
 
 pub mod libsecp {
@@ -219,6 +219,7 @@ mod tests {
     use secp256k1::{Message, PublicKey, SecretKey};
 
     use super::*;
+    use crate::codec::keccak;
 
     const ORDER: [u8; 32] = [
         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
