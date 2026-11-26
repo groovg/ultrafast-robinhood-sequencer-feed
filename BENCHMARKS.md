@@ -294,10 +294,12 @@ Build variants of the same code (`65e0e85`, measured the same way), feed path, �
 - PGO doesn't help a tight loop, where everything is in cache. With caches gone cold
   between messages, as on the live feed, it cut the median by 16 µs on c7i and 4 µs on
   c7a. `scripts/pgo-build.sh` does it, and the Docker image is built with it.
-- Inflating a frame from a stream compressed with context takeover, as the feed sends
-  it: zlib-rs 14.5 µs on c7a, 15.3 on c8g, 16.4 on c7i. ISA-L had to load the 32 KB
-  window as a dictionary for every frame and took 17.3, 29.1 and 18.3. We stay on
-  zlib-rs.
+- Inflating a frame from a stream compressed with context takeover: zlib-rs 14.5 µs on
+  c7a, 15.3 on c8g, 16.4 on c7i. ISA-L had to load the 32 KB window as a dictionary for
+  every frame and took 17.3, 29.1 and 18.3, so we stayed on zlib-rs. The feed doesn't
+  work that way, though: it compresses every frame on its own (see
+  [Inflating frames](#inflating-frames)), so ISA-L needs no dictionary there. That
+  comparison is still to be redone.
 
 Live, from the last socket read to `recv()`, 2 minutes each way, µs p50 / p99, at the
 end of the day with the final code:
@@ -331,7 +333,8 @@ signature. Live with `--busy-poll`, a message reached `recv()` with every sender
 ## Inflating frames
 
 The feed path starts after the WebSocket library has inflated the frame. The public feed
-compresses every frame (permessage-deflate), each one on its own.
+compresses every frame (permessage-deflate), each one on its own: it answers with
+`server_no_context_takeover` even when the client allows takeover (checked 2026-11-26).
 
 - Inflating one takes 8.9 µs with [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs),
   which we use, or 11.9 µs with [miniz_oxide](https://github.com/Frommi/miniz_oxide),
@@ -340,6 +343,11 @@ compresses every frame (permessage-deflate), each one on its own.
   big buffer (9.1 µs both).
 - With `busy_poll`, the idle warm-ups inflate an old frame too. After 100 ms of
   spinning, inflating a frame took 10.0 µs with that and 13.9 µs without.
+- Nitro's own `Arbitrum-permessage-deflate` is meant to compress each frame against a
+  20 KB static dictionary. The public feed accepts it, but sends the same bytes either
+  way: on 2026-11-26, two connections, one per extension, got 568 identical frames in
+  90 s, and every one of them inflated without the dictionary. Nothing to gain from it.
+- The median frame was 1.2 KB compressed and 3.4 KB inflated, one TCP segment.
 
 ## How the feed path got faster
 
