@@ -8,7 +8,7 @@ pub mod secp;
 pub mod verify;
 
 pub use codec::{
-    FeedMessage, Frame, SenderPool, Timing, Tx, addr, checksum, decode_l2_message,
+    Check, FeedMessage, Frame, SenderPool, Timing, Tx, addr, checksum, decode_l2_message,
     decode_parent_chain_message, decode_transaction, frame_from_slice, is_filtered_call, keccak,
     parse_frame, recover_senders, sel, selector_of,
 };

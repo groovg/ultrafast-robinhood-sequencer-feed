@@ -36,8 +36,10 @@ use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use yawc::{HttpRequestBuilder, MaybeTlsStream, OpCode, Options, WebSocket};
 
+use bytes::Bytes;
+
 use crate::codec::{
-    Entry, FeedMessage, Frame, SenderPool, Timing, entry_texts, frame_from_slice, l2_msg,
+    Check, Entry, FeedMessage, Frame, SenderPool, Timing, entry_texts, frame_from_slice, l2_msg,
     parse_entry_with,
 };
 use crate::verify::{MAINNET_CHAIN_ID, Verifier};
@@ -325,12 +327,35 @@ impl State {
 struct Shared {
     verify: Option<Verifier>,
     senders: Option<Mutex<SenderPool>>,
+    optimistic: bool,
     state: Mutex<State>,
     warmed: Mutex<Instant>,
 }
 
+/// A signature check `ingest` left for after delivery, and how to undo the message if it
+/// fails. Dropped unsettled, the check reads as failed, so no `Check::wait` spins forever.
+struct Deferred {
+    /// Into the frame's entries.
+    index: usize,
+    l2: Option<Bytes>,
+    check: Check,
+    seq: i64,
+    prev_highest: i64,
+}
+
+impl Drop for Deferred {
+    fn drop(&mut self) {
+        self.check.set(false);
+    }
+}
+
 impl Shared {
-    fn new(urls: &[String], verify: Option<Verifier>, senders: Option<SenderPool>) -> Self {
+    fn new(
+        urls: &[String],
+        verify: Option<Verifier>,
+        senders: Option<SenderPool>,
+        optimistic: bool,
+    ) -> Self {
         let sources = urls
             .iter()
             .map(|url| SourceStats {
@@ -341,6 +366,7 @@ impl Shared {
         Self {
             verify,
             senders: senders.map(Mutex::new),
+            optimistic,
             state: Mutex::new(State {
                 highest_seq: -1,
                 seen: HashMap::new(),
@@ -371,6 +397,9 @@ impl Shared {
     ///
     /// Until the connection is live, each entry is judged on its own timestamp (a relay
     /// replays its backlog in big frames), and only a verified entry can end the backlog.
+    ///
+    /// With `optimistic`, a new sequence number on a live connection comes back decoded
+    /// and unchecked, with the check to `settle` once it is delivered.
     fn ingest(
         &self,
         source: usize,
@@ -379,29 +408,32 @@ impl Shared {
         chain_id: Option<u64>,
         received_at: f64,
         mut timing: Timing,
-    ) -> Vec<FeedMessage> {
+    ) -> Vec<(FeedMessage, Option<Deferred>)> {
         let now = timing.inflated;
         let mut out = Vec::new();
-        for entry in frame.entries() {
+        for (index, entry) in frame.entries().iter().enumerate() {
             let seq = entry.sequence_number.unwrap_or(-1);
             let hash = entry.block_hash.as_deref();
             let live_now = *is_live || {
                 let stamp = entry.header().and_then(|h| h.timestamp).unwrap_or(0);
                 stamp != 0 && received_at - stamp as f64 <= LIVE_THRESHOLD
             };
-            {
+            // Never seen: undoing it after a failed check is then just forgetting it.
+            let unseen = {
                 let mut st = self.lock();
                 if let Verdict::Duplicate = st.classify(seq, hash) {
                     st.late_copy(source, seq, live_now, now);
                     continue;
                 }
-            }
+                seq > st.highest_seq && !st.seen.contains_key(&seq)
+            };
             let live = live_now;
             let l2 = if live || self.verify.is_some() {
                 l2_msg(entry)
             } else {
                 Ok(None)
             };
+            let defer = self.optimistic && *is_live && unseen && l2.is_ok();
             let accepted = || match &self.verify {
                 None => true,
                 Some(v) => l2
@@ -425,6 +457,13 @@ impl Shared {
                         self.reject(entry, seq);
                         continue;
                     }
+                    msg
+                }
+                _ if defer => {
+                    // Not checked yet: that stage takes no time here.
+                    timing.verified = timing.parsed;
+                    let msg = parse_entry_with(entry, decodable, chain_id);
+                    timing.decoded = Instant::now();
                     msg
                 }
                 _ => {
@@ -461,7 +500,7 @@ impl Shared {
                 }
                 Verdict::New => {}
             }
-            st.highest_seq = seq;
+            let prev_highest = std::mem::replace(&mut st.highest_seq, seq);
             st.remember(seq, hash, now);
             st.stats.sources[source].first += 1;
             if live {
@@ -477,9 +516,42 @@ impl Shared {
             msg.source = source;
             msg.received_at = received_at;
             msg.timing = Some(timing);
-            out.push(msg);
+            let deferred = defer.then(|| {
+                let check = Check::default();
+                msg.check = Some(check.clone());
+                Deferred {
+                    index,
+                    l2: l2.ok().flatten(),
+                    check,
+                    seq,
+                    prev_highest,
+                }
+            });
+            out.push((msg, deferred));
         }
         out
+    }
+
+    /// Run a check `ingest` deferred. A bad signature undoes the message, so the real one
+    /// can still arrive from another source.
+    fn settle(&self, source: usize, frame: &Frame, d: Deferred) {
+        let entry = &frame.entries()[d.index];
+        let ok = (self.verify.as_ref()).is_some_and(|v| v.accepts_with(entry, d.l2.as_deref()));
+        d.check.set(ok);
+        if ok {
+            return;
+        }
+        {
+            let mut st = self.lock();
+            st.seen.remove(&d.seq);
+            if st.highest_seq == d.seq {
+                st.highest_seq = d.prev_highest;
+            }
+            st.stats.live_messages -= 1;
+            st.stats.sources[source].first -= 1;
+            st.recent[source].0 = st.recent[source].0.saturating_sub(1);
+        }
+        self.reject(entry, d.seq);
     }
 
     /// Once per interval across all sources: a frame arriving during a warm-up waits.
@@ -583,6 +655,7 @@ impl Feed {
             busy_poll: false,
             senders: 0,
             chain_id: None,
+            optimistic: false,
         }
     }
 
@@ -616,6 +689,7 @@ pub struct FeedBuilder {
     busy_poll: bool,
     senders: usize,
     chain_id: Option<u64>,
+    optimistic: bool,
 }
 
 impl FeedBuilder {
@@ -665,12 +739,31 @@ impl FeedBuilder {
         self
     }
 
+    /// Hand over each live message as soon as it is decoded, and check its signature
+    /// afterwards while you work on it. Act on it only once `msg.check` says it passed.
+    /// Needs `verify` and `busy_poll`: the check then runs on the feed's own thread, and
+    /// with every source on that thread nothing slips in before a failed message is
+    /// undone. Not with `senders`, which recovers during the check.
+    pub fn optimistic(mut self, on: bool) -> Self {
+        self.optimistic = on;
+        self
+    }
+
     /// Start every source on the current tokio runtime, or on its own thread with
-    /// `busy_poll`. Panics with no sources.
+    /// `busy_poll`. Panics with no sources, or with `optimistic` set up wrong.
     pub fn spawn(self) -> Feed {
         assert!(!self.sources.is_empty(), "a feed needs at least one source");
+        assert!(
+            !self.optimistic || (self.verify.is_some() && self.busy_poll && self.senders == 0),
+            "optimistic needs verify and busy_poll, and no senders"
+        );
         let senders = (self.senders > 0).then(|| SenderPool::new(self.senders));
-        let shared = Arc::new(Shared::new(&self.sources, self.verify, senders));
+        let shared = Arc::new(Shared::new(
+            &self.sources,
+            self.verify,
+            senders,
+            self.optimistic,
+        ));
         let (tx, rx) = mpsc::channel(self.capacity.max(1));
         let sources: Vec<Source> = (self.sources.into_iter().enumerate())
             .map(|(index, url)| Source {
@@ -997,8 +1090,8 @@ impl Source {
                 timing,
             );
             if !was_live {
-                backlog += msgs.iter().filter(|m| !m.live).count();
-                if let Some(first) = msgs.iter().find(|m| m.live) {
+                backlog += msgs.iter().filter(|(m, _)| !m.live).count();
+                if let Some((first, _)) = msgs.iter().find(|(m, _)| m.live) {
                     info!(
                         "{} is live at seq {}, {backlog} backlog messages skipped",
                         self.name, first.seq
@@ -1009,7 +1102,7 @@ impl Source {
                 }
             }
             let slow = std::mem::take(&mut self.shared.lock().replace[self.index]);
-            for mut msg in msgs {
+            for (mut msg, mut deferred) in msgs {
                 if !msg.live {
                     continue;
                 }
@@ -1020,6 +1113,11 @@ impl Source {
                     Ok(()) => {}
                     Err(TrySendError::Closed(_)) => return End::Stopped,
                     Err(TrySendError::Full(msg)) => {
+                        // Before waiting, when the other sources run and must see the
+                        // outcome.
+                        if let Some(d) = deferred.take() {
+                            self.shared.settle(self.index, &parsed, d);
+                        }
                         if !std::mem::replace(&mut warned_full, true) {
                             warn!(
                                 "consumer is falling behind: {} messages buffered, \
@@ -1032,6 +1130,9 @@ impl Source {
                             return End::Stopped;
                         }
                     }
+                }
+                if let Some(d) = deferred {
+                    self.shared.settle(self.index, &parsed, d);
                 }
             }
             if self.warm && live {
@@ -1076,7 +1177,7 @@ mod tests {
 
     fn shared(sources: usize, verify: Option<Verifier>) -> Shared {
         let urls: Vec<String> = (0..sources).map(|i| format!("ws://source{i}")).collect();
-        Shared::new(&urls, verify, None)
+        Shared::new(&urls, verify, None, false)
     }
 
     fn feed_at(
@@ -1090,7 +1191,7 @@ mod tests {
         let frame = frame_from_slice(json.as_bytes()).unwrap();
         s.ingest(source, &frame, &mut live, None, unix_now(), stamps(now))
             .iter()
-            .map(|m| (m.seq, m.reorg))
+            .map(|(m, _)| (m.seq, m.reorg))
             .collect()
     }
 
@@ -1200,6 +1301,9 @@ mod tests {
         let json = format!(r#"{{"messages":[{}]}}"#, entries.join(","));
         let frame = frame_from_slice(json.as_bytes()).unwrap();
         s.ingest(0, &frame, live, None, unix_now(), stamps(Instant::now()))
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect()
     }
 
     #[test]
@@ -1317,5 +1421,64 @@ mod tests {
         // The real replacement for 3 still goes through, and is not a second reorg.
         assert_eq!(feed(&s, 0, &[entry_json(3, &hash_of(0xA3))]), [(3, false)]);
         assert_eq!(s.lock().stats.reorgs, 1);
+    }
+
+    const REAL: &str = include_str!("../tests/fixtures/verified_message.json");
+
+    fn optimistic(sources: usize) -> Shared {
+        let urls: Vec<String> = (0..sources).map(|i| format!("ws://source{i}")).collect();
+        Shared::new(&urls, Some(MAINNET_VERIFIER.clone()), None, true)
+    }
+
+    fn live_ingest(s: &Shared, source: usize, frame: &Frame) -> (FeedMessage, Option<Deferred>) {
+        let mut live = true;
+        let mut out = s.ingest(
+            source,
+            frame,
+            &mut live,
+            None,
+            unix_now(),
+            stamps(Instant::now()),
+        );
+        assert_eq!(out.len(), 1);
+        out.pop().unwrap()
+    }
+
+    #[test]
+    fn optimistic_hands_a_message_over_before_its_check() {
+        let s = optimistic(1);
+        let json = format!(r#"{{"messages":[{}]}}"#, REAL.trim());
+        let frame = frame_from_slice(json.as_bytes()).unwrap();
+        let (msg, deferred) = live_ingest(&s, 0, &frame);
+        let check = msg.check.clone().unwrap();
+        assert_eq!(check.get(), None);
+        s.settle(0, &frame, deferred.unwrap());
+        assert_eq!(check.get(), Some(true));
+        assert_eq!(s.lock().highest_seq, msg.seq);
+    }
+
+    #[test]
+    fn a_forgery_that_fails_its_late_check_is_undone() {
+        let s = optimistic(2);
+        // Same sequence number and block hash as the real message, different signed data.
+        let real = REAL.trim();
+        let forged = real.replace("\"timestamp\": 1785166353", "\"timestamp\": 1785166354");
+        assert_ne!(forged, real);
+        let frame_of = |e: &str| format!(r#"{{"messages":[{e}]}}"#);
+        let (forged, real) = (frame_of(&forged), frame_of(real));
+        let frame = frame_from_slice(forged.as_bytes()).unwrap();
+        let (msg, deferred) = live_ingest(&s, 0, &frame);
+        s.settle(0, &frame, deferred.unwrap());
+        assert_eq!(msg.check.unwrap().get(), Some(false));
+
+        // The real copy from the other source is new, not a duplicate or a reorg.
+        let frame = frame_from_slice(real.as_bytes()).unwrap();
+        let (msg, _) = live_ingest(&s, 1, &frame);
+        assert!(!msg.reorg);
+        let st = s.lock();
+        let counts = (st.stats.unverified_messages, st.stats.duplicate_messages);
+        assert_eq!(counts, (1, 0));
+        let firsts = (st.stats.sources[0].first, st.stats.sources[1].first);
+        assert_eq!((st.stats.live_messages, firsts), (1, (0, 1)));
     }
 }

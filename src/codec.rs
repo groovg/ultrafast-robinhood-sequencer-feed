@@ -1018,6 +1018,40 @@ pub struct FeedMessage {
     pub source: usize,
     /// When each stage of `Feed` finished with this message.
     pub timing: Option<Timing>,
+    /// With `FeedBuilder::optimistic`, the signature check still running on delivery.
+    pub check: Option<Check>,
+}
+
+/// A signature check that finishes after its message was delivered.
+#[derive(Clone, Debug, Default)]
+pub struct Check(Arc<OnceLock<(bool, Instant)>>);
+
+impl Check {
+    /// `Some(true)` for a good signature, `None` while the check runs.
+    pub fn get(&self) -> Option<bool> {
+        self.0.get().map(|&(ok, _)| ok)
+    }
+
+    /// Spins until the check is done, about as long as the check takes. Act on the
+    /// message only if this is `true`.
+    pub fn wait(&self) -> bool {
+        loop {
+            if let Some(ok) = self.get() {
+                return ok;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// When the check finished.
+    pub fn done_at(&self) -> Option<Instant> {
+        self.0.get().map(|&(_, at)| at)
+    }
+
+    /// The first call decides; later ones change nothing.
+    pub(crate) fn set(&self, ok: bool) {
+        let _ = self.0.set((ok, Instant::now()));
+    }
 }
 
 impl FeedMessage {
@@ -1102,6 +1136,7 @@ pub fn parse_entry_with(entry: &Entry, l2: Option<&Bytes>, chain_id: Option<u64>
         reorg: false,
         source: 0,
         timing: None,
+        check: None,
     }
 }
 

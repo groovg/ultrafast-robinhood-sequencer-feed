@@ -61,6 +61,10 @@ struct Args {
     /// Lower latency, at the cost of two cores at 100%, plus up to 7 more for --sender
     #[arg(long)]
     busy_poll: bool,
+    /// With --busy-poll: hand each message over before its signature check finishes, and
+    /// wait for the check before showing it. --timing also shows when the check finished
+    #[arg(long)]
+    optimistic: bool,
 }
 
 /// The filters, cheapest first; `sender` needs an ECDSA recovery, so it goes last.
@@ -263,6 +267,10 @@ async fn run() {
         );
         exit(1);
     }
+    if args.optimistic && !(verify && args.busy_poll) {
+        eprintln!("rhfeed: --optimistic needs --busy-poll, and can't go with --no-verify");
+        exit(1);
+    }
     let keep = Filter::new(&args).unwrap_or_else(|err| {
         eprintln!("rhfeed: {err}");
         exit(1);
@@ -277,14 +285,15 @@ async fn run() {
     let mut builder = urls
         .iter()
         .fold(Feed::builder(), |b, url| b.source(*url))
-        .busy_poll(args.busy_poll);
+        .busy_poll(args.busy_poll)
+        .optimistic(args.optimistic);
     if verify {
         builder = builder.verify(MAINNET_VERIFIER.clone());
     }
     // Senders cost an ECDSA recovery each, so only show them when a filter needs them.
     let show_sender = keep.wants_sender();
     // As many spinning threads as a typical message has transactions (7).
-    let pooled = args.busy_poll && show_sender;
+    let pooled = args.busy_poll && show_sender && !args.optimistic;
     if pooled {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         builder = builder.senders(cores.saturating_sub(3).clamp(1, 7));
@@ -292,6 +301,7 @@ async fn run() {
     let mut feed = builder.spawn();
     let mut shown = 0usize;
     let mut stages: Vec<[Duration; STAGES.len()]> = Vec::new();
+    let mut checks: Vec<Duration> = Vec::new();
 
     let stream = async {
         while let Some(msg) = feed.recv().await {
@@ -314,6 +324,15 @@ async fn run() {
                 }
                 row[STAGES.len() - 1] = received.saturating_duration_since(t.last_read);
                 stages.push(row);
+            }
+            if let Some(check) = &msg.check {
+                let ok = check.wait();
+                if let (true, Some(t), Some(at)) = (args.timing, msg.timing, check.done_at()) {
+                    checks.push(at.saturating_duration_since(t.last_read));
+                }
+                if !ok {
+                    continue;
+                }
             }
             let mut txs: Vec<(&Tx, Vec<Intent>)> = msg
                 .txs
@@ -376,7 +395,7 @@ async fn run() {
     };
 
     if args.timing && !stages.is_empty() {
-        print_timing(&mut stages);
+        print_timing(&mut stages, &mut checks);
     }
     let s = feed.stats();
     let counted = if keep.active() { "matched" } else { "seen" };
@@ -435,7 +454,7 @@ const STAGES: [&str; 9] = [
     "total: last read to recv()",
 ];
 
-fn print_timing(stages: &mut [[Duration; STAGES.len()]]) {
+fn print_timing(stages: &mut [[Duration; STAGES.len()]], checks: &mut [Duration]) {
     eprintln!("# per message, µs ({} live messages):", stages.len());
     eprintln!("#   {:<28}{:>9}{:>9}{:>9}", "stage", "p50", "p99", "max");
     for (i, name) in STAGES.iter().enumerate() {
@@ -444,6 +463,18 @@ fn print_timing(stages: &mut [[Duration; STAGES.len()]]) {
             let row = &stages[((stages.len() - 1) as f64 * q).round() as usize];
             row[i].as_secs_f64() * 1e6
         };
+        eprintln!(
+            "#   {name:<28}{:>9.1}{:>9.1}{:>9.1}",
+            at(0.5),
+            at(0.99),
+            at(1.0)
+        );
+    }
+    if !checks.is_empty() {
+        checks.sort_unstable();
+        let at =
+            |q: f64| checks[((checks.len() - 1) as f64 * q).round() as usize].as_secs_f64() * 1e6;
+        let name = "last read to check done";
         eprintln!(
             "#   {name:<28}{:>9.1}{:>9.1}{:>9.1}",
             at(0.5),
