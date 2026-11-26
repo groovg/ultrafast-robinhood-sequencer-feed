@@ -26,6 +26,8 @@ uses those machines while they run.
   `recv()`, and about 49 µs from the NIC interrupt to `recv()`, without busy polling.
 - A copy-trading bot's senders (about 7 per message): 273 µs with `recover_senders`
   after `recv()`, 56 µs with `SenderPool`.
+- With `optimistic`, a message reaches `recv()` before its signature is checked: 13.6 µs
+  after the last read on c8g and 16.3 on c7i, against 37.2 and 38.4 with the check first.
 - The network is where the milliseconds are: two connections save about 30 ms on half
   the messages, and the feed backend your machine's IP lands on can cost 17 ms more.
 
@@ -311,6 +313,37 @@ end of the day with the final code:
 
 The feed carried 17,000 to 30,000 transactions in each of these runs, against 6,800 to
 21,500 earlier that day, and the runs happened at different times. Compare them loosely.
+
+### Checking the signature after delivery, pinning and pings
+
+On 2026-11-26, a c8g.2xlarge and a c7i.2xlarge in us-east-1a, kernel 7.0, plain
+`cargo build --release`. Every row is two rounds of two minutes with one connection, the
+rows taking turns, 1,400 to 1,600 live messages each. "Kernel to first read" comes from
+bpftrace: from the first data segment a socket gets after our last read, to the
+`tcp_recvmsg` that returns it. p50 in µs:
+
+| | c8g: last read to `recv()` | c8g: kernel to first read | c7i: last read to `recv()` | c7i: kernel to first read |
+|---|---:|---:|---:|---:|
+| normal | 41.7 | 5 | 120.6 | 154 |
+| pinned to one CPU | 41.9 | 6 | 124.7 | 151 |
+| a ping after 20 ms without frames | 43.5 | 5 | 122.0 | 130 |
+| busy poll | 37.2 | 3 | 38.4 | 4 |
+| busy poll, pinned to two CPUs | 39.6 | 3 | 43.2 | 8 |
+| busy poll, `optimistic` | 13.6 | 3 | 16.3 | 3 |
+
+- `optimistic` delivers the message 23.6 µs sooner on c8g and 22.1 on c7i, and p99 went
+  from 142 to 90 and from 151 to 101. The check was done 38.0 and 40.9 µs after the last
+  read, within 3 µs of when busy poll delivered the checked message. Whatever your code
+  does in between comes free.
+- Pinning (`taskset -c 3`, or `-c 2,3` with busy poll: separate cores, away from CPU 0
+  and its interrupts) changed nothing. With busy poll it made things worse, most at p99:
+  269 against 142 µs on c8g, 521 against 151 on c7i. `taskset` puts every thread of the
+  process on the two CPUs the spinning threads occupy, which is the likely cause.
+- A WebSocket ping whenever the connection had been quiet for 20 ms, like the keep-warm
+  pings of [robinhood-feed-bench](https://github.com/qskateboard/robinhood-feed-bench),
+  shortened the wait in the kernel on c7i from 154 to 130 µs, in both rounds, and changed
+  nothing on c8g. Busy poll gets c7i to 4 µs, so the pings aren't in the code: a few
+  dozen a second to a shared public feed isn't worth 24 µs in the slow mode.
 
 ## Senders for copy trading
 

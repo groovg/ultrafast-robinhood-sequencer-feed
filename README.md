@@ -154,6 +154,43 @@ let mut feed = rhfeed::Feed::builder()
 
 `rhfeed --busy-poll` and `copy_trade --busy` use these settings.
 
+### Checking the signature after delivery
+
+Most of the feed path is the signature check. With `optimistic(true)` instead of
+`senders`, you get each message as soon as it's decoded, and the feed checks the
+signature on its own thread while your code already works on the message. Build and sign
+your transaction, then send it only if the check passed:
+
+```rust
+let mut feed = rhfeed::Feed::builder()
+    .source(rhfeed::MAINNET_FEED)
+    .source(rhfeed::MAINNET_FEED)
+    .verify(rhfeed::MAINNET_VERIFIER.clone())
+    .busy_poll(true)
+    .optimistic(true)
+    .spawn();
+
+while let Some(msg) = feed.recv().await {
+    let reply = build_reply(&msg); // runs while the signature is checked
+    if msg.check.as_ref().is_none_or(|c| c.wait()) {
+        send(reply);
+    }
+}
+```
+
+- In AWS a message reached `recv()` 13.6 µs after the last socket read on c8g and
+  16.3 µs on c7i, against 37.2 and 38.4 µs with the check first. The check itself was
+  done at 38.0 and 40.9 µs, about when it used to be. See
+  [BENCHMARKS.md](BENCHMARKS.md#checking-the-signature-after-delivery-pinning-and-pings).
+- That only helps if your code has something to do before it sends. If all it does is
+  wait for the check, it sends no sooner than before.
+- `msg.check` is `None` for a message that was checked before delivery, such as the
+  first one on a new connection. If a check fails, the message is undone, so the real
+  one can still arrive from another source.
+- It needs `busy_poll` and `verify`, and doesn't go with `senders`: recover senders
+  yourself for the transactions you care about. `rhfeed --busy-poll --optimistic` waits
+  for each check before printing and shows when it finished in `--timing`.
+
 ## Two connections are faster than one
 
 - We opened two connections to the same public endpoint and compared arrival times.
