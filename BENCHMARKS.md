@@ -296,10 +296,9 @@ Build variants of the same code (`65e0e85`, measured the same way), feed path, �
   c7a. `scripts/pgo-build.sh` does it, and the Docker image is built with it.
 - Inflating a frame from a stream compressed with context takeover: zlib-rs 14.5 µs on
   c7a, 15.3 on c8g, 16.4 on c7i. ISA-L had to load the 32 KB window as a dictionary for
-  every frame and took 17.3, 29.1 and 18.3, so we stayed on zlib-rs. The feed doesn't
-  work that way, though: it compresses every frame on its own (see
-  [Inflating frames](#inflating-frames)), so ISA-L needs no dictionary there. That
-  comparison is still to be redone.
+  every frame and took 17.3, 29.1 and 18.3. The feed doesn't work that way, though: it
+  compresses every frame on its own (see [Inflating frames](#inflating-frames)). ISA-L
+  still loses without the dictionary, so we stay on zlib-rs.
 
 Live, from the last socket read to `recv()`, 2 minutes each way, µs p50 / p99, at the
 end of the day with the final code:
@@ -348,6 +347,20 @@ compresses every frame (permessage-deflate), each one on its own: it answers wit
   way: on 2026-11-26, two connections, one per extension, got 568 identical frames in
   90 s, and every one of them inflated without the dictionary. Nothing to gain from it.
 - The median frame was 1.2 KB compressed and 3.4 KB inflated, one TCP segment.
+
+ISA-L against zlib-rs, on 2026-11-27 in AWS us-east-1: 1,151 frames recorded that day
+(1.2 KB compressed and 2.3 KB inflated at the median), each inflated on its own as the
+feed sends it, with the same output byte for byte. µs per frame, tight loop / p50 with
+10 ms before each frame, best of two runs:
+
+| | c7a | c8g | c7i |
+|---|---:|---:|---:|
+| zlib-rs | 7.6 / 8.4 | 8.1 / 6.6 | 8.5 / 12.0 |
+| ISA-L, `isal_inflate` | 8.7 / 9.7 | 15.2 / 11.3 | 8.7 / 13.3 |
+| ISA-L, `isal_inflate_stateless` | 8.6 / 8.8 | 15.1 / 10.5 | 8.6 / 13.0 |
+
+ISA-L is made for large buffers, and it loses on frames this small, by up to twice the
+time on Graviton4.
 
 ## How the feed path got faster
 
